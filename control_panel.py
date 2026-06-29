@@ -1,0 +1,952 @@
+"""
+AniNote 控制面板 — 便签墙管理、系统设置、关于页面。
+
+提供便签卡片的流式布局、搜索过滤、全局设置修改（存储路径、
+字体、快捷键、Bangumi 集成、自启等），以及与主引擎的双向通信。
+"""
+
+import sys
+import os
+import json
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QStackedWidget, QLabel, QPushButton, QGridLayout,
+    QFormLayout, QLineEdit, QCheckBox, QComboBox,
+    QScrollArea, QFrame, QToolTip, QFontComboBox,
+    QGraphicsDropShadowEffect, QSizeGrip, QMessageBox, QMenu, QFileDialog,
+)
+from PySide6.QtGui import QFont, QColor, QTextDocument, QCursor, QPainter
+from PySide6.QtCore import (
+    Qt, Signal, Property, QPropertyAnimation, QEasingCurve, QRect, QTimer,
+)
+
+from main import load_config, save_config, SAVE_DIR
+
+
+# ==========================================
+#  滑动胶囊开关 (Toggle Switch)
+# ==========================================
+
+class ToggleSwitch(QCheckBox):
+    """自定义开关控件：以胶囊滑轨 + 滚珠动画替代原生勾选框。
+
+    通过 QPropertyAnimation 驱动 position 属性实现 200ms 平滑过渡。
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self._position = 0.0
+        self.animation = QPropertyAnimation(self, b"position")
+        self.animation.setEasingCurve(QEasingCurve.InOutQuad)
+        self.animation.setDuration(200)
+        self.stateChanged.connect(self.setup_animation)
+
+    @Property(float)
+    def position(self):
+        return self._position
+
+    @position.setter
+    def position(self, pos):
+        self._position = pos
+        self.update()
+
+    def setup_animation(self, state):
+        self.animation.stop()
+        self.animation.setEndValue(1.0 if state else 0.0)
+        self.animation.start()
+
+    def showEvent(self, event):
+        # 面板打开时重置滚珠位置，避免动画残留
+        self._position = 1.0 if self.isChecked() else 0.0
+        super().showEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        h, w = 22, 42
+        y = (self.height() - h) // 2
+        x = 0
+
+        # 轨道
+        track_color = QColor("#0078D7") if self.isChecked() else QColor("#cccccc")
+        p.setBrush(track_color)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(x, y, w, h, h / 2, h / 2)
+
+        # 滚珠
+        circle_color = QColor("white")
+        circle_radius = h - 4
+        circle_x = x + 2 + self._position * (w - circle_radius - 4)
+        p.setBrush(circle_color)
+        p.drawEllipse(int(circle_x), int(y + 2), int(circle_radius), int(circle_radius))
+
+        # 标签文字
+        p.setPen(QColor("#333"))
+        p.setFont(self.font())
+        text_rect = QRect(w + 10, 0, self.width() - w - 10, self.height())
+        p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, self.text())
+
+
+# ==========================================
+#  流式网格布局
+# ==========================================
+
+class FlowWidget(QWidget):
+    """自适应网格容器：根据自身宽度动态计算列数，自动排列子控件。"""
+
+    ITEM_WIDTH = 175
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.grid = QGridLayout(self)
+        self.grid.setSpacing(15)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.items = []
+
+    def add_item(self, widget):
+        self.items.append(widget)
+        self.rearrange()
+
+    def clear_items(self):
+        for widget in self.items:
+            self.grid.removeWidget(widget)
+            widget.deleteLater()
+        self.items = []
+
+    def resizeEvent(self, event):
+        self.rearrange()
+        super().resizeEvent(event)
+
+    def rearrange(self):
+        if not self.items:
+            return
+        w = self.width()
+        cols = max(1, (w - 20) // self.ITEM_WIDTH)
+        for i, widget in enumerate(self.items):
+            self.grid.addWidget(widget, i // cols, i % cols)
+
+
+# ==========================================
+#  便签预览卡片
+# ==========================================
+
+class NoteCard(QFrame):
+    """便签墙上的预览卡片，展示标题与正文摘要。
+
+    信号:
+        clicked(str): 用户点击卡片，携带 note_id。
+        delete_clicked(str): 用户点击删除按钮。
+        set_top_clicked(str, bool): 用户通过右键菜单切换置顶。
+    """
+
+    clicked = Signal(str)
+    delete_clicked = Signal(str)
+    set_top_clicked = Signal(str, bool)
+    export_clicked = Signal(str)
+
+    def __init__(self, note_info, parent=None):
+        super().__init__(parent)
+        self.note_id = note_info["id"]
+        self.is_top = note_info["is_top"]
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(160, 160)
+        r, g, b = note_info.get("bg_color", [255, 249, 196])[:3]
+        self.setStyleSheet(
+            f"QFrame {{ background-color: rgb({r}, {g}, {b}); border-radius: 10px;"
+            f" border: 1px solid rgba(0,0,0,0.1); }}"
+            f" QFrame:hover {{ border: 2px solid #0078D7; }}"
+        )
+
+        card_layout = QVBoxLayout(self)
+        card_layout.setContentsMargins(10, 10, 10, 10)
+        card_layout.setSpacing(5)
+
+        title_lbl = QLabel(note_info["title"])
+        title_lbl.setStyleSheet(
+            "font-weight: bold; font-size: 14px; color: #222;"
+            " border: none; background: transparent;"
+        )
+        title_lbl.setFixedHeight(20)
+        card_layout.addWidget(title_lbl)
+
+        preview = QLabel(note_info["text"])
+        preview.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        preview.setWordWrap(True)
+        preview.setStyleSheet(
+            "border: none; background: transparent; color: #555; font-size: 13px;"
+        )
+        preview.setFixedHeight(75)
+
+        # 防止子控件拦截鼠标事件，确保点击穿透到卡片
+        preview.setAttribute(Qt.WA_TransparentForMouseEvents)
+        title_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+        card_layout.addWidget(preview)
+
+        bottom_layout = QHBoxLayout()
+        if self.is_top:
+            top_icon = QLabel("📌")
+            top_icon.setStyleSheet("background: transparent; border: none; font-size: 13px;")
+            bottom_layout.addWidget(top_icon)
+
+        bottom_layout.addStretch()
+        self.del_btn = QPushButton("🗑️")
+        self.del_btn.setFixedSize(26, 26)
+        self.del_btn.setToolTip("删除此便签")
+        self.del_btn.setStyleSheet(
+            "QPushButton { border: none; background: rgba(255,0,0,0.1); border-radius: 5px; }"
+            " QPushButton:hover { background: rgba(255,0,0,0.4); }"
+        )
+        self.del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.note_id))
+        bottom_layout.addWidget(self.del_btn)
+        card_layout.addLayout(bottom_layout)
+
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.note_id)
+
+    def show_context_menu(self, pos):
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WA_TranslucentBackground)
+        menu.setStyleSheet(
+            "QMenu {"
+            " background-color: #FFFFFF;"
+            " border: 1px solid #DDDDDD;"
+            " border-radius: 6px;"
+            " padding: 3px;"
+            " }"
+            " QMenu::item {"
+            " padding: 5px 18px;"
+            " border-radius: 3px;"
+            " margin: 1px 2px;"
+            " color: #333333;"
+            " font-size: 13px;"
+            " }"
+            " QMenu::item:selected {"
+            " background-color: #E8F4FD;"
+            " color: #0078D7;"
+            " }"
+        )
+        top_action = menu.addAction(
+            "⬇️ 置于底部 (贴在桌面)"
+            if self.is_top
+            else "⬆️ 置于最顶部"
+        )
+        export_action = menu.addAction("📄 导出为 Word 文档 (.doc)")
+        action = menu.exec(self.mapToGlobal(pos))
+        if action == top_action:
+            self.is_top = not self.is_top
+            self.set_top_clicked.emit(self.note_id, self.is_top)
+        elif action == export_action:
+            self.export_clicked.emit(self.note_id)
+
+
+# ==========================================
+#  自定义标题栏
+# ==========================================
+
+class CustomTitleBar(QWidget):
+    """无边框窗口的自定义标题栏，支持拖拽和最大化/最小化/关闭。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setFixedHeight(45)
+        self.setStyleSheet("background-color: transparent;")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 0, 10, 0)
+        title_label = QLabel("AniNote")
+        title_label.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #333;"
+            " font-family: 'Microsoft YaHei';"
+        )
+        layout.addWidget(title_label)
+        layout.addStretch()
+
+        btn_style = (
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: rgba(0,0,0,0.08); color: #000; }"
+        )
+        close_style = (
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: #E81123; color: white; }"
+        )
+
+        self.min_btn = QPushButton("—")
+        self.min_btn.setFixedSize(36, 30)
+        self.min_btn.setStyleSheet(btn_style)
+        self.min_btn.clicked.connect(self.parent_window.showMinimized)
+
+        self.max_btn = QPushButton("◻")
+        self.max_btn.setFixedSize(36, 30)
+        self.max_btn.setStyleSheet(btn_style)
+        self.max_btn.clicked.connect(self.toggle_maximize)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(36, 30)
+        self.close_btn.setStyleSheet(close_style)
+        self.close_btn.clicked.connect(self.parent_window.close)
+
+        layout.addWidget(self.min_btn)
+        layout.addWidget(self.max_btn)
+        layout.addWidget(self.close_btn)
+        self._is_dragging = False
+        self._start_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            self._start_pos = event.globalPosition().toPoint() - self.parent_window.pos()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._is_dragging and not self.parent_window.isMaximized():
+            self.parent_window.move(event.globalPosition().toPoint() - self._start_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._is_dragging = False
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_maximize()
+
+    def toggle_maximize(self):
+        if self.parent_window.isMaximized():
+            self.parent_window.showNormal()
+            self.max_btn.setText("◻")
+        else:
+            self.parent_window.showMaximized()
+            self.max_btn.setText("❐")
+
+
+# ==========================================
+#  控制面板主窗口
+# ==========================================
+
+class ControlPanel(QWidget):
+    """AniNote 总控制台，包含便签墙、设置、关于三个页面。
+
+    信号:
+        request_open_note(str): 请求打开指定便签。
+        request_new_note(): 请求新建便签。
+        request_delete_note(str): 请求删除指定便签。
+        request_set_top(str, bool): 请求切换便签置顶状态。
+        settings_changed(dict): 设置变更时发射完整配置字典。
+    """
+
+    request_open_note = Signal(str)
+    request_new_note = Signal()
+    request_new_habit = Signal()
+    request_delete_note = Signal(str)
+    request_set_top = Signal(str, bool)
+    request_export_note = Signal(str)
+    settings_changed = Signal(dict)
+
+    # 导航按钮默认/选中样式
+    NAV_STYLE_NORMAL = (
+        "QPushButton { text-align: left; padding-left: 15px; border: none;"
+        " border-radius: 8px; background-color: transparent; font-size: 14px; color: #555; }"
+        " QPushButton:hover { background-color: #F0F4F8; color: #0078D7; }"
+    )
+    NAV_STYLE_ACTIVE = (
+        "QPushButton { text-align: left; padding-left: 15px; border: none;"
+        " border-radius: 8px; background-color: #E6F2FF; font-size: 14px;"
+        " font-weight: bold; color: #0078D7; }"
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinimizeButtonHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.resize(900, 600)
+        self.setMinimumSize(800, 500)
+
+        wrapper_layout = QVBoxLayout(self)
+        wrapper_layout.setContentsMargins(15, 15, 15, 15)
+
+        self.bg_frame = QFrame(self)
+        self.bg_frame.setObjectName("bg_frame")
+        self.bg_frame.setStyleSheet(
+            "QFrame#bg_frame { background-color: #FAFAFA;"
+            " border-radius: 12px; border: 1px solid #EAEAEA; }"
+        )
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 6)
+        self.bg_frame.setGraphicsEffect(shadow)
+        wrapper_layout.addWidget(self.bg_frame)
+
+        bg_layout = QVBoxLayout(self.bg_frame)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(0)
+        self.title_bar = CustomTitleBar(self)
+        bg_layout.addWidget(self.title_bar)
+
+        content_layout = QHBoxLayout()
+        content_layout.setContentsMargins(15, 5, 15, 15)
+        content_layout.setSpacing(15)
+
+        # 侧边栏导航
+        self.sidebar = QFrame()
+        self.sidebar.setFixedWidth(180)
+        self.sidebar.setStyleSheet(
+            "background-color: white; border-radius: 10px; border: 1px solid #EAEAEA;"
+        )
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(10, 20, 10, 20)
+        sidebar_layout.setSpacing(10)
+
+        self.nav_buttons = []
+
+        def _create_nav_btn(text, index):
+            btn = QPushButton(text)
+            btn.setFixedHeight(45)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(self.NAV_STYLE_NORMAL)
+            btn.clicked.connect(lambda: self.switch_page(index, btn))
+            sidebar_layout.addWidget(btn)
+            self.nav_buttons.append(btn)
+            return btn
+
+        self.btn_notes = _create_nav_btn("📝 便签墙管理", 0)
+        self.btn_settings = _create_nav_btn("⚙️ 系统与个性化", 1)
+        self.btn_about = _create_nav_btn("ℹ️ 关于 AniNote", 2)
+        sidebar_layout.addStretch()
+
+        self.content_area = QStackedWidget()
+        self.content_area.setStyleSheet(
+            "background-color: white; border-radius: 10px; border: 1px solid #EAEAEA;"
+        )
+
+        self.init_notes_page()
+        self.init_settings_page()
+        self.init_about_page()
+
+        content_layout.addWidget(self.sidebar)
+        content_layout.addWidget(self.content_area)
+        bg_layout.addLayout(content_layout)
+
+        # 右下角窗口缩放
+        size_grip_layout = QHBoxLayout()
+        size_grip_layout.setContentsMargins(0, 0, 0, 0)
+        size_grip_layout.addStretch()
+        self.size_grip = QSizeGrip(self.bg_frame)
+        self.size_grip.setStyleSheet("width: 15px; height: 15px; background: transparent;")
+        size_grip_layout.addWidget(self.size_grip)
+        bg_layout.addLayout(size_grip_layout)
+
+        self.switch_page(0, self.btn_notes)
+
+        # 搜索防抖定时器：300ms 无输入后才触发过滤
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.refresh_notes_wall)
+
+    def switch_page(self, index, active_btn):
+        """切换右侧内容页面并高亮对应导航按钮。"""
+        self.content_area.setCurrentIndex(index)
+        for btn in self.nav_buttons:
+            btn.setStyleSheet(self.NAV_STYLE_NORMAL)
+        active_btn.setStyleSheet(self.NAV_STYLE_ACTIVE)
+
+    # ---------- 便签墙页面 ----------
+
+    def init_notes_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        top_bar = QHBoxLayout()
+
+        # 搜索框
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 输入关键字检索...")
+        self.search_input.setFixedWidth(200)
+        self.search_input.setStyleSheet("""
+            QLineEdit { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px;
+                        background-color: white; font-size: 13px; color: #333; }
+            QLineEdit:focus { border: 1px solid #0078D7; background-color: #FCFCFC; }
+        """)
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        top_bar.addWidget(self.search_input)
+
+        # 清空按钮
+        clear_btn = QPushButton("×")
+        clear_btn.setFixedSize(26, 26)
+        clear_btn.setToolTip("清空搜索内容")
+        clear_btn.setStyleSheet("""
+            QPushButton { border: none; background: transparent; font-size: 18px;
+                          color: #999; font-weight: bold; }
+            QPushButton:hover { color: #333; }
+        """)
+        clear_btn.clicked.connect(self.search_input.clear)
+        top_bar.addWidget(clear_btn)
+
+        # 刷新按钮
+        refresh_btn = QPushButton("🔄刷新")
+        refresh_btn.setFixedSize(56, 28)
+        refresh_btn.setToolTip("同步最新便签修改")
+        refresh_btn.setStyleSheet("""
+            QPushButton { border: none; background: transparent; font-size: 14px; }
+            QPushButton:hover { background-color: rgba(0,0,0,0.06); border-radius: 5px; }
+        """)
+        refresh_btn.clicked.connect(self.refresh_notes_wall)
+        top_bar.addWidget(refresh_btn)
+
+        top_bar.addStretch()
+
+        habit_btn = QPushButton("📋 新建事务追踪")
+        habit_btn.setStyleSheet(
+            "QPushButton { background-color: #E8E8E8; color: #555; padding: 8px 15px;"
+            " border-radius: 6px; font-weight: bold; }"
+            " QPushButton:hover { background-color: #D0D0D0; }"
+        )
+        habit_btn.clicked.connect(self.request_new_habit.emit)
+        top_bar.addWidget(habit_btn)
+
+        new_btn = QPushButton("➕ 新建空白便签")
+        new_btn.setStyleSheet(
+            "QPushButton { background-color: #0078D7; color: white; padding: 8px 15px;"
+            " border-radius: 6px; font-weight: bold; }"
+            " QPushButton:hover { background-color: #005A9E; }"
+        )
+        new_btn.clicked.connect(self.request_new_note.emit)
+        top_bar.addWidget(new_btn)
+        layout.addLayout(top_bar)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("""
+            QScrollArea { border: none; background-color: transparent; }
+            QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
+            QScrollBar::handle:vertical { background: #DCDCDC; border-radius: 3px; min-height: 30px; }
+            QScrollBar::handle:vertical:hover { background: #A9A9A9; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        self.flow_container = FlowWidget()
+        self.refresh_notes_wall()
+        scroll_area.setWidget(self.flow_container)
+        layout.addWidget(scroll_area)
+        self.content_area.addWidget(page)
+
+    def _on_search_text_changed(self):
+        """搜索框文本变更时启动防抖定时器，避免每次按键都触发完整刷新。"""
+        self._search_timer.start()
+
+    def refresh_notes_wall(self):
+        """重新加载磁盘上的便签数据并刷新卡片墙。"""
+        self.flow_container.clear_items()
+        notes_data_list = self._load_notes_from_disk()
+        if not notes_data_list:
+            empty_label = QLabel("还没有任何便签，点击右上角新建吧！")
+            empty_label.setStyleSheet("color: #999; font-size: 14px;")
+            self.flow_container.add_item(empty_label)
+            return
+
+        kw = self.search_input.text().strip().lower() if hasattr(self, 'search_input') else ""
+        visible_count = 0
+
+        for note_info in notes_data_list:
+            if kw and (kw not in note_info["title"].lower() and kw not in note_info["text"].lower()):
+                continue
+
+            card = NoteCard(note_info)
+            card.clicked.connect(self.request_open_note.emit)
+            card.delete_clicked.connect(self._handle_card_delete)
+            card.set_top_clicked.connect(self.request_set_top.emit)
+            card.export_clicked.connect(self.request_export_note.emit)
+            self.flow_container.add_item(card)
+            visible_count += 1
+
+        if visible_count == 0 and kw:
+            no_result_lbl = QLabel("未找到匹配的便签 🔍")
+            no_result_lbl.setStyleSheet("color: #999; font-size: 14px; padding: 20px;")
+            self.flow_container.add_item(no_result_lbl)
+
+    def _handle_card_delete(self, note_id):
+        self.request_delete_note.emit(note_id)
+
+    @staticmethod
+    def _load_notes_from_disk():
+        """扫描存储目录，返回便签的摘要信息列表。"""
+        data_list = []
+        if os.path.exists(SAVE_DIR):
+            for filename in os.listdir(SAVE_DIR):
+                if not filename.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(SAVE_DIR, filename), 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    title = data.get("title", "未命名便签")
+                    is_top = data.get("is_always_on_top", True)
+                    doc = QTextDocument()
+                    doc.setHtml(data.get("html_content", ""))
+                    raw_text = doc.toPlainText().strip()
+                    if not raw_text:
+                        raw_text = "[空便签内容]"
+                    bg_color = data.get("bg_color", [255, 249, 196, 242])
+                    data_list.append({
+                        "id": filename.replace('.json', ''),
+                        "title": title,
+                        "text": raw_text,
+                        "is_top": is_top,
+                        "bg_color": bg_color,
+                    })
+                except Exception:
+                    pass
+        return data_list
+
+    # ---------- 设置页面 ----------
+
+    def init_settings_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea { border: none; background-color: transparent; }
+            QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
+            QScrollBar::handle:vertical { background: #DCDCDC; border-radius: 3px; min-height: 30px; }
+            QScrollBar::handle:vertical:hover { background: #A9A9A9; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        inner_widget = QWidget()
+        inner_widget.setStyleSheet("background-color: transparent;")
+        inner_layout = QVBoxLayout(inner_widget)
+        inner_layout.setContentsMargins(30, 20, 30, 30)
+
+        title = QLabel("系统与个性化")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        inner_layout.addWidget(title)
+
+        form_layout = QFormLayout()
+        form_layout.setVerticalSpacing(25)
+        form_layout.setLabelAlignment(Qt.AlignLeft)
+
+        cfg = load_config()
+
+        # 存储目录
+        display_dir = cfg.get("save_dir", "default")
+        if display_dir == "default":
+            display_dir = os.path.abspath(SAVE_DIR)
+
+        self.path_input = QLineEdit(display_dir)
+        self.path_input.setReadOnly(True)
+        self.path_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " background-color: #f9f9f9;"
+        )
+        browse_btn = QPushButton("更改目录")
+        browse_btn.setStyleSheet("padding: 8px 12px; background-color: #eee; border-radius: 5px;")
+        browse_btn.clicked.connect(self._browse_directory)
+
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(self.path_input)
+        path_layout.addWidget(browse_btn)
+
+        # 导出目录
+        from main import EXPORT_DIR as _export_dir
+        export_display = cfg.get("export_dir", "default")
+        if export_display == "default" or not export_display:
+            export_display = os.path.abspath(_export_dir)
+
+        self.export_path_input = QLineEdit(export_display)
+        self.export_path_input.setReadOnly(True)
+        self.export_path_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " background-color: #f9f9f9;"
+        )
+        export_browse_btn = QPushButton("更改目录")
+        export_browse_btn.setStyleSheet("padding: 8px 12px; background-color: #eee; border-radius: 5px;")
+        export_browse_btn.clicked.connect(self._browse_export_directory)
+
+        export_path_layout = QHBoxLayout()
+        export_path_layout.addWidget(self.export_path_input)
+        export_path_layout.addWidget(export_browse_btn)
+
+        # ComboBox 共享样式：统一简约白底蓝调
+        dropdown_style = """
+            QComboBox {
+                padding: 8px 12px;
+                border: 1px solid #D0D0D0;
+                border-radius: 6px;
+                background-color: #FFFFFF;
+                color: #333333;
+                font-size: 13px;
+            }
+            QComboBox:hover {
+                border: 1px solid #0078D7;
+            }
+            QComboBox:focus {
+                border: 1px solid #0078D7;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 26px;
+                border-left: 1px solid #E8E8E8;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+            QComboBox::down-arrow {
+                width: 0;
+                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #999999;
+                margin-right: 8px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #FFFFFF;
+                color: #333333;
+                selection-background-color: transparent;
+                border: 1px solid #D0D0D0;
+                border-radius: 6px;
+                padding: 4px;
+                outline: none;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 8px 12px;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #F0F4F8;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #E8F4FD;
+                color: #0078D7;
+            }
+        """
+
+        # 皮肤选择
+        self.skin_combo = QComboBox()
+        self.skin_combo.addItems(["极简模式", "AniMode（功能暂时无效）"])
+        self.skin_combo.setCurrentText(cfg["skin"])
+        self.skin_combo.wheelEvent = lambda event: event.ignore()
+        self.skin_combo.setStyleSheet(dropdown_style + "QComboBox { min-width: 250px; }")
+
+        # 字体选择
+        self.font_combo = QFontComboBox()
+        self.font_combo.setStyleSheet(dropdown_style)
+        self.font_combo.setCurrentFont(QFont(cfg["font_family"]))
+        self.font_combo.wheelEvent = lambda event: event.ignore()
+
+        # 快捷键输入
+        self.hotkey_input = QLineEdit(cfg["toggle_hotkey"])
+        self.hotkey_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " font-weight: bold; color: #0078D7;"
+        )
+        self.new_hotkey_input = QLineEdit(cfg["new_hotkey"])
+        self.new_hotkey_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " font-weight: bold; color: #28a745;"
+        )
+        self.show_all_hotkey_input = QLineEdit(cfg.get("show_all_hotkey", "alt+shift+n"))
+        self.show_all_hotkey_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " font-weight: bold; color: #e67e22;"
+        )
+        self.disable_all_hotkey_input = QLineEdit(cfg.get("disable_all_hotkey", "ctrl+shift+a"))
+        self.disable_all_hotkey_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " font-weight: bold; color: #dc3545;" 
+        )
+
+        # ---------- Bangumi 设置 ----------
+
+        bangumi_layout = QHBoxLayout()
+        self.uid_input = QLineEdit(cfg.get("bangumi_uid", ""))
+        self.uid_input.setPlaceholderText("请输入你的 Bangumi UID...")
+        self.uid_input.setStyleSheet("padding: 8px; border: 1px solid #ccc; border-radius: 5px;")
+
+        # 信息图标：悬停时立即弹出提示
+        info_icon = QLabel(" ⓘ ")
+        info_icon.setToolTip("输入UID后可自动拉取新番信息")
+        info_icon.setStyleSheet("""
+            QLabel { color: #0078D7; font-size: 16px; font-weight: bold;
+                     background: transparent; border: none; }
+            QToolTip {
+                background-color: rgba(255, 255, 255, 0.95);
+                color: #333333;
+                border: 1px solid #cccccc;
+                border-radius: 4px;
+                font-size: 13px;
+                font-weight: normal;
+                padding: 6px;
+                font-family: 'Microsoft YaHei';
+            }
+        """)
+
+        def _instant_tooltip(event):
+            QToolTip.showText(QCursor.pos(), info_icon.toolTip(), info_icon)
+
+        info_icon.enterEvent = _instant_tooltip
+
+        bangumi_layout.addWidget(self.uid_input)
+        bangumi_layout.addWidget(info_icon)
+
+        # 新番开关
+        self.bangumi_checkbox = ToggleSwitch("开启新番信息便签")
+        self.bangumi_checkbox.setChecked(cfg.get("enable_bangumi", False))
+        self.bangumi_checkbox.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        # 代理设置
+        proxy_layout = QVBoxLayout()
+        proxy_layout.setContentsMargins(0, 0, 0, 0)
+        proxy_layout.setSpacing(5)
+
+        self.proxy_input = QLineEdit(cfg.get("api_proxy", ""))
+        self.proxy_input.setPlaceholderText("例如: 127.0.0.1:7890 (国内网络请留空)")
+        self.proxy_input.setStyleSheet("padding: 8px; border: 1px solid #ccc; border-radius: 5px;")
+
+        proxy_hint = QLabel(
+            "💡 新番同步小贴士：\n"
+            "如果无法获取新番数据，请确保代理软件在后台运行。\n"
+            "无需开启系统代理，只需在此填入对应的本地端口即可静默同步。"
+        )
+        proxy_hint.setStyleSheet("color: #777; font-size: 12px; line-height: 1.3;")
+        proxy_hint.setWordWrap(True)
+
+        proxy_layout.addWidget(self.proxy_input)
+        proxy_layout.addWidget(proxy_hint)
+
+        # 开机自启
+        self.autostart_checkbox = ToggleSwitch("开机时自动在后台静默启动")
+        self.autostart_checkbox.setChecked(cfg["autostart"])
+        self.autostart_checkbox.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        # 装配表单
+        form_layout.addRow(QLabel("<b>数据存储目录：</b>"), path_layout)
+        form_layout.addRow(QLabel("<b>文档导出目录：</b>"), export_path_layout)
+        form_layout.addRow(QLabel("<b>全局便签皮肤：</b>"), self.skin_combo)
+        form_layout.addRow(QLabel("<b>便签默认字体：</b>"), self.font_combo)
+        form_layout.addRow(QLabel("<b>显示/隐藏全局快捷键：</b>"), self.hotkey_input)
+        form_layout.addRow(QLabel("<b>新建便签全局快捷键：</b>"), self.new_hotkey_input)
+        form_layout.addRow(QLabel("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
+        form_layout.addRow(QLabel("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
+        form_layout.addRow(QLabel("<b>绑定 Bangumi UID：</b>"), bangumi_layout)
+        form_layout.addRow(QLabel("<b>API 代理地址：</b>"), proxy_layout)
+        form_layout.addRow(QLabel("<b>新番追踪功能：</b>"), self.bangumi_checkbox)
+        form_layout.addRow(QLabel("<b>系统后台行为：</b>"), self.autostart_checkbox)
+
+        inner_layout.addLayout(form_layout)
+        inner_layout.addStretch()
+
+        save_btn = QPushButton("保存全部设置")
+        save_btn.setStyleSheet(
+            "QPushButton { background-color: #28a745; color: white; padding: 10px;"
+            " border-radius: 8px; font-weight: bold; font-size: 15px; }"
+            " QPushButton:hover { background-color: #218838; }"
+        )
+        save_btn.clicked.connect(self._save_settings)
+        inner_layout.addWidget(save_btn, alignment=Qt.AlignRight)
+
+        scroll_area.setWidget(inner_widget)
+        layout.addWidget(scroll_area)
+        self.content_area.addWidget(page)
+
+    def _browse_directory(self):
+        """弹出文件夹选择对话框。"""
+        new_dir = QFileDialog.getExistingDirectory(
+            self, "选择新的数据存储目录", self.path_input.text()
+        )
+        if new_dir:
+            self.path_input.setText(os.path.abspath(new_dir))
+
+    def _browse_export_directory(self):
+        """弹出导出目录选择对话框。"""
+        new_dir = QFileDialog.getExistingDirectory(
+            self, "选择文档导出目录", self.export_path_input.text()
+        )
+        if new_dir:
+            self.export_path_input.setText(os.path.abspath(new_dir))
+
+    def _save_settings(self):
+        """收集表单数据，保存配置并发射设置变更信号。"""
+        from main import BASE_DIR
+
+        if self.sender():
+            self.sender().clearFocus()
+
+        old_cfg = load_config()
+        new_dir = os.path.abspath(self.path_input.text())
+        default_dir = os.path.abspath(os.path.join(BASE_DIR, "notes_data"))
+
+        # 若用户选择的恰好是程序同级目录，记为 "default" 以保持便携性
+        final_save_dir = "default" if new_dir == default_dir else new_dir
+
+        new_export_dir = os.path.abspath(self.export_path_input.text())
+        default_export_dir = os.path.abspath(os.path.join(BASE_DIR, "导出的便签文本"))
+        final_export_dir = "default" if new_export_dir == default_export_dir else new_export_dir
+
+        cfg = {
+            "skin": self.skin_combo.currentText(),
+            "font_family": self.font_combo.currentFont().family(),
+            "toggle_hotkey": self.hotkey_input.text(),
+            "new_hotkey": self.new_hotkey_input.text(),
+            "show_all_hotkey": self.show_all_hotkey_input.text(),
+            "disable_all_hotkey": self.disable_all_hotkey_input.text().strip(),
+            "autostart": self.autostart_checkbox.isChecked(),
+            "bangumi_uid": self.uid_input.text().strip(),
+            "enable_bangumi": self.bangumi_checkbox.isChecked(),
+            "api_proxy": self.proxy_input.text().strip(),
+            "save_dir": final_save_dir,
+            "export_dir": final_export_dir,
+            "is_first_run": old_cfg.get("is_first_run", False),
+        }
+        save_config(cfg)
+        self.settings_changed.emit(cfg)
+
+        old_save_dir = old_cfg.get("save_dir", os.path.abspath(SAVE_DIR))
+        if new_dir != old_save_dir:
+            QMessageBox.warning(
+                self, "需要重启",
+                "设置已保存，快捷键已实时生效！\n\n"
+                "【注意】\n你更改了数据存储目录，"
+                "请手动将旧文件迁移至新目录，"
+                "并重启本程序以使其完全生效。"
+            )
+        else:
+            QMessageBox.information(self, "成功", "设置已保存，快捷键已实时生效！")
+
+    # ---------- 关于页面 ----------
+
+    def init_about_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        from main import VERSION
+
+        info = QLabel(
+            f"<b>AniNote v{VERSION}</b><br><br>"
+            f"本软件基于Creator自身需求制作而成<br>"
+            f"作者本人并无编程能力和经历, 因此完全由AI辅助创作, 如有问题还请见谅<br>"
+            f"欢迎私信反馈bug<br>"
+            f"Made By B站@HunterHasCome"
+        )
+        info.setAlignment(Qt.AlignCenter)
+        info.setStyleSheet("font-size: 16px; color: #555; line-height: 1.5;")
+        layout.addWidget(info)
+        self.content_area.addWidget(page)
