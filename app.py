@@ -45,7 +45,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
     """
     try:
         headers = {
-            'User-Agent': f'HunterHasCome/AniNote/{note_app.VERSION} (Private-Dev)',# TODO: 待GitHub项目创建后，将 (Private-Dev) 替换为真实的 URL 链接
+            'User-Agent': f'HunterHasCome/AniNote/{note_app.VERSION} (https://github.com/TurboHunter-CN/AniNote)',
             'X-Contact':  'Bilibili: https://space.bilibili.com/499162799',
         }
         proxies = None
