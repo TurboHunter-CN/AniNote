@@ -11,7 +11,7 @@ import os
 import uuid
 import datetime as datetime_module
 
-VERSION = "3.0"
+VERSION = "3.1"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate
 from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices
+
+from icons import icon, set_icon_font
 
 # ---------- 路径初始化 ----------
 
@@ -387,7 +389,8 @@ class FormatPanel(QFrame):
             btn.clicked.connect(lambda checked, color=c: self.parent_window.change_font_color_direct(color))
             layout.addWidget(btn)
         
-        more_btn = self._create_format_btn("🎨", "自定义颜色", self.parent_window.change_font_color)
+        more_btn = self._create_format_btn(icon("palette"), "自定义颜色", self.parent_window.change_font_color, "font-weight: normal;")
+        set_icon_font(more_btn, 14)
         layout.addWidget(more_btn)
         layout.addStretch()
         self.stack.addWidget(page) 
@@ -406,7 +409,8 @@ class FormatPanel(QFrame):
             btn.clicked.connect(lambda checked, c=(r,g,b): self.parent_window.change_bg_base_color(c))
             layout.addWidget(btn)
             
-        custom_btn = self._create_format_btn("🎨", "自定义背景色", self.parent_window.pick_custom_bg_color)
+        custom_btn = self._create_format_btn(icon("palette"), "自定义背景色", self.parent_window.pick_custom_bg_color, "font-weight: normal;")
+        set_icon_font(custom_btn, 14)
         layout.addWidget(custom_btn)
         
         layout.addWidget(QLabel(" 透明度:"))
@@ -483,15 +487,17 @@ class AniNoteWindow(QWidget):
 
         cfg = load_config()
         self.new_note_btn = self._create_tool_btn(
-            "➕", f"新建 ({cfg['new_hotkey'].upper()})",
-            self.create_new_note, "color: green;"
+            icon("add"), f"新建 ({cfg['new_hotkey'].upper()})",
+            self.create_new_note, "color: #555;"
         )
+        set_icon_font(self.new_note_btn, 14)
         self.update_button_hints()
         global_signaler.config_changed_signal.connect(self.update_button_hints)
-        self._create_tool_btn(
-            "❌", "彻底删除",
-            lambda: self.delete_note(confirm=True), "color: red;"
+        del_btn = self._create_tool_btn(
+            icon("delete"), "彻底删除",
+            lambda: self.delete_note(confirm=True), "color: #555; font-weight: normal;"
         )
+        set_icon_font(del_btn, 14)
 
         self.text_edit = NoteTextEdit(self)
         self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -600,7 +606,8 @@ class AniNoteWindow(QWidget):
 
         create_toggle_btn("Aa", "字体与样式", 0)
         create_toggle_btn("A", "字体颜色", 1, "color: blue;")
-        create_toggle_btn("🎨", "便签外观", 2, "color: #E91E63;")
+        palette_btn = create_toggle_btn(icon("palette"), "便签外观", 2, "color: #555; font-weight: normal;")
+        set_icon_font(palette_btn, 14)
         
         self._create_tool_btn("☑", "插入待办事项", self.insert_todo, "color: #e67e22;")
         self.header.toolbar_layout.addStretch()
@@ -635,7 +642,8 @@ class AniNoteWindow(QWidget):
         self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.header.toolbar_container.hide()
 
-        self.refresh_btn = QPushButton("🔄", self.header)
+        self.refresh_btn = QPushButton(icon("refresh"), self.header)
+        set_icon_font(self.refresh_btn, 14)
         self.refresh_btn.setToolTip("立即同步新番日历")
         self.refresh_btn.setFixedSize(22, 22)
         self.refresh_btn.setStyleSheet(
@@ -744,23 +752,23 @@ class AniNoteWindow(QWidget):
         )
 
         lock_action = menu.addAction(
-            "🔓 解除锁定" if self.is_locked else "🔒 锁定便签 (防误触)"
+            "解除锁定" if self.is_locked else "锁定便签 (防误触)"
         )
         top_action = menu.addAction(
-            "📌 取消置顶" if self.is_always_on_top else "📌 置顶"
+            "取消置顶" if self.is_always_on_top else "置顶"
         )
-        open_panel_action = menu.addAction("🛠️ 打开控制台")
+        open_panel_action = menu.addAction("打开控制台")
         menu.addSeparator()
 
-        hide_single_action = menu.addAction("👻 暂时隐藏此便签")
-        del_action = menu.addAction("🗑️ 删除此便签")
+        hide_single_action = menu.addAction("暂时隐藏此便签")
+        del_action = menu.addAction("删除此便签")
         menu.addSeparator()
 
         cfg = load_config()
         hide_action = menu.addAction(
-            f"👁️‍🗨️ 隐藏全部便签 ({cfg['toggle_hotkey'].upper()})"
+            f"隐藏全部便签 ({cfg['toggle_hotkey'].upper()})"
         )
-        show_all_action = menu.addAction("🔍 显示全部便签")
+        show_all_action = menu.addAction("显示全部便签")
 
         action = menu.exec(self.mapToGlobal(pos))
 
@@ -919,6 +927,47 @@ class AniNoteWindow(QWidget):
 
 # ---------- 事务追踪器 ----------
 
+class DragHandle(QLabel):
+    """拖拽排序手柄：点击并纵向拖动可移动所在行。"""
+
+    drag_started = Signal(object)   # handle 自身
+    drag_moved = Signal(object, int)  # handle, global_y
+    drag_dropped = Signal(object, int)  # handle, global_y
+
+    def __init__(self, parent=None):
+        super().__init__("⋮⋮", parent)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setStyleSheet(
+            "font-size: 14px; color: #bbb; padding: 0 4px;"
+            " background: transparent; border: none;"
+        )
+        self.setFixedWidth(20)
+        self._drag_start_y = 0
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_y = event.globalPosition().y()
+            self._dragging = False
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.LeftButton):
+            return
+        delta = abs(event.globalPosition().y() - self._drag_start_y)
+        if delta < 6:
+            return
+        if not self._dragging:
+            self._dragging = True
+            self.drag_started.emit(self)
+        self.drag_moved.emit(self, int(event.globalPosition().y()))
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.OpenHandCursor)
+        if self._dragging:
+            self._dragging = False
+            self.drag_dropped.emit(self, int(event.globalPosition().y()))
+
 class HabitTrackerWindow(AniNoteWindow):
     """事务追踪器窗口，继承便签的全部功能。
 
@@ -942,6 +991,9 @@ class HabitTrackerWindow(AniNoteWindow):
         # 状态
         self._week_offset = 0
         self._habits = []       # [{id, name, color, records: {date: bool}}]
+        self._drag_handles = {}  # hab_id -> DragHandle
+        self._drag_row = None    # 正在拖拽的 grid row
+        self._drag_placeholder = None  # 拖拽时的浮动控件
 
         # 统一网格：日期 + 事务行共用同一列宽，杜绝对不齐
         self._build_tracker_grid()
@@ -1105,14 +1157,84 @@ class HabitTrackerWindow(AniNoteWindow):
             grid_row = i + 1
             self._add_habit_to_grid(habit, week_dates, today, grid_row)
 
+    def _on_drag_started(self, handle):
+        """开始拖拽：记录源行，创建浮动预览。"""
+        if getattr(self, 'is_locked', False):
+            return
+        for hab in self._habits:
+            if self._drag_handles.get(hab["id"]) is handle:
+                self._drag_row = self._habits.index(hab) + 1
+                break
+        if self._drag_row is None:
+            return
+        left_widget = self._grid.itemAtPosition(self._drag_row, 0)
+        if left_widget and left_widget.widget():
+            w = left_widget.widget()
+            self._drag_placeholder = QLabel(pixmap=w.grab())
+            self._drag_placeholder.setWindowFlags(
+                Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+            )
+            self._drag_placeholder.setAttribute(Qt.WA_TranslucentBackground)
+            self._drag_placeholder.setStyleSheet(
+                "background: white; border: 1px solid #0078D7; opacity: 0.85;"
+            )
+            self._drag_placeholder.resize(w.width() + 300, w.height())
+            self._drag_placeholder.move(
+                w.mapToGlobal(w.rect().topLeft())
+            )
+            self._drag_placeholder.show()
+
+    def _on_drag_moved(self, handle, global_y):
+        """拖拽移动：更新浮动预览位置。"""
+        if self._drag_placeholder:
+            x = self._drag_placeholder.x()
+            self._drag_placeholder.move(x, global_y - self._drag_placeholder.height() // 2)
+
+    def _on_drag_dropped(self, handle, global_y):
+        """拖拽释放：计算目标行，重排列表。"""
+        if self._drag_row is None:
+            return
+        if self._drag_placeholder:
+            self._drag_placeholder.close()
+            self._drag_placeholder = None
+        # 计算目标行：找到全局 y 落在哪个行的中心以下
+        target_row = len(self._habits)
+        for r in range(1, len(self._habits) + 1):
+            item = self._grid.itemAtPosition(r, 0)
+            if item is None or item.widget() is None:
+                continue
+            w = item.widget()
+            center_y = w.mapToGlobal(w.rect().topLeft()).y() + w.height() // 2
+            if global_y < center_y:
+                target_row = r
+                break
+        src_idx = self._drag_row - 1
+        dst_idx = max(0, min(target_row - 1, len(self._habits) - 1))
+        if src_idx != dst_idx:
+            hab = self._habits.pop(src_idx)
+            self._habits.insert(dst_idx, hab)
+            self._refresh_habit_list()
+            self.save_data()
+        self._drag_row = None
+
     def _add_habit_to_grid(self, habit, week_dates, today, grid_row):
         """向网格的指定行填充一条事务，按模式渲染不同内容。"""
-        # col 0：颜色条 + 名称（三种模式共用）
+        hab_id = habit["id"]
+
+        # col 0：拖拽手柄 + 颜色条 + 名称（三种模式共用）
         left = QWidget()
         left.setStyleSheet("background: transparent;")
         left_layout = QHBoxLayout(left)
-        left_layout.setContentsMargins(8, 6, 0, 6)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(2, 6, 0, 6)
+        left_layout.setSpacing(4)
+
+        handle = DragHandle()
+        handle.setToolTip("拖拽排序")
+        handle.drag_started.connect(self._on_drag_started)
+        handle.drag_moved.connect(self._on_drag_moved)
+        handle.drag_dropped.connect(self._on_drag_dropped)
+        self._drag_handles[hab_id] = handle
+        left_layout.addWidget(handle)
 
         color_bar = QWidget()
         color_bar.setFixedSize(4, 28)
@@ -1537,6 +1659,9 @@ class HabitTrackerWindow(AniNoteWindow):
         self._btn_next.setVisible(not locked)
         self._bottom_widget.setVisible(not locked)
         self._refresh_habit_list()
+        # 锁定时不显示拖拽手柄
+        for h in self._drag_handles.values():
+            h.setVisible(not locked)
 
 
 # ---------- 全局操作 ----------

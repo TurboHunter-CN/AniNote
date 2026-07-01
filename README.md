@@ -6,11 +6,12 @@
 
 - **桌面便签** — 无边框可拖拽缩放，支持锁定/置顶/隐藏
 - **富文本编辑** — 粗体、斜体、下划线、字号、颜色、背景色，调色板自由选
-- **待办事项** — 快捷插入 `☐`，点击 `☑` 切换完成状态
+- **Material Icons** — 统一使用 Google Material Symbols 图标，界面简洁一致
+- **待办事项** — 快捷插入，点击切换完成状态
 
     ![todo](images/todo.png)
 
-- **事务追踪器** — 自由打卡 / 周期循环 / 倒计时三种模式，周视图网格，适用于二游日常提醒 
+- **事务追踪器** — 自由打卡 / 周期循环 / 倒计时三种模式，周视图网格，支持拖拽排序，适用于二游日常提醒
 
     ![missiontrack](images/missiontrack.png)
     ![missiontrack2](images/missiontrack2.png)
@@ -19,7 +20,7 @@
 
     ![animeupdate](images/animeupdate.png)
 
-- **网络代理接口** — 内置网络代理设置，解决Bangumi裸连无响应
+- **网络代理接口** — 内置网络代理设置，解决 Bangumi 裸连无响应
 - **便签墙管理** — 控制台集中浏览、搜索、打开/删除便签
 
     ![control](images/control.png)
@@ -39,7 +40,7 @@
 ## 运行
 
 ```bash
-git clone https://github.com/HunterHasCome/AniNote.git
+git clone https://github.com/TurboHunter-CN/AniNote.git
 cd AniNote
 pip install PySide6 requests
 python app.py
@@ -48,7 +49,7 @@ python app.py
 ## 打包
 
 ```bash
-python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." app.py
+python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
 ```
 
 分发 `dist/app/` 整个文件夹即可，对方无需安装 Python。
@@ -57,12 +58,26 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
 
 ```
 AniNote/
-├── app.py            # 应用入口、热键、Bangumi 逻辑
-├── main.py           # 便签窗口、事务追踪器、配置
-├── control_panel.py  # 控制台 UI（便签墙、设置页）
-├── Newicon.ico       # 托盘图标 + 打包用 exe 图标
-└── notes_data/       # 便签数据目录（自动创建）
+├── app.py                            # 应用入口、热键、Bangumi 逻辑
+├── main.py                           # 便签窗口、事务追踪器、配置
+├── control_panel.py                  # 控制台 UI（便签墙、设置页）
+├── icons.py                          # Material Icons 图标系统
+├── theme.py                          # 设计系统常量
+├── MaterialSymbolsOutlined_Static.ttf # 图标字体
+├── Newicon.ico                       # 托盘图标 + 打包用 exe 图标
+└── notes_data/                       # 便签数据目录（自动创建）
 ```
+
+## 快捷键
+
+| 操作 | 默认快捷键 |
+|------|-----------|
+| 新建便签 | Alt + M |
+| 显示/隐藏全部 | Alt + N |
+| 显示全部 | Alt + Shift + N |
+| 临时禁用全部 | Ctrl + Shift + A |
+
+快捷键可在控制台「系统与个性化」页面中自定义。
 
 ## 快捷键
 

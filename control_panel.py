@@ -9,11 +9,14 @@ import sys
 import os
 import json
 
+from icons import icon, set_icon_font
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QStackedWidget, QLabel, QPushButton, QGridLayout,
     QFormLayout, QLineEdit, QCheckBox, QComboBox,
     QScrollArea, QFrame, QToolTip, QFontComboBox,
+
     QGraphicsDropShadowEffect, QSizeGrip, QMessageBox, QMenu, QFileDialog,
 )
 from PySide6.QtGui import QFont, QColor, QTextDocument, QCursor, QPainter
@@ -188,16 +191,19 @@ class NoteCard(QFrame):
 
         bottom_layout = QHBoxLayout()
         if self.is_top:
-            top_icon = QLabel("📌")
-            top_icon.setStyleSheet("background: transparent; border: none; font-size: 13px;")
+            top_icon = QLabel(icon("push_pin"))
+            set_icon_font(top_icon, 14)
+            top_icon.setStyleSheet("background: transparent; border: none; font-size: 14px; color: #555;")
             bottom_layout.addWidget(top_icon)
 
         bottom_layout.addStretch()
-        self.del_btn = QPushButton("🗑️")
+        self.del_btn = QPushButton(icon("delete"))
         self.del_btn.setFixedSize(26, 26)
         self.del_btn.setToolTip("删除此便签")
+        set_icon_font(self.del_btn, 16)
         self.del_btn.setStyleSheet(
-            "QPushButton { border: none; background: rgba(255,0,0,0.1); border-radius: 5px; }"
+            "QPushButton { border: none; background: rgba(255,0,0,0.1); border-radius: 5px;"
+            " color: #555; }"
             " QPushButton:hover { background: rgba(255,0,0,0.4); }"
         )
         self.del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.note_id))
@@ -214,6 +220,7 @@ class NoteCard(QFrame):
     def show_context_menu(self, pos):
         menu = QMenu(self)
         menu.setAttribute(Qt.WA_TranslucentBackground)
+        # 不使用 set_icon_font 以免 Material Symbols 拉丁字符替换系统字体
         menu.setStyleSheet(
             "QMenu {"
             " background-color: #FFFFFF;"
@@ -234,11 +241,11 @@ class NoteCard(QFrame):
             " }"
         )
         top_action = menu.addAction(
-            "⬇️ 置于底部 (贴在桌面)"
+            "置于底部 (贴在桌面)"
             if self.is_top
-            else "⬆️ 置于最顶部"
+            else "置于最顶部"
         )
-        export_action = menu.addAction("📄 导出为 Word 文档 (.doc)")
+        export_action = menu.addAction("导出为 Word 文档 (.doc)")
         action = menu.exec(self.mapToGlobal(pos))
         if action == top_action:
             self.is_top = not self.is_top
@@ -286,13 +293,15 @@ class CustomTitleBar(QWidget):
         self.min_btn.setStyleSheet(btn_style)
         self.min_btn.clicked.connect(self.parent_window.showMinimized)
 
-        self.max_btn = QPushButton("◻")
+        self.max_btn = QPushButton(icon("crop_square"))
         self.max_btn.setFixedSize(36, 30)
+        set_icon_font(self.max_btn, 16)
         self.max_btn.setStyleSheet(btn_style)
         self.max_btn.clicked.connect(self.toggle_maximize)
 
-        self.close_btn = QPushButton("✕")
+        self.close_btn = QPushButton(icon("close"))
         self.close_btn.setFixedSize(36, 30)
+        set_icon_font(self.close_btn, 16)
         self.close_btn.setStyleSheet(close_style)
         self.close_btn.clicked.connect(self.parent_window.close)
 
@@ -323,10 +332,8 @@ class CustomTitleBar(QWidget):
     def toggle_maximize(self):
         if self.parent_window.isMaximized():
             self.parent_window.showNormal()
-            self.max_btn.setText("◻")
         else:
             self.parent_window.showMaximized()
-            self.max_btn.setText("❐")
 
 
 # ==========================================
@@ -352,7 +359,7 @@ class ControlPanel(QWidget):
     request_export_note = Signal(str)
     settings_changed = Signal(dict)
 
-    # 导航按钮默认/选中样式
+    # 导航按钮默认/选中样式（QPushButton 保留用于兼容）
     NAV_STYLE_NORMAL = (
         "QPushButton { text-align: left; padding-left: 15px; border: none;"
         " border-radius: 8px; background-color: transparent; font-size: 14px; color: #555; }"
@@ -362,6 +369,19 @@ class ControlPanel(QWidget):
         "QPushButton { text-align: left; padding-left: 15px; border: none;"
         " border-radius: 8px; background-color: #E6F2FF; font-size: 14px;"
         " font-weight: bold; color: #0078D7; }"
+    )
+    # QLabel 版（Material Icon 导航按钮用）
+    NAV_LBL_NORMAL = (
+        "QLabel { padding: 10px 15px; color: #555; background: transparent;"
+        " border-radius: 8px; }"
+    )
+    NAV_LBL_HOVER = (
+        "QLabel { padding: 10px 15px; color: #0078D7; background-color: #F0F4F8;"
+        " border-radius: 8px; }"
+    )
+    NAV_LBL_ACTIVE = (
+        "QLabel { padding: 10px 15px; color: #0078D7; background-color: #E6F2FF;"
+        " border-radius: 8px; font-weight: bold; }"
     )
 
     def __init__(self):
@@ -411,19 +431,19 @@ class ControlPanel(QWidget):
 
         self.nav_buttons = []
 
-        def _create_nav_btn(text, index):
-            btn = QPushButton(text)
+        def _make_nav_btn(icon_name, label, index):
+            btn = self._icon_label(icon_name, label, icon_size=17, text_size=15,
+                                   base_style=self.NAV_LBL_NORMAL,
+                                   hover_style=self.NAV_LBL_HOVER)
             btn.setFixedHeight(45)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(self.NAV_STYLE_NORMAL)
-            btn.clicked.connect(lambda: self.switch_page(index, btn))
+            btn.mousePressEvent = lambda e, i=index, b=btn: self.switch_page(i, b)
             sidebar_layout.addWidget(btn)
             self.nav_buttons.append(btn)
             return btn
 
-        self.btn_notes = _create_nav_btn("📝 便签墙管理", 0)
-        self.btn_settings = _create_nav_btn("⚙️ 系统与个性化", 1)
-        self.btn_about = _create_nav_btn("ℹ️ 关于 AniNote", 2)
+        self.btn_notes = _make_nav_btn("description", "便签墙管理", 0)
+        self.btn_settings = _make_nav_btn("settings", "系统与个性化", 1)
+        self.btn_about = _make_nav_btn("info", "关于 AniNote", 2)
         sidebar_layout.addStretch()
 
         self.content_area = QStackedWidget()
@@ -456,12 +476,48 @@ class ControlPanel(QWidget):
         self._search_timer.setInterval(300)
         self._search_timer.timeout.connect(self.refresh_notes_wall)
 
+    def _icon_label(self, name, label, icon_size=18, text_size=13,
+                     base_style=None, hover_style=None):
+        """创建一个带 Material Icon 的 QLabel（table 布局保证对齐）。
+        自动注册悬停效果，由 eventFilter 处理。
+        """
+        html = (
+            f'<table style="border:none;margin:0;padding:0;border-collapse:collapse;">'
+            f'<tr>'
+            f'<td style="vertical-align:middle;padding-top:1px;padding-right:2px;">'
+            f'<span style="font-family:\'Material Symbols Outlined\';'
+            f'font-size:{icon_size}px;">{icon(name)}</span></td>'
+            f'<td style="vertical-align:middle;padding-top:1px;">'
+            f'<span style="font-size:{text_size}px;">{label}</span></td>'
+            f'</tr></table>'
+        )
+        lbl = QLabel(html)
+        lbl.setCursor(Qt.PointingHandCursor)
+        if base_style is None:
+            base_style = "QLabel { padding: 2px 10px; color: #333; background: transparent; border-radius: 6px; }"
+        if hover_style is None:
+            hover_style = "QLabel { padding: 2px 10px; color: #333; background-color: rgba(0,0,0,0.06); border-radius: 6px; }"
+        lbl.setProperty("hover_base_style", base_style)
+        lbl.setProperty("hover_hover_style", hover_style)
+        lbl.setStyleSheet(base_style)
+        lbl.installEventFilter(self)
+        if not hasattr(self, '_hover_labels'):
+            self._hover_labels = set()
+        self._hover_labels.add(lbl)
+        return lbl
+
     def switch_page(self, index, active_btn):
         """切换右侧内容页面并高亮对应导航按钮。"""
         self.content_area.setCurrentIndex(index)
         for btn in self.nav_buttons:
-            btn.setStyleSheet(self.NAV_STYLE_NORMAL)
-        active_btn.setStyleSheet(self.NAV_STYLE_ACTIVE)
+            if isinstance(btn, QLabel):
+                btn.setStyleSheet(self.NAV_LBL_NORMAL)
+            else:
+                btn.setStyleSheet(self.NAV_STYLE_NORMAL)
+        if isinstance(active_btn, QLabel):
+            active_btn.setStyleSheet(self.NAV_LBL_ACTIVE)
+        else:
+            active_btn.setStyleSheet(self.NAV_STYLE_ACTIVE)
 
     # ---------- 便签墙页面 ----------
 
@@ -474,8 +530,9 @@ class ControlPanel(QWidget):
 
         # 搜索框
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 输入关键字检索...")
+        self.search_input.setPlaceholderText("输入关键字检索...")
         self.search_input.setFixedWidth(200)
+
         self.search_input.setStyleSheet("""
             QLineEdit { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px;
                         background-color: white; font-size: 13px; color: #333; }
@@ -485,46 +542,38 @@ class ControlPanel(QWidget):
         top_bar.addWidget(self.search_input)
 
         # 清空按钮
-        clear_btn = QPushButton("×")
+        clear_btn = QPushButton(icon("close"))
         clear_btn.setFixedSize(26, 26)
         clear_btn.setToolTip("清空搜索内容")
+        set_icon_font(clear_btn, 18)
         clear_btn.setStyleSheet("""
-            QPushButton { border: none; background: transparent; font-size: 18px;
-                          color: #999; font-weight: bold; }
+            QPushButton { border: none; background: transparent; color: #999; }
             QPushButton:hover { color: #333; }
         """)
         clear_btn.clicked.connect(self.search_input.clear)
         top_bar.addWidget(clear_btn)
 
         # 刷新按钮
-        refresh_btn = QPushButton("🔄刷新")
-        refresh_btn.setFixedSize(56, 28)
+        refresh_btn = self._icon_label("refresh", "刷新", icon_size=18, text_size=13)
+        refresh_btn.setFixedHeight(28)
         refresh_btn.setToolTip("同步最新便签修改")
-        refresh_btn.setStyleSheet("""
-            QPushButton { border: none; background: transparent; font-size: 14px; }
-            QPushButton:hover { background-color: rgba(0,0,0,0.06); border-radius: 5px; }
-        """)
-        refresh_btn.clicked.connect(self.refresh_notes_wall)
+        refresh_btn.mousePressEvent = lambda e: self.refresh_notes_wall()
         top_bar.addWidget(refresh_btn)
 
         top_bar.addStretch()
 
-        habit_btn = QPushButton("📋 新建事务追踪")
-        habit_btn.setStyleSheet(
-            "QPushButton { background-color: #E8E8E8; color: #555; padding: 8px 15px;"
-            " border-radius: 6px; font-weight: bold; }"
-            " QPushButton:hover { background-color: #D0D0D0; }"
-        )
-        habit_btn.clicked.connect(self.request_new_habit.emit)
+        # 事务追踪按钮
+        habit_btn = self._icon_label("playlist_add", "新建事务追踪", icon_size=16, text_size=14,
+                                      base_style="QLabel { padding: 8px 15px; color: #555; background-color: #E8E8E8; border-radius: 6px; }",
+                                      hover_style="QLabel { padding: 8px 15px; color: #555; background-color: #D0D0D0; border-radius: 6px; }")
+        habit_btn.mousePressEvent = lambda e: self.request_new_habit.emit()
         top_bar.addWidget(habit_btn)
 
-        new_btn = QPushButton("➕ 新建空白便签")
-        new_btn.setStyleSheet(
-            "QPushButton { background-color: #0078D7; color: white; padding: 8px 15px;"
-            " border-radius: 6px; font-weight: bold; }"
-            " QPushButton:hover { background-color: #005A9E; }"
-        )
-        new_btn.clicked.connect(self.request_new_note.emit)
+        # 新建便签按钮
+        new_btn = self._icon_label("note_add", "新建空白便签", icon_size=16, text_size=14,
+                                    base_style="QLabel { padding: 8px 15px; color: white; background-color: #0078D7; border-radius: 6px; }",
+                                    hover_style="QLabel { padding: 8px 15px; color: white; background-color: #005A9E; border-radius: 6px; }")
+        new_btn.mousePressEvent = lambda e: self.request_new_note.emit()
         top_bar.addWidget(new_btn)
         layout.addLayout(top_bar)
 
@@ -549,6 +598,16 @@ class ControlPanel(QWidget):
     def _on_search_text_changed(self):
         """搜索框文本变更时启动防抖定时器，避免每次按键都触发完整刷新。"""
         self._search_timer.start()
+
+    def eventFilter(self, obj, event):
+        """为 QLabel 模拟按钮悬停效果（QLabel 不支持 :hover 样式）。"""
+        from PySide6.QtCore import QEvent
+        if hasattr(self, '_hover_labels') and obj in self._hover_labels:
+            if event.type() == QEvent.Enter:
+                obj.setStyleSheet(obj.property("hover_hover_style"))
+            elif event.type() == QEvent.Leave:
+                obj.setStyleSheet(obj.property("hover_base_style"))
+        return super().eventFilter(obj, event)
 
     def refresh_notes_wall(self):
         """重新加载磁盘上的便签数据并刷新卡片墙。"""
@@ -576,7 +635,7 @@ class ControlPanel(QWidget):
             visible_count += 1
 
         if visible_count == 0 and kw:
-            no_result_lbl = QLabel("未找到匹配的便签 🔍")
+            no_result_lbl = QLabel("未找到匹配的便签")
             no_result_lbl.setStyleSheet("color: #999; font-size: 14px; padding: 20px;")
             self.flow_container.add_item(no_result_lbl)
 
@@ -634,10 +693,6 @@ class ControlPanel(QWidget):
         inner_widget.setStyleSheet("background-color: transparent;")
         inner_layout = QVBoxLayout(inner_widget)
         inner_layout.setContentsMargins(30, 20, 30, 30)
-
-        title = QLabel("系统与个性化")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #333; margin-bottom: 10px;")
-        inner_layout.addWidget(title)
 
         form_layout = QFormLayout()
         form_layout.setVerticalSpacing(25)
@@ -810,7 +865,13 @@ class ControlPanel(QWidget):
         # 新番开关
         self.bangumi_checkbox = ToggleSwitch("开启新番信息便签")
         self.bangumi_checkbox.setChecked(cfg.get("enable_bangumi", False))
-        self.bangumi_checkbox.setStyleSheet("font-size: 14px; font-weight: bold;")
+        cf = self.bangumi_checkbox.font()
+        cf.setPixelSize(14)
+        self.bangumi_checkbox.setFont(cf)
+        bangumi_wrapper = QWidget()
+        bangumi_wrap_layout = QVBoxLayout(bangumi_wrapper)
+        bangumi_wrap_layout.setContentsMargins(0, 5, 0, 5)
+        bangumi_wrap_layout.addWidget(self.bangumi_checkbox)
 
         # 代理设置
         proxy_layout = QVBoxLayout()
@@ -835,21 +896,35 @@ class ControlPanel(QWidget):
         # 开机自启
         self.autostart_checkbox = ToggleSwitch("开机时自动在后台静默启动")
         self.autostart_checkbox.setChecked(cfg["autostart"])
-        self.autostart_checkbox.setStyleSheet("font-size: 14px; font-weight: bold;")
+        cf2 = self.autostart_checkbox.font()
+        cf2.setPixelSize(14)
+        self.autostart_checkbox.setFont(cf2)
+        autostart_wrapper = QWidget()
+        autostart_wrap_layout = QVBoxLayout(autostart_wrapper)
+        autostart_wrap_layout.setContentsMargins(0, 5, 0, 5)
+        autostart_wrap_layout.addWidget(self.autostart_checkbox)
 
         # 装配表单
-        form_layout.addRow(QLabel("<b>数据存储目录：</b>"), path_layout)
-        form_layout.addRow(QLabel("<b>文档导出目录：</b>"), export_path_layout)
-        form_layout.addRow(QLabel("<b>全局便签皮肤：</b>"), self.skin_combo)
-        form_layout.addRow(QLabel("<b>便签默认字体：</b>"), self.font_combo)
-        form_layout.addRow(QLabel("<b>显示/隐藏全局快捷键：</b>"), self.hotkey_input)
-        form_layout.addRow(QLabel("<b>新建便签全局快捷键：</b>"), self.new_hotkey_input)
-        form_layout.addRow(QLabel("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
-        form_layout.addRow(QLabel("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
-        form_layout.addRow(QLabel("<b>绑定 Bangumi UID：</b>"), bangumi_layout)
-        form_layout.addRow(QLabel("<b>API 代理地址：</b>"), proxy_layout)
-        form_layout.addRow(QLabel("<b>新番追踪功能：</b>"), self.bangumi_checkbox)
-        form_layout.addRow(QLabel("<b>系统后台行为：</b>"), self.autostart_checkbox)
+        def _lbl(text):
+            lbl = QLabel(text)
+            f = lbl.font()
+            f.setPixelSize(14)
+            lbl.setFont(f)
+            lbl.setStyleSheet("color: #333;")
+            return lbl
+
+        form_layout.addRow(_lbl("<b>数据存储目录：</b>"), path_layout)
+        form_layout.addRow(_lbl("<b>文档导出目录：</b>"), export_path_layout)
+        form_layout.addRow(_lbl("<b>全局便签皮肤：</b>"), self.skin_combo)
+        form_layout.addRow(_lbl("<b>便签默认字体：</b>"), self.font_combo)
+        form_layout.addRow(_lbl("<b>显示/隐藏全局快捷键：</b>"), self.hotkey_input)
+        form_layout.addRow(_lbl("<b>新建便签全局快捷键：</b>"), self.new_hotkey_input)
+        form_layout.addRow(_lbl("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
+        form_layout.addRow(_lbl("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
+        form_layout.addRow(_lbl("<b>绑定 Bangumi UID：</b>"), bangumi_layout)
+        form_layout.addRow(_lbl("<b>API 代理地址：</b>"), proxy_layout)
+        form_layout.addRow(_lbl("<b>新番追踪功能：</b>"), bangumi_wrapper)
+        form_layout.addRow(_lbl("<b>系统后台行为：</b>"), autostart_wrapper)
 
         inner_layout.addLayout(form_layout)
         inner_layout.addStretch()

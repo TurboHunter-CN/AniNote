@@ -325,11 +325,10 @@ def main():
     if cfg.get("is_first_run", True):
         note = note_app.AniNoteWindow()
         note.resize(550, 500)
-        note.header.title_edit.setText(f"🎉 欢迎使用 AniNote v{note_app.VERSION}！")
+        note.header.title_edit.setText(f"欢迎使用 AniNote v{note_app.VERSION}！")
         note.text_edit.setHtml("""
         <p><b>👋 你好，欢迎来到属于你的桌面便签！</b></p>
         <p>这里有一份快速上手指南，看完就可以把它删掉：</p>
-        <br>
         <p>1. <b>移动与排版</b>: 按住右上角的 <span style="color: #aaa;"><b>⋮⋮</b></span> 及其右侧区域可以拖动；拖动右下角可以缩放。</p>
         <p>2. <b>右键菜单</b>: 在便签上右键，可以【锁定】或【隐藏】。锁定状态下无法对便签进行操作</p>
         <p>3. <b>待办事项</b>: 点击顶部的 ☑，试试看点击下面这个方块：</p>
@@ -340,8 +339,8 @@ def main():
         <p>7. <b>新番信息</b>: 控制面板中开启并绑定Bangumi UID即可监测自己账户的新番更新, 在大陆网络环境需自备梯子</p>
         <p>8. <b>事务追踪器</b>: 控制面板中右上角“新建事务追踪”即可创建该便签</p>
         """)
-        note.show()
         note.save_data()
+        note.show()
         cfg["is_first_run"] = False
         note_app.save_config(cfg)
     else:
@@ -619,20 +618,20 @@ def main():
     )
 
     action_new = QAction(
-        f"➕ 新建便签 ({cfg['new_hotkey'].upper()})", app
+        f"新建便签 ({cfg['new_hotkey'].upper()})", app
     )
     action_new.triggered.connect(lambda: note_app.global_signaler.new_note_signal.emit())
 
     action_toggle = QAction(
-        f"👁️‍🗨️ 隐藏/显示所有便签 ({cfg['toggle_hotkey'].upper()})", app
+        f"隐藏/显示所有便签 ({cfg['toggle_hotkey'].upper()})", app
     )
     action_toggle.triggered.connect(lambda: note_app.global_signaler.toggle_signal.emit())
 
-    action_panel = QAction("⚙️ 打开总控制台", app)
+    action_panel = QAction("打开总控制台", app)
     action_panel.triggered.connect(
         show_and_focus_panel)
 
-    action_exit = QAction("❌ 彻底退出 AniNote", app)
+    action_exit = QAction("彻底退出 AniNote", app)
     action_exit.triggered.connect(lambda: (
         [note.save_data() for note in note_app.ACTIVE_NOTES],
         tray_icon.hide(),
@@ -709,9 +708,9 @@ def main():
                 f"font-family: '{new_cfg['font_family']}'; color: #333333; }}"
             )
 
-        action_new.setText(f"➕ 新建便签 ({new_cfg['new_hotkey'].upper()})")
+        action_new.setText(f"新建便签 ({new_cfg['new_hotkey'].upper()})")
         action_toggle.setText(
-            f"👁️‍🗨️ 隐藏/显示所有便签 ({new_cfg['toggle_hotkey'].upper()})"
+            f"隐藏/显示所有便签 ({new_cfg['toggle_hotkey'].upper()})"
         )
 
         # 立即触发一次同步，延迟为 0（用户主动操作）
