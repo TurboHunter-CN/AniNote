@@ -9,10 +9,11 @@ import sys
 import json
 import os
 import re
+import time
 import uuid
 import datetime as datetime_module
 
-VERSION = "3.2"
+VERSION = "3.3"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -20,9 +21,11 @@ from PySide6.QtWidgets import (
     QColorDialog, QMessageBox, QSizePolicy, QFontDialog,
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
+    QFileDialog, QRubberBand,
 )
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate
-from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QEvent, QRect, QPoint
+from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage, QPainter, QPen, QBrush
+from PySide6.QtSvg import QSvgRenderer
 
 from icons import icon, set_icon_font
 
@@ -139,6 +142,37 @@ def get_new_note_title():
     return f"未命名便签({max_num + 1})"
 
 
+def migrate_legacy_notes():
+    """v3.x 迁移：将旧版单文件 .json 便签移入同名文件夹。"""
+    if not os.path.exists(SAVE_DIR):
+        return
+    for fn in os.listdir(SAVE_DIR):
+        if not fn.endswith('.json'):
+            continue
+        src = os.path.join(SAVE_DIR, fn)
+        # 忽略已经是文件夹模式的（data.json）
+        if os.path.basename(src) == "data.json":
+            continue
+        try:
+            with open(src, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            title = data.get("title", fn.replace('.json', ''))
+            folder_name = sanitize_filename(title)
+            folder = os.path.join(SAVE_DIR, folder_name)
+            # 如果目标文件夹已存在，追加序号
+            if os.path.exists(folder):
+                counter = 1
+                while os.path.exists(os.path.join(SAVE_DIR, f"{folder_name}({counter})")):
+                    counter += 1
+                folder_name = f"{folder_name}({counter})"
+                folder = os.path.join(SAVE_DIR, folder_name)
+            os.makedirs(folder, exist_ok=True)
+            dest = os.path.join(folder, "data.json")
+            os.rename(src, dest)
+        except Exception:
+            pass
+
+
 def sanitize_filename(title):
     """将标题转为安全的文件名（去除非法字符，限制长度）。"""
     safe = re.sub(r'[\\/:*?"<>|]', '', title)  # 移除 Windows 非法字符
@@ -148,17 +182,41 @@ def sanitize_filename(title):
     return safe[:80]  # 限制长度
 
 
+def _cleanup_orphan_images(note_dir, html):
+    """删除便签 HTML 中未引用的图片文件。"""
+    if not os.path.isdir(note_dir):
+        return
+    if '<img ' not in html.lower():
+        return  # 无图片，跳过扫描
+    referenced = set()
+    for m in re.finditer(r'src="([^"]+)"', html):
+        src = m.group(1)
+        # 跳过外部 URL
+        if src.startswith(('http:', 'https:', 'file:', 'data:')):
+            continue
+        referenced.add(src)
+    for f in os.listdir(note_dir):
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.svg', '.gif')):
+            if f not in referenced:
+                try:
+                    os.remove(os.path.join(note_dir, f))
+                except OSError:
+                    pass
+
+
 def make_save_path(title, exclude_path=None):
-    """根据标题生成唯一的保存路径，重复时追加 (1) (2) 序号。"""
+    """根据标题生成唯一的文件夹保存路径，返回 data.json 完整路径。"""
     base = sanitize_filename(title)
-    path = os.path.join(SAVE_DIR, f"{base}.json")
+    folder = os.path.join(SAVE_DIR, base)
+    path = os.path.join(folder, "data.json")
     if exclude_path and os.path.abspath(path) == os.path.abspath(exclude_path):
         return path
     if not os.path.exists(path):
         return path
     counter = 1
     while True:
-        path = os.path.join(SAVE_DIR, f"{base}({counter}).json")
+        folder = os.path.join(SAVE_DIR, f"{base}({counter})")
+        path = os.path.join(folder, "data.json")
         if exclude_path and os.path.abspath(path) == os.path.abspath(exclude_path):
             return path
         if not os.path.exists(path):
@@ -280,31 +338,49 @@ class HeaderBar(QWidget):
 # ---------- 缩放手柄 ----------
 
 class ResizeHandle(QWidget):
-    """右下角拖拽缩放控件。"""
+    """便签四角拖拽缩放控件。"""
 
-    def __init__(self, parent_window):
-        super().__init__(parent_window)
-        self.parent_window = parent_window
+    TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT = 0, 1, 2, 3
+
+    def __init__(self, parent, anchor=BOTTOM_RIGHT, window=None):
+        super().__init__(parent)
+        self.parent_window = window or parent
+        self._anchor = anchor
         self.setFixedSize(20, 20)
-        self.setCursor(Qt.SizeFDiagCursor)
-        self.setStyleSheet("background-color: rgba(0, 0, 0, 0.05); border-bottom-right-radius: 12px;")
+        cursors = [Qt.SizeFDiagCursor, Qt.SizeBDiagCursor, Qt.SizeBDiagCursor, Qt.SizeFDiagCursor]
+        self.setCursor(cursors[anchor])
+        bg_styles = [
+            "background-color: rgba(0,0,0,0.05); border-top-left-radius: 12px;",
+            "background-color: rgba(0,0,0,0.05); border-top-right-radius: 12px;",
+            "background-color: rgba(0,0,0,0.05); border-bottom-left-radius: 12px;",
+            "background-color: rgba(0,0,0,0.05); border-bottom-right-radius: 12px;",
+        ]
+        self.setStyleSheet(bg_styles[anchor])
         self._is_resizing = False
         self._start_pos = None
-        self._start_size = None
+        self._start_geom = None
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and not self.parent_window.is_locked:
             self._is_resizing = True
             self._start_pos = event.globalPosition().toPoint()
-            self._start_size = self.parent_window.size()
+            self._start_geom = self.parent_window.geometry()
             event.accept()
 
     def mouseMoveEvent(self, event):
         if self._is_resizing and not self.parent_window.is_locked:
             delta = event.globalPosition().toPoint() - self._start_pos
-            new_w = max(self.parent_window.minimumWidth(), self._start_size.width() + delta.x())
-            new_h = max(self.parent_window.minimumHeight(), self._start_size.height() + delta.y())
-            self.parent_window.resize(new_w, new_h)
+            g = QRect(self._start_geom)
+            a = self._anchor
+            if a in (self.TOP_LEFT, self.BOTTOM_LEFT):
+                g.setLeft(min(g.right() - self.parent_window.minimumWidth(), g.left() + delta.x()))
+            if a in (self.TOP_LEFT, self.TOP_RIGHT):
+                g.setTop(min(g.bottom() - self.parent_window.minimumHeight(), g.top() + delta.y()))
+            if a in (self.TOP_RIGHT, self.BOTTOM_RIGHT):
+                g.setRight(max(g.left() + self.parent_window.minimumWidth(), g.right() + delta.x()))
+            if a in (self.BOTTOM_LEFT, self.BOTTOM_RIGHT):
+                g.setBottom(max(g.top() + self.parent_window.minimumHeight(), g.bottom() + delta.y()))
+            self.parent_window.setGeometry(g)
             event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -522,10 +598,12 @@ class AniNoteWindow(QWidget):
 
         self._build_toolbar()
 
+        self.header.toolbar_layout.addStretch()
+
         # 便签独立快捷键设置按钮
         self.settings_btn = self._create_tool_btn(
             icon("settings"), "设置便签快捷键",
-            self._open_note_hotkey_dialog, "color: #555;"
+            self._open_note_hotkey_dialog, "color: #555; font-weight: normal;"
         )
         set_icon_font(self.settings_btn, 14)
 
@@ -544,6 +622,7 @@ class AniNoteWindow(QWidget):
         set_icon_font(del_btn, 14)
 
         self.text_edit = NoteTextEdit(self)
+        self.text_edit.viewport().installEventFilter(self)
         self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.text_edit.setStyleSheet(
             f"QTextEdit {{ border: none; background: transparent; font-size: 18px; "
@@ -552,13 +631,13 @@ class AniNoteWindow(QWidget):
         self.text_edit.textChanged.connect(self._mark_dirty)
         frame_layout.addWidget(self.text_edit)
 
-        # 右下角缩放手柄
-        size_grip_layout = QHBoxLayout()
-        size_grip_layout.setContentsMargins(0, 0, 0, 0)
-        size_grip_layout.addStretch()
-        self.size_grip = ResizeHandle(self)
-        size_grip_layout.addWidget(self.size_grip)
-        frame_layout.addLayout(size_grip_layout)
+        # 四角缩放手柄（作为 bg_frame 的子控件，在 resizeEvent 中定位）
+        self._grips = [
+            ResizeHandle(self.bg_frame, ResizeHandle.TOP_LEFT, self),
+            ResizeHandle(self.bg_frame, ResizeHandle.TOP_RIGHT, self),
+            ResizeHandle(self.bg_frame, ResizeHandle.BOTTOM_LEFT, self),
+            ResizeHandle(self.bg_frame, ResizeHandle.BOTTOM_RIGHT, self),
+        ]
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -654,7 +733,17 @@ class AniNoteWindow(QWidget):
         set_icon_font(palette_btn, 14)
         
         self._create_tool_btn("☑", "插入待办事项", self.insert_todo, "color: #e67e22;")
-        self.header.toolbar_layout.addStretch()
+        # 截图和插入图片按钮
+        self.screenshot_btn = self._create_tool_btn(
+            icon("content_cut"), "区域截图",
+            self._start_screenshot, "color: #555; font-weight: normal;"
+        )
+        set_icon_font(self.screenshot_btn, 14)
+        self.image_btn = self._create_tool_btn(
+            icon("insert_photo"), "插入图片",
+            self._insert_image, "color: #555; font-weight: normal;"
+        )
+        set_icon_font(self.image_btn, 14)
 
     def _on_main_tool_clicked(self, clicked_btn, index):
         """处理主工具栏点击：互斥展开/收起二级面板"""
@@ -762,8 +851,14 @@ class AniNoteWindow(QWidget):
             ACTIVE_NOTES.remove(self)
         self._deleted = True
         global_signaler.unregister_note_hotkey.emit(self.note_id)
-        if os.path.exists(self.save_file):
+        if self.save_file and os.path.exists(self.save_file):
+            # 删除保存文件
             os.remove(self.save_file)
+            # 如果是文件夹模式（data.json 在子目录中），连目录一起删
+            note_dir = os.path.dirname(self.save_file)
+            if note_dir != SAVE_DIR and os.path.isdir(note_dir):
+                import shutil
+                shutil.rmtree(note_dir)
         self.close()
         global_signaler.note_updated_signal.emit()
 
@@ -828,6 +923,149 @@ class AniNoteWindow(QWidget):
 
         btn_box.accepted.connect(do_register)
         btn_box.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    # ---------- 图片管理 ----------
+
+    def _note_image_dir(self):
+        """返回便签的图片存储目录，按需创建。"""
+        # 用 save_file 所在目录（如果已保存）
+        if self.save_file:
+            img_dir = os.path.dirname(self.save_file)
+            if not os.path.isdir(img_dir):
+                os.makedirs(img_dir, exist_ok=True)
+        else:
+            # 尚未保存：用标题推算
+            base = sanitize_filename(self.header.title_edit.text())
+            img_dir = os.path.join(SAVE_DIR, base)
+            os.makedirs(img_dir, exist_ok=True)
+        return img_dir
+
+    def _has_images(self):
+        """检测便签是否包含图片。"""
+        html = self.text_edit.toHtml()
+        return '<img ' in html.lower()
+
+    def _insert_image(self):
+        """从文件选择器插入图片。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择图片", "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.svg);;所有文件 (*.*)"
+        )
+        if not path:
+            return
+        self._insert_image_file(path)
+
+    def _insert_image_file(self, src_path):
+        """将图片复制到便签目录并插入光标处。"""
+        import shutil
+        img_dir = self._note_image_dir()
+        ext = os.path.splitext(src_path)[1].lower() or ".png"
+        ts = int(time.time() * 1000)
+        name = f"img_{ts:013d}{ext}"
+        dest = os.path.join(img_dir, name)
+
+        from PySide6.QtGui import QPixmap, QImage
+        if ext == ".svg":
+            raster, _ = QSvgRenderer.load(src_path)
+            if raster and not raster.isNull():
+                raster.save(dest, "PNG")
+            shutil.copy2(src_path, os.path.join(img_dir, f"img_{ts:013d}.svg"))
+        else:
+            shutil.copy2(src_path, dest)
+
+        cursor = self.text_edit.textCursor()
+        url = f"file:///{dest.replace(os.sep, '/')}"
+        cursor.insertHtml(
+            f'<img src="{url}" '
+            f'style="max-width:100%; max-height:400px;" '
+            f'title="双击查看原图">'
+        )
+        self._mark_dirty()
+
+    def _start_screenshot(self):
+        """启动区域截图。"""
+        self.hide()  # 隐藏便签避免截到自己
+        QApplication.processEvents()
+        QTimer.singleShot(200, self._do_region_screenshot)
+
+    def _do_region_screenshot(self):
+        """弹出区域截图遮罩。"""
+        screen = QApplication.primaryScreen()
+        if not screen:
+            self.show()
+            return
+        pixmap = screen.grabWindow(0)
+        self._screenshot_overlay = RegionSelector(pixmap)
+        self._screenshot_overlay.selected.connect(self._on_region_selected)
+        self._screenshot_overlay.showFullScreen()
+
+    def _on_region_selected(self, cropped_pixmap):
+        """区域截图完成，插入到便签。"""
+        self.show()
+        if cropped_pixmap.isNull():
+            return
+        img_dir = self._note_image_dir()
+        ts = int(time.time() * 1000)
+        name = f"screenshot_{ts:013d}.png"
+        dest = os.path.join(img_dir, name)
+        ok = cropped_pixmap.save(dest, "PNG")
+        if not ok:
+            return
+        cursor = self.text_edit.textCursor()
+        url = f"file:///{dest.replace(os.sep, '/')}"
+        cursor.insertHtml(
+            f'<img src="{url}" '
+            f'style="max-width:100%; max-height:400px;" '
+            f'title="双击查看原图">'
+        )
+        self._mark_dirty()
+        self.raise_()
+        self.activateWindow()
+
+    # ---------- 双击查看大图 ----------
+
+    def eventFilter(self, obj, event):
+        """拦截 QTextEdit 内双击图片事件。"""
+        from PySide6.QtCore import QEvent
+        if obj == self.text_edit.viewport() and event.type() == QEvent.MouseButtonDblClick:
+            cursor = self.text_edit.cursorForPosition(event.pos())
+            fmt = cursor.charFormat()
+            if fmt.isImageFormat():
+                img_fmt = fmt.toImageFormat()
+                if img_fmt.name():
+                    self._show_full_image(img_fmt.name())
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _show_full_image(self, src):
+        """弹出窗口显示原图。"""
+        # 处理 file:// 协议
+        if src.startswith("file:///"):
+            import urllib.parse
+            full_path = urllib.parse.unquote(src[8:])  # 去掉 file:///
+            full_path = full_path.replace('/', os.sep)
+        else:
+            img_dir = self._note_image_dir()
+            full_path = os.path.join(img_dir, src)
+        if not os.path.exists(full_path):
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(src)
+        dlg.setMinimumSize(200, 200)
+        pixmap = QPixmap(full_path)
+        if pixmap.isNull():
+            return
+        screen = QApplication.primaryScreen().geometry()
+        max_w = int(screen.width() * 0.85)
+        max_h = int(screen.height() * 0.85)
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+            pixmap = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        lbl = QLabel(pixmap=pixmap)
+        lbl.setScaledContents(False)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(lbl)
+        dlg.adjustSize()
         dlg.exec()
 
     def show_context_menu(self, pos):
@@ -902,7 +1140,8 @@ class AniNoteWindow(QWidget):
         locked = self.is_locked
         self.header.toolbar_container.setVisible(not locked)
         self.header.drag_handle.setVisible(not locked)
-        self.size_grip.setVisible(not locked)
+        for g in self._grips:
+            g.setVisible(not locked)
         self.header.title_edit.setReadOnly(locked)
         self.text_edit.setReadOnly(locked)
         if locked:
@@ -979,21 +1218,66 @@ class AniNoteWindow(QWidget):
             os.makedirs(SAVE_DIR)
 
         title = self.header.title_edit.text()
-        # 根据当前标题生成目标路径（排除自身避免无意义重命名）
-        new_path = make_save_path(title, exclude_path=self.save_file)
+        base = sanitize_filename(title)
 
-        # 如果有旧文件且路径不同 → 先删除旧文件（重命名效果）
+        # 统一文件夹模式：所有便签都存为 {标题}/data.json
+        folder = os.path.join(SAVE_DIR, base)
+        new_path = os.path.join(folder, "data.json")
+
+        # 如果有旧单文件，先删除（升级场景）
+        old_single = os.path.join(SAVE_DIR, f"{base}.json")
+        if os.path.exists(old_single):
+            try:
+                os.remove(old_single)
+            except OSError:
+                pass
+
+        # 优先使用现有路径（避免标题未变时重复建文件夹）
+        if self.save_file and os.path.exists(self.save_file):
+            new_path = self.save_file
+        else:
+            new_path = make_save_path(title, exclude_path=self.save_file)
+
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+
+        # 如果有旧文件且路径不同 → 删除旧文件，清理旧空文件夹
         if self.save_file and os.path.exists(self.save_file) and os.path.abspath(self.save_file) != os.path.abspath(new_path):
+            old_dir = os.path.dirname(self.save_file)
             try:
                 os.remove(self.save_file)
+                # 尝试删除旧文件夹（失败了也无所谓，里面可能有图片）
+                if old_dir != SAVE_DIR and os.path.isdir(old_dir):
+                    import shutil
+                    shutil.rmtree(old_dir, ignore_errors=True)
             except OSError:
                 pass
 
         self.save_file = new_path
+        # 将文件绝对路径的 img src 还原为相对路径
+        html = self.text_edit.toHtml()
+        note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+        # 处理 file:// URL（含 URL 编码），还原为相对路径
+        import urllib.parse
+        def _unfile_src(m):
+            raw = m.group(1)
+            decoded = urllib.parse.unquote(raw)
+            for prefix in ('file:///', 'file://', 'file:'):
+                if decoded.startswith(prefix):
+                    decoded = decoded[len(prefix):]
+                    break
+            try:
+                rel = os.path.relpath(decoded, note_dir.replace('/', os.sep))
+                return f'src="{rel.replace(os.sep, "/")}"'
+            except ValueError:
+                return m.group(0)
+        html = re.sub(r'src="(file://[^"]+)"', _unfile_src, html)
+        # 清理未被引用的图片文件
+        _cleanup_orphan_images(note_dir, html)
+
         data = {
             "note_id": self.note_id,
             "title": title,
-            "html_content": self.text_edit.toHtml(),
+            "html_content": html,
             "x": self.x(), "y": self.y(),
             "width": self.width(), "height": self.height(),
             "is_locked": self.is_locked,
@@ -1015,25 +1299,37 @@ class AniNoteWindow(QWidget):
             ACTIVE_NOTES.remove(self)
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        """重新定位四角缩放手柄。"""
+        super().resizeEvent(event)
+        bw = self.bg_frame.width()
+        bh = self.bg_frame.height()
+        gs = 20
+        self._grips[0].move(0, 0)           # 左上
+        self._grips[1].move(bw - gs, 0)      # 右上
+        self._grips[2].move(0, bh - gs)      # 左下
+        self._grips[3].move(bw - gs, bh - gs) # 右下
+
     def load_data(self):
         """从 JSON 文件恢复便签状态。"""
         self._is_loading = True     # 护盾：加载期间禁止自动保存
 
-        # 通过 note_id 在目录中查找对应的文件
+        # 通过 note_id 在目录中查找对应的文件（文件夹模式）
         if not self.save_file and os.path.exists(SAVE_DIR):
-            for filename in os.listdir(SAVE_DIR):
-                if not filename.endswith('.json'):
+            for item in os.listdir(SAVE_DIR):
+                item_path = os.path.join(SAVE_DIR, item)
+                if not os.path.isdir(item_path):
                     continue
-                fpath = os.path.join(SAVE_DIR, filename)
-                try:
-                    with open(fpath, 'r', encoding='utf-8') as fh:
-                        data = json.load(fh)
-                    # 新格式：JSON 内嵌 note_id
-                    if data.get("note_id") == self.note_id:
-                        self.save_file = fpath
-                        break
-                except (json.JSONDecodeError, OSError):
-                    pass
+                data_file = os.path.join(item_path, "data.json")
+                if os.path.exists(data_file):
+                    try:
+                        with open(data_file, 'r', encoding='utf-8') as fh:
+                            data = json.load(fh)
+                        if data.get("note_id") == self.note_id:
+                            self.save_file = data_file
+                            break
+                    except (json.JSONDecodeError, OSError):
+                        pass
             # 旧格式兜底：文件名即 ID（v2.x 及更早）
             if not self.save_file:
                 legacy = os.path.join(SAVE_DIR, f"{self.note_id}.json")
@@ -1045,7 +1341,18 @@ class AniNoteWindow(QWidget):
                 with open(self.save_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.header.title_edit.setText(data.get("title", get_new_note_title()))
-                    self.text_edit.setHtml(data.get("html_content", ""))
+                    html = data.get("html_content", "")
+                    # 将相对路径图片转为绝对 file:// URL
+                    if self.save_file:
+                        note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+                        html = re.sub(
+                            r'src="([^"]+)"',
+                            lambda m: f'src="file:///{note_dir}/{m.group(1)}"'
+                            if not m.group(1).startswith(('file:', 'http:', 'data:'))
+                            else m.group(0),
+                            html
+                        )
+                    self.text_edit.setHtml(html)
                     x = data.get("x", 100)
                     y = data.get("y", 100)
                     w = max(data.get("width", 320), 300)
@@ -1071,6 +1378,92 @@ class AniNoteWindow(QWidget):
         """配置变更后更新工具栏按钮的快捷键提示。"""
         cfg = load_config()
         self.new_note_btn.setToolTip(f"新建 ({cfg.get('new_hotkey', 'alt+m').upper()})")
+
+
+# ---------- 区域截图遮罩 ----------
+
+class RegionSelector(QWidget):
+    """全屏半透明遮罩，支持拖拽选区截图。"""
+
+    selected = Signal(QPixmap)
+
+    def __init__(self, full_pixmap):
+        super().__init__()
+        self._full = full_pixmap
+        self._origin = QPoint()
+        self._rect = QRect()
+        self._drawing = False
+        self.setCursor(Qt.CrossCursor)
+        # 确保遮罩在所有窗口之上
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.grabMouse()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._full)
+        dark = QColor(0, 0, 0, 100)
+        p.fillRect(self.rect(), dark)
+        if not self._rect.isNull():
+            # 用背景图的逻辑坐标缩放版本填充选区，避免高 DPI 放大
+            sx = self._full.width() / self.width()
+            sy = self._full.height() / self.height()
+            src_rect = QRect(
+                int(self._rect.x() * sx),
+                int(self._rect.y() * sy),
+                int(self._rect.width() * sx),
+                int(self._rect.height() * sy)
+            )
+            p.drawPixmap(self._rect, self._full, src_rect)
+            pen = QPen(QColor("#0078D7"), 2, Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(self._rect)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._origin = event.pos()
+            self._rect = QRect()
+            self._drawing = True
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._drawing:
+            self._rect = QRect(self._origin, event.pos()).normalized()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._drawing and event.button() == Qt.LeftButton:
+            self._drawing = False
+            self._rect = QRect(self._origin, event.pos()).normalized()
+            if self._rect.width() > 10 and self._rect.height() > 10:
+                # 将逻辑坐标映射到物理像素
+                sx = self._full.width() / self.width()
+                sy = self._full.height() / self.height()
+                phys = QRect(
+                    int(self._rect.x() * sx),
+                    int(self._rect.y() * sy),
+                    int(self._rect.width() * sx),
+                    int(self._rect.height() * sy)
+                )
+                cropped = self._full.copy(phys)
+                self.selected.emit(cropped)
+            self.releaseMouse()
+            self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.releaseMouse()
+            self.close()
+
+    def closeEvent(self, event):
+        try:
+            self.releaseMouse()
+        except:
+            pass
+        super().closeEvent(event)
 
 
 # ---------- 事务追踪器 ----------
@@ -1794,6 +2187,7 @@ class HabitTrackerWindow(AniNoteWindow):
 
         title = self.header.title_edit.text()
         new_path = make_save_path(title, exclude_path=self.save_file)
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
         if self.save_file and os.path.exists(self.save_file) and os.path.abspath(self.save_file) != os.path.abspath(new_path):
             try:
                 os.remove(self.save_file)

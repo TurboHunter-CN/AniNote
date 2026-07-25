@@ -652,14 +652,18 @@ class ControlPanel(QWidget):
 
     @staticmethod
     def _load_notes_from_disk():
-        """扫描存储目录，返回便签的摘要信息列表。"""
+        """扫描存储目录，返回便签的摘要信息列表（文件夹模式）。"""
         data_list = []
         if os.path.exists(SAVE_DIR):
-            for filename in os.listdir(SAVE_DIR):
-                if not filename.endswith('.json'):
+            for item in os.listdir(SAVE_DIR):
+                item_path = os.path.join(SAVE_DIR, item)
+                if not os.path.isdir(item_path):
+                    continue
+                data_file = os.path.join(item_path, "data.json")
+                if not os.path.exists(data_file):
                     continue
                 try:
-                    with open(os.path.join(SAVE_DIR, filename), 'r', encoding='utf-8') as f:
+                    with open(data_file, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     title = data.get("title", "未命名便签")
                     is_top = data.get("is_always_on_top", True)
@@ -670,7 +674,7 @@ class ControlPanel(QWidget):
                         raw_text = "[空便签内容]"
                     bg_color = data.get("bg_color", [255, 249, 196, 242])
                     data_list.append({
-                        "id": data.get("note_id", filename.replace('.json', '')),
+                        "id": data.get("note_id", ""),
                         "title": title,
                         "text": raw_text,
                         "is_top": is_top,

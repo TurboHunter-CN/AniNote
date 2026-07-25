@@ -327,7 +327,16 @@ def main():
 
     # 将验证后的实际路径同步给核心引擎
     note_app.SAVE_DIR = save_dir
-    files = [f for f in os.listdir(save_dir) if f.endswith('.json')]
+
+    # 迁移旧版单文件到文件夹
+    note_app.migrate_legacy_notes()
+
+    # 收集所有便签（文件夹内的 data.json）
+    files = []
+    for d in os.listdir(save_dir):
+        dpath = os.path.join(save_dir, d)
+        if os.path.isdir(dpath) and os.path.exists(os.path.join(dpath, "data.json")):
+            files.append(f"{d}/data.json")
 
     # 首次运行：创建欢迎便签
     if cfg.get("is_first_run", True):
@@ -339,16 +348,16 @@ def main():
         <br>
         <p>这里有一份快速上手指南，看完就可以把它删掉：</p>
         <br>
-        <p><b>1. 移动与缩放</b>: 按住右上角 ⋮⋮ 区域拖动便签，拖拽右下角可自由缩放。</p>
+        <p><b>1. 移动与缩放</b>: 按住右上角 ⋮⋮ 区域拖动便签，拖拽任意边角可自由缩放。</p>
         <p><b>2. 右键菜单</b>: 在便签上右键，可以锁定、置顶、隐藏、导出 Word 文档。</p>
         <p><b>3. 待办事项</b>: 点击顶部工具栏的待办按钮，插入可勾选的待办方块。</p>
         <p><b>4. 富文本编辑</b>: 粗体、斜体、下划线、字号、颜色、背景色，随心搭配。</p>
-        <p><b>5. 全局快捷键</b>: <b>Alt+M</b> 新建便签 | <b>Alt+N</b> 隐藏/显示全部 | <b>Alt+C</b> 呼出控制台（可在控制面板中自定义）。</p>
-        <p><b>6. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
-        <p><b>7. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
-        <p><b>8. 新番信息</b>: 在控制面板中绑定 Bangumi UID，即可自动拉取追番日历（大陆网络环境需自备代理）。</p>
-        <p><b>9. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
-        <p><b>10. 更多设置</b>: 控制面板中支持自定义快捷键、数据存储目录、开机自启、字体选择等。</p>
+        <p><b>5. 截图与插图</b>: 工具栏剪刀按钮区域截图，图片按钮从文件插入，图片自动存入便签专属文件夹。</p>
+        <p><b>6. 全局快捷键</b>: <b>Alt+M</b> 新建 | <b>Alt+N</b> 隐藏/显示 | <b>Alt+C</b> 控制台（可在控制面板中自定义）。</p>
+        <p><b>7. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
+        <p><b>8. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
+        <p><b>9. 新番信息</b>: 在控制面板中绑定 Bangumi UID，自动拉取追番日历（大陆网络环境需自备代理）。</p>
+        <p><b>10. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
         """)
         note.save_data()
         note.show()
@@ -571,12 +580,15 @@ def main():
         """按 ID 显示便签；如果未实例化则创建。"""
         for note in note_app.ACTIVE_NOTES:
             if note.note_id == note_id:
+                note.is_hidden = False
+                note.save_data()
                 note.show()
                 note.activateWindow()
                 return
         new_note = (note_app.HabitTrackerWindow(note_id=note_id)
                     if note_id.startswith("habit_")
                     else note_app.AniNoteWindow(note_id=note_id))
+        new_note.is_hidden = False
         new_note.show()
         new_note.activateWindow()
 
@@ -587,18 +599,31 @@ def main():
                 note.delete_note(confirm=False)
                 return
         # 便签未实例化，通过扫描目录按 note_id 查找文件
-        for f in os.listdir(note_app.SAVE_DIR):
-            if not f.endswith('.json'):
-                continue
-            fpath = os.path.join(note_app.SAVE_DIR, f)
-            try:
-                with open(fpath, 'r', encoding='utf-8') as fh:
-                    data = json.load(fh)
-                if data.get("note_id") == nid:
-                    os.remove(fpath)
-                    break
-            except (json.JSONDecodeError, OSError):
-                pass
+        for fn in os.listdir(note_app.SAVE_DIR):
+            item_path = os.path.join(note_app.SAVE_DIR, fn)
+            # 文件夹模式
+            if os.path.isdir(item_path):
+                data_file = os.path.join(item_path, "data.json")
+                if os.path.exists(data_file):
+                    try:
+                        with open(data_file, 'r', encoding='utf-8') as fh:
+                            data = json.load(fh)
+                        if data.get("note_id") == nid:
+                            import shutil
+                            shutil.rmtree(item_path)
+                            break
+                    except (json.JSONDecodeError, OSError):
+                        pass
+            # 单文件模式
+            elif fn.endswith('.json'):
+                try:
+                    with open(item_path, 'r', encoding='utf-8') as fh:
+                        data = json.load(fh)
+                    if data.get("note_id") == nid:
+                        os.remove(item_path)
+                        break
+                except (json.JSONDecodeError, OSError):
+                    pass
         panel.refresh_notes_wall()
 
     def set_note_top(nid, is_top):

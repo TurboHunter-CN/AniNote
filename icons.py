@@ -150,6 +150,9 @@ _ICONS = {
     "menu":          "\ue5d2",   # 菜单
     "home":          "\ue88a",   # 主页
     "palette":       "\ue40a",   # 调色板
+    "photo_camera":  "\ue412",   # 相机/截图
+    "insert_photo":  "\ue3f4",   # 图片/插入图片
+    "content_cut":   "\ue14e",   # 剪刀
     "format_bold":   "\ue238",
     "format_italic": "\ue23f",
     "format_underlined": "\ue249",
