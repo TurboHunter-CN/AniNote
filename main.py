@@ -674,7 +674,7 @@ class AniNoteWindow(QWidget):
         仅首次创建时套用蓝色主题；已有存档则保留用户自定义的外观。
         """
         self.is_locked = True
-        if not os.path.exists(self.save_file):
+        if not (self.save_file and os.path.exists(self.save_file)):
             self.is_always_on_top = False
             self.bg_color = [235, 245, 255, 242]
             self._apply_bg_color()
@@ -1028,11 +1028,17 @@ class AniNoteWindow(QWidget):
                 try:
                     with open(fpath, 'r', encoding='utf-8') as fh:
                         data = json.load(fh)
+                    # 新格式：JSON 内嵌 note_id
                     if data.get("note_id") == self.note_id:
                         self.save_file = fpath
                         break
                 except (json.JSONDecodeError, OSError):
                     pass
+            # 旧格式兜底：文件名即 ID（v2.x 及更早）
+            if not self.save_file:
+                legacy = os.path.join(SAVE_DIR, f"{self.note_id}.json")
+                if os.path.exists(legacy):
+                    self.save_file = legacy
 
         if self.save_file and os.path.exists(self.save_file):
             try:
