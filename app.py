@@ -215,19 +215,27 @@ class Win32HotkeyManager(QAbstractNativeEventFilter):
             elif p in self.VK_MAP:
                 vk = self.VK_MAP[p]
         if vk == 0:
-            return
+            return -1
 
         hk_id = self.hk_id_counter
         self.hk_id_counter += 1
         success = ctypes.windll.user32.RegisterHotKey(None, hk_id, modifiers, vk)
         if success:
             self.hotkeys[hk_id] = callback
+            return hk_id
+        return -1
 
     def clear_all(self):
         """注销所有已注册热键。"""
-        for hk_id in self.hotkeys.keys():
+        for hk_id in list(self.hotkeys.keys()):
             ctypes.windll.user32.UnregisterHotKey(None, hk_id)
         self.hotkeys.clear()
+
+    def unregister_by_id(self, hk_id):
+        """注销单个热键。"""
+        if hk_id in self.hotkeys:
+            ctypes.windll.user32.UnregisterHotKey(None, hk_id)
+            del self.hotkeys[hk_id]
 
     def nativeEventFilter(self, eventType, message):
         """拦截系统 WM_HOTKEY 消息并分发到对应回调。"""
@@ -327,17 +335,20 @@ def main():
         note.resize(550, 500)
         note.header.title_edit.setText(f"欢迎使用 AniNote v{note_app.VERSION}！")
         note.text_edit.setHtml("""
-        <p><b>👋 你好，欢迎来到属于你的桌面便签！</b></p>
+        <p><span style="font-size:18px;font-weight:600;">你好，欢迎来到属于你的桌面便签！</span></p>
+        <br>
         <p>这里有一份快速上手指南，看完就可以把它删掉：</p>
-        <p>1. <b>移动与排版</b>: 按住右上角的 <span style="color: #aaa;"><b>⋮⋮</b></span> 及其右侧区域可以拖动；拖动右下角可以缩放。</p>
-        <p>2. <b>右键菜单</b>: 在便签上右键，可以【锁定】或【隐藏】。锁定状态下无法对便签进行操作</p>
-        <p>3. <b>待办事项</b>: 点击顶部的 ☑，试试看点击下面这个方块：</p>
-        <p>☐ 这是一个待办事项，点我就可以打勾</p>
-        <p>4. <b>快捷呼唤</b>: 随时按 <b>Alt+M</b> 新建，按 <b>Alt+N</b> 隐藏（快捷键可更改）。</p>
-        <p>5. <b>皮肤更换</b>: 暂未上线，在遥远的未来或许有更改成二次元风格的功能。</p>
-        <p>6. <b>控制面板</b>: 系统任务栏里或者便签右键可以打开控制面板，探索更多功能。</p>
-        <p>7. <b>新番信息</b>: 控制面板中开启并绑定Bangumi UID即可监测自己账户的新番更新, 在大陆网络环境需自备梯子</p>
-        <p>8. <b>事务追踪器</b>: 控制面板中右上角“新建事务追踪”即可创建该便签</p>
+        <br>
+        <p><b>1. 移动与缩放</b>: 按住右上角 ⋮⋮ 区域拖动便签，拖拽右下角可自由缩放。</p>
+        <p><b>2. 右键菜单</b>: 在便签上右键，可以锁定、置顶、隐藏、导出 Word 文档。</p>
+        <p><b>3. 待办事项</b>: 点击顶部工具栏的待办按钮，插入可勾选的待办方块。</p>
+        <p><b>4. 富文本编辑</b>: 粗体、斜体、下划线、字号、颜色、背景色，随心搭配。</p>
+        <p><b>5. 全局快捷键</b>: <b>Alt+M</b> 新建便签 | <b>Alt+N</b> 隐藏/显示全部 | <b>Alt+C</b> 呼出控制台（可在控制面板中自定义）。</p>
+        <p><b>6. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
+        <p><b>7. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
+        <p><b>8. 新番信息</b>: 在控制面板中绑定 Bangumi UID，即可自动拉取追番日历（大陆网络环境需自备代理）。</p>
+        <p><b>9. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
+        <p><b>10. 更多设置</b>: 控制面板中支持自定义快捷键、数据存储目录、开机自启、字体选择等。</p>
         """)
         note.save_data()
         note.show()
@@ -345,7 +356,13 @@ def main():
         note_app.save_config(cfg)
     else:
         for f in files:
-            note_id = f.replace('.json', '')
+            fpath = os.path.join(save_dir, f)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+                note_id = data.get("note_id", f.replace('.json', ''))
+            except (json.JSONDecodeError, OSError):
+                note_id = f.replace('.json', '')
             if note_id.startswith("habit_"):
                 note = note_app.HabitTrackerWindow(note_id=note_id)
             else:
@@ -475,6 +492,81 @@ def main():
         lambda: trigger_bangumi_sync(note_app.load_config(), delay=0, force=True)
     )
 
+    # 便签独立快捷键管理
+    _per_note_hk = {}  # note_id -> hotkey_str
+    _shared_hk = {}    # hotkey_str -> (hk_id, [note_ids])
+
+    def _on_register_note_hotkey(note_id, hotkey_str):
+        """注册便签独立快捷键。同一组合键只注册一次，触发时广播到所有绑定的便签。"""
+        # 先注销旧键（从共享组中移除）
+        _on_unregister_note_hotkey(note_id)
+
+        if not hotkey_str.strip():
+            return
+
+        _per_note_hk[note_id] = hotkey_str
+        key = hotkey_str.lower().strip()
+
+        if key in _shared_hk:
+            # 组合键已存在，加入便签列表
+            _shared_hk[key][1].append(note_id)
+        else:
+            # 首次注册该组合键
+            def show_notes():
+                for nid in _shared_hk.get(key, (0, []))[1]:
+                    for note in note_app.ACTIVE_NOTES:
+                        if note.note_id == nid:
+                            if note.isHidden():
+                                note.show()
+                            note.raise_()
+                            note.activateWindow()
+                            break
+                    else:
+                        open_note_by_id(nid)
+
+            hk_id = hotkey_manager.register(hotkey_str, show_notes)
+            if hk_id >= 0:
+                _shared_hk[key] = (hk_id, [note_id])
+
+    def _on_unregister_note_hotkey(note_id):
+        """注销便签独立快捷键。"""
+        hotkey_str = _per_note_hk.pop(note_id, None)
+        if not hotkey_str:
+            return
+        key = hotkey_str.lower().strip()
+        if key in _shared_hk:
+            hk_id, note_ids = _shared_hk[key]
+            if note_id in note_ids:
+                note_ids.remove(note_id)
+            if not note_ids:
+                # 没有便签使用了，注销系统热键
+                hotkey_manager.unregister_by_id(hk_id)
+                del _shared_hk[key]
+
+    def _on_check_hotkey_conflict(hotkey_str, callback):
+        """检查快捷键是否被其他便签占用。callback(conflict_names_list)"""
+        conflicts = []
+        key = hotkey_str.lower().strip()
+        for nid, hk in _per_note_hk.items():
+            if hk.lower().strip() != key:
+                continue
+            for fn in os.listdir(note_app.SAVE_DIR):
+                if not fn.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(note_app.SAVE_DIR, fn), 'r', encoding='utf-8') as fh:
+                        jdata = json.load(fh)
+                    if jdata.get("note_id") == nid:
+                        conflicts.append(jdata.get("title", fn.replace('.json', '')))
+                        break
+                except:
+                    pass
+        callback(conflicts)
+
+    note_app.global_signaler.register_note_hotkey.connect(_on_register_note_hotkey)
+    note_app.global_signaler.unregister_note_hotkey.connect(_on_unregister_note_hotkey)
+    note_app.global_signaler.check_hotkey_conflict.connect(_on_check_hotkey_conflict)
+
     def open_note_by_id(note_id):
         """按 ID 显示便签；如果未实例化则创建。"""
         for note in note_app.ACTIVE_NOTES:
@@ -494,10 +586,19 @@ def main():
             if note.note_id == nid:
                 note.delete_note(confirm=False)
                 return
-        # 便签未实例化，直接删磁盘文件
-        file_path = os.path.join(note_app.SAVE_DIR, f"{nid}.json")
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # 便签未实例化，通过扫描目录按 note_id 查找文件
+        for f in os.listdir(note_app.SAVE_DIR):
+            if not f.endswith('.json'):
+                continue
+            fpath = os.path.join(note_app.SAVE_DIR, f)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+                if data.get("note_id") == nid:
+                    os.remove(fpath)
+                    break
+            except (json.JSONDecodeError, OSError):
+                pass
         panel.refresh_notes_wall()
 
     def set_note_top(nid, is_top):
@@ -512,18 +613,34 @@ def main():
                 panel.refresh_notes_wall()
                 return
 
-        # 便签未实例化，直接修改磁盘文件
-        file_path = os.path.join(note_app.SAVE_DIR, f"{nid}.json")
-        if os.path.exists(file_path):
+        # 便签未实例化，通过扫描目录按 note_id 查找文件
+        for fn in os.listdir(note_app.SAVE_DIR):
+            if not fn.endswith('.json'):
+                continue
+            fpath = os.path.join(note_app.SAVE_DIR, fn)
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                with open(fpath, "r", encoding="utf-8") as fi:
+                    data = json.load(fi)
+                if data.get("note_id") != nid:
+                    continue
                 data["is_always_on_top"] = is_top
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
+                with open(fpath, "w", encoding="utf-8") as fo:
+                    json.dump(data, fo, ensure_ascii=False, indent=4)
                 panel.refresh_notes_wall()
+                break
             except Exception:
                 pass
+
+    def _open_note_hotkey_by_id(note_id):
+        """通过控制面板触发便签快捷键设置。"""
+        for note in note_app.ACTIVE_NOTES:
+            if note.note_id == note_id:
+                note._open_note_hotkey_dialog()
+                return
+        # 便签未实例化，先创建再打开
+        new_note = note_app.AniNoteWindow(note_id=note_id)
+        new_note.show()
+        new_note._open_note_hotkey_dialog()
 
     def export_note_by_id(nid):
         """将指定便签导出为 Word 文档（.doc），保留全部富文本格式。
@@ -532,8 +649,21 @@ def main():
         Word / WPS 可直接打开，加粗/斜体/颜色/字号/待办项全部保留。
         """
         try:
-            file_path = os.path.join(note_app.SAVE_DIR, f"{nid}.json")
-            if not os.path.exists(file_path):
+            # 扫描查找文件
+            file_path = None
+            for fn in os.listdir(note_app.SAVE_DIR):
+                if not fn.endswith('.json'):
+                    continue
+                fp = os.path.join(note_app.SAVE_DIR, fn)
+                try:
+                    with open(fp, 'r', encoding='utf-8') as fh:
+                        jdata = json.load(fh)
+                    if jdata.get("note_id") == nid:
+                        file_path = fp
+                        break
+                except:
+                    pass
+            if not file_path:
                 QMessageBox.warning(panel, "导出失败", "未找到该便签的数据文件。")
                 return
 
@@ -584,6 +714,7 @@ def main():
     panel.request_delete_note.connect(delete_note_by_id)
     panel.request_set_top.connect(set_note_top)
     panel.request_export_note.connect(export_note_by_id)
+    panel.request_set_note_hotkey.connect(_open_note_hotkey_by_id)
 
     # ==========================================
     #  系统托盘菜单
@@ -627,7 +758,9 @@ def main():
     )
     action_toggle.triggered.connect(lambda: note_app.global_signaler.toggle_signal.emit())
 
-    action_panel = QAction("打开总控制台", app)
+    action_panel = QAction(
+        f"打开总控制台 ({cfg.get('panel_hotkey', 'alt+c').upper()})", app
+    )
     action_panel.triggered.connect(
         show_and_focus_panel)
 
@@ -672,6 +805,7 @@ def main():
             hk_new = config["new_hotkey"].strip()
             hk_show_all = config.get("show_all_hotkey", "alt+shift+n").strip()
             hk_disable = config.get("disable_all_hotkey", "ctrl+shift+a").strip()
+            hk_panel = config.get("panel_hotkey", "alt+c").strip()
 
             if hk_toggle:
                 hotkey_manager.register(hk_toggle, lambda: note_app.global_signaler.toggle_signal.emit())
@@ -679,6 +813,8 @@ def main():
                 hotkey_manager.register(hk_new, lambda: note_app.global_signaler.new_note_signal.emit())
             if hk_show_all:
                 hotkey_manager.register(hk_show_all, lambda: note_app.global_signaler.show_all_signal.emit())
+            if hk_panel:
+                hotkey_manager.register(hk_panel, show_and_focus_panel)
             #注册主控开关
             if hk_disable:
                 def toggle_pause():
@@ -711,6 +847,9 @@ def main():
         action_new.setText(f"新建便签 ({new_cfg['new_hotkey'].upper()})")
         action_toggle.setText(
             f"隐藏/显示所有便签 ({new_cfg['toggle_hotkey'].upper()})"
+        )
+        action_panel.setText(
+            f"打开总控制台 ({new_cfg.get('panel_hotkey', 'alt+c').upper()})"
         )
 
         # 立即触发一次同步，延迟为 0（用户主动操作）

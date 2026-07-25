@@ -150,11 +150,13 @@ class NoteCard(QFrame):
     delete_clicked = Signal(str)
     set_top_clicked = Signal(str, bool)
     export_clicked = Signal(str)
+    set_hotkey_clicked = Signal(str)  # note_id
 
     def __init__(self, note_info, parent=None):
         super().__init__(parent)
         self.note_id = note_info["id"]
         self.is_top = note_info["is_top"]
+        self._note_hotkey = note_info.get("note_hotkey", "")
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(160, 160)
         r, g, b = note_info.get("bg_color", [255, 249, 196])[:3]
@@ -246,12 +248,16 @@ class NoteCard(QFrame):
             else "置于最顶部"
         )
         export_action = menu.addAction("导出为 Word 文档 (.doc)")
+        hk_label = f"设置便签快捷键 ({self._note_hotkey.upper()})" if self._note_hotkey else "设置便签快捷键"
+        hotkey_action = menu.addAction(hk_label)
         action = menu.exec(self.mapToGlobal(pos))
         if action == top_action:
             self.is_top = not self.is_top
             self.set_top_clicked.emit(self.note_id, self.is_top)
         elif action == export_action:
             self.export_clicked.emit(self.note_id)
+        elif action == hotkey_action:
+            self.set_hotkey_clicked.emit(self.note_id)
 
 
 # ==========================================
@@ -357,6 +363,7 @@ class ControlPanel(QWidget):
     request_delete_note = Signal(str)
     request_set_top = Signal(str, bool)
     request_export_note = Signal(str)
+    request_set_note_hotkey = Signal(str)
     settings_changed = Signal(dict)
 
     # 导航按钮默认/选中样式（QPushButton 保留用于兼容）
@@ -631,6 +638,7 @@ class ControlPanel(QWidget):
             card.delete_clicked.connect(self._handle_card_delete)
             card.set_top_clicked.connect(self.request_set_top.emit)
             card.export_clicked.connect(self.request_export_note.emit)
+            card.set_hotkey_clicked.connect(self.request_set_note_hotkey.emit)
             self.flow_container.add_item(card)
             visible_count += 1
 
@@ -662,11 +670,12 @@ class ControlPanel(QWidget):
                         raw_text = "[空便签内容]"
                     bg_color = data.get("bg_color", [255, 249, 196, 242])
                     data_list.append({
-                        "id": filename.replace('.json', ''),
+                        "id": data.get("note_id", filename.replace('.json', '')),
                         "title": title,
                         "text": raw_text,
                         "is_top": is_top,
                         "bg_color": bg_color,
+                        "note_hotkey": data.get("note_hotkey", ""),
                     })
                 except Exception:
                     pass
@@ -828,6 +837,11 @@ class ControlPanel(QWidget):
             "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
             " font-weight: bold; color: #dc3545;" 
         )
+        self.panel_hotkey_input = QLineEdit(cfg.get("panel_hotkey", "alt+c"))
+        self.panel_hotkey_input.setStyleSheet(
+            "padding: 8px; border: 1px solid #ccc; border-radius: 5px;"
+            " font-weight: bold; color: #17a2b8;"
+        )
 
         # ---------- Bangumi 设置 ----------
 
@@ -921,6 +935,7 @@ class ControlPanel(QWidget):
         form_layout.addRow(_lbl("<b>新建便签全局快捷键：</b>"), self.new_hotkey_input)
         form_layout.addRow(_lbl("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
         form_layout.addRow(_lbl("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
+        form_layout.addRow(_lbl("<b>呼出控制台快捷键：</b>"), self.panel_hotkey_input)
         form_layout.addRow(_lbl("<b>绑定 Bangumi UID：</b>"), bangumi_layout)
         form_layout.addRow(_lbl("<b>API 代理地址：</b>"), proxy_layout)
         form_layout.addRow(_lbl("<b>新番追踪功能：</b>"), bangumi_wrapper)
@@ -983,6 +998,7 @@ class ControlPanel(QWidget):
             "new_hotkey": self.new_hotkey_input.text(),
             "show_all_hotkey": self.show_all_hotkey_input.text(),
             "disable_all_hotkey": self.disable_all_hotkey_input.text().strip(),
+            "panel_hotkey": self.panel_hotkey_input.text().strip(),
             "autostart": self.autostart_checkbox.isChecked(),
             "bangumi_uid": self.uid_input.text().strip(),
             "enable_bangumi": self.bangumi_checkbox.isChecked(),
@@ -999,7 +1015,7 @@ class ControlPanel(QWidget):
             QMessageBox.warning(
                 self, "需要重启",
                 "设置已保存，快捷键已实时生效！\n\n"
-                "【注意】\n你更改了数据存储目录，"
+                "【注意】\n若你更改了数据存储目录，"
                 "请手动将旧文件迁移至新目录，"
                 "并重启本程序以使其完全生效。"
             )

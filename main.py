@@ -8,10 +8,11 @@ AniNote 核心引擎 — 便签窗口、富文本编辑、配置管理。
 import sys
 import json
 import os
+import re
 import uuid
 import datetime as datetime_module
 
-VERSION = "3.1"
+VERSION = "3.2"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,6 +41,7 @@ _TOGGLE_HIDDEN_NOTES = set()   # 记录被「全局隐藏」操作隐藏的便�
 DEFAULT_CONFIG = {
     "toggle_hotkey": "alt+n",
     "new_hotkey": "alt+m",
+    "panel_hotkey": "alt+c",
     "show_all_hotkey": "alt+shift+n",
     "disable_all_hotkey": "ctrl+shift+a",
     "font_family": "Microsoft YaHei",
@@ -99,6 +101,11 @@ class GlobalSignaler(QObject):
     open_panel_signal = Signal()
     config_changed_signal = Signal()
     force_sync_bangumi_signal = Signal()
+    # 便签独立快捷键
+    register_note_hotkey = Signal(str, str)   # note_id, hotkey_str
+    unregister_note_hotkey = Signal(str)      # note_id
+    check_hotkey_conflict = Signal(str, object)  # hotkey_str, callback(list_of_names)
+    force_sync_bangumi_signal = Signal()
 
 
 global_signaler = GlobalSignaler()
@@ -130,6 +137,33 @@ def get_new_note_title():
                 except Exception as e:
                     print(f"[AniNote] 解析便签文件 {filename} 失败: {e}")
     return f"未命名便签({max_num + 1})"
+
+
+def sanitize_filename(title):
+    """将标题转为安全的文件名（去除非法字符，限制长度）。"""
+    safe = re.sub(r'[\\/:*?"<>|]', '', title)  # 移除 Windows 非法字符
+    safe = safe.strip().rstrip('.')
+    if not safe:
+        safe = "未命名便签"
+    return safe[:80]  # 限制长度
+
+
+def make_save_path(title, exclude_path=None):
+    """根据标题生成唯一的保存路径，重复时追加 (1) (2) 序号。"""
+    base = sanitize_filename(title)
+    path = os.path.join(SAVE_DIR, f"{base}.json")
+    if exclude_path and os.path.abspath(path) == os.path.abspath(exclude_path):
+        return path
+    if not os.path.exists(path):
+        return path
+    counter = 1
+    while True:
+        path = os.path.join(SAVE_DIR, f"{base}({counter}).json")
+        if exclude_path and os.path.abspath(path) == os.path.abspath(exclude_path):
+            return path
+        if not os.path.exists(path):
+            return path
+        counter += 1
 
 
 # ---------- 富文本编辑器 ----------
@@ -438,8 +472,11 @@ class AniNoteWindow(QWidget):
         if not os.path.exists(SAVE_DIR):
             os.makedirs(SAVE_DIR)
 
+        # note_id 作为稳定的内部标识，始终使用 UUID
+        # save_file 根据标题动态生成，文件名可能随标题变更而改变
         self.note_id = note_id if note_id else uuid.uuid4().hex
-        self.save_file = os.path.join(SAVE_DIR, f"{self.note_id}.json")
+        self.save_file = None  # 首次 save_data() 时根据标题生成
+        self._note_hotkey = ""  # 便签独立快捷键
 
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(320, 280)
@@ -484,6 +521,13 @@ class AniNoteWindow(QWidget):
         frame_layout.addWidget(self.format_panel)
 
         self._build_toolbar()
+
+        # 便签独立快捷键设置按钮
+        self.settings_btn = self._create_tool_btn(
+            icon("settings"), "设置便签快捷键",
+            self._open_note_hotkey_dialog, "color: #555;"
+        )
+        set_icon_font(self.settings_btn, 14)
 
         cfg = load_config()
         self.new_note_btn = self._create_tool_btn(
@@ -717,10 +761,74 @@ class AniNoteWindow(QWidget):
         if self in ACTIVE_NOTES:
             ACTIVE_NOTES.remove(self)
         self._deleted = True
+        global_signaler.unregister_note_hotkey.emit(self.note_id)
         if os.path.exists(self.save_file):
             os.remove(self.save_file)
         self.close()
         global_signaler.note_updated_signal.emit()
+
+    def _open_note_hotkey_dialog(self):
+        """打开便签独立快捷键设置对话框。"""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        from PySide6.QtCore import QTimer
+        dlg = QDialog(self)
+        dlg.setWindowTitle("便签快捷键设置")
+        dlg.setFixedSize(400, 180)
+        dlg.setStyleSheet("background-color: #FFFFFF;")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        info = QLabel(f"便签「{self.header.title_edit.text()}」专属快捷键")
+        info.setStyleSheet("font-size: 14px; color: #333; font-weight: bold;")
+        layout.addWidget(info)
+
+        current = getattr(self, '_note_hotkey', '')
+        input_field = QLineEdit(current)
+        input_field.setPlaceholderText("例：alt+1")
+        input_field.setStyleSheet(
+            "padding: 8px 10px; border: 1px solid #D0D0D0; border-radius: 6px;"
+            " font-size: 14px;"
+        )
+        layout.addWidget(input_field)
+
+        hint = QLabel("留空则不设置快捷键")
+        hint.setStyleSheet("font-size: 12px; color: #999;")
+        layout.addWidget(hint)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.button(QDialogButtonBox.Ok).setText("确定")
+        btn_box.button(QDialogButtonBox.Cancel).setText("取消")
+        layout.addWidget(btn_box)
+
+        def do_register():
+            text = input_field.text().strip()
+            global_signaler.unregister_note_hotkey.emit(self.note_id)
+            self._note_hotkey = text
+            if text:
+                def on_conflict_result(conflicts):
+                    if conflicts:
+                        names = "」、「".join(conflicts)
+                        reply = QMessageBox.question(
+                            dlg, '快捷键已存在',
+                            f'快捷键已被「{names}」使用，要添加到此便签吗？',
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                        )
+                        if reply != QMessageBox.Yes:
+                            self._mark_dirty()
+                            dlg.accept()
+                            return
+                    global_signaler.register_note_hotkey.emit(self.note_id, text)
+                    self._mark_dirty()
+                    dlg.accept()
+                global_signaler.check_hotkey_conflict.emit(text, on_conflict_result)
+            else:
+                self._mark_dirty()
+                dlg.accept()
+
+        btn_box.accepted.connect(do_register)
+        btn_box.rejected.connect(dlg.reject)
+        dlg.exec()
 
     def show_context_menu(self, pos):
         """构建并显示右键上下文菜单。"""
@@ -869,8 +977,22 @@ class AniNoteWindow(QWidget):
             return
         if not os.path.exists(SAVE_DIR):
             os.makedirs(SAVE_DIR)
+
+        title = self.header.title_edit.text()
+        # 根据当前标题生成目标路径（排除自身避免无意义重命名）
+        new_path = make_save_path(title, exclude_path=self.save_file)
+
+        # 如果有旧文件且路径不同 → 先删除旧文件（重命名效果）
+        if self.save_file and os.path.exists(self.save_file) and os.path.abspath(self.save_file) != os.path.abspath(new_path):
+            try:
+                os.remove(self.save_file)
+            except OSError:
+                pass
+
+        self.save_file = new_path
         data = {
-            "title": self.header.title_edit.text(),
+            "note_id": self.note_id,
+            "title": title,
             "html_content": self.text_edit.toHtml(),
             "x": self.x(), "y": self.y(),
             "width": self.width(), "height": self.height(),
@@ -878,6 +1000,7 @@ class AniNoteWindow(QWidget):
             "is_always_on_top": getattr(self, 'is_always_on_top', True),
             "is_hidden": getattr(self, 'is_hidden', False),
             "bg_color": self.bg_color,
+            "note_hotkey": getattr(self, '_note_hotkey', ''),
         }
         with open(self.save_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -895,7 +1018,23 @@ class AniNoteWindow(QWidget):
     def load_data(self):
         """从 JSON 文件恢复便签状态。"""
         self._is_loading = True     # 护盾：加载期间禁止自动保存
-        if os.path.exists(self.save_file):
+
+        # 通过 note_id 在目录中查找对应的文件
+        if not self.save_file and os.path.exists(SAVE_DIR):
+            for filename in os.listdir(SAVE_DIR):
+                if not filename.endswith('.json'):
+                    continue
+                fpath = os.path.join(SAVE_DIR, filename)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as fh:
+                        data = json.load(fh)
+                    if data.get("note_id") == self.note_id:
+                        self.save_file = fpath
+                        break
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        if self.save_file and os.path.exists(self.save_file):
             try:
                 with open(self.save_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -910,6 +1049,9 @@ class AniNoteWindow(QWidget):
                     self.is_hidden = data.get("is_hidden", False)
                     self.is_always_on_top = data.get("is_always_on_top", True)
                     self.bg_color = data.get("bg_color", [255, 249, 196, 242])
+                    self._note_hotkey = data.get("note_hotkey", "")
+                    if self._note_hotkey:
+                        global_signaler.register_note_hotkey.emit(self.note_id, self._note_hotkey)
                     self.format_panel.opacity_slider.setValue(int(round(self.bg_color[3] / 2.55)))
                     self._apply_lock_ui()
             except Exception as e:
@@ -1388,12 +1530,24 @@ class HabitTrackerWindow(AniNoteWindow):
     # ---------- 操作 ----------
 
     def _toggle_habit(self, hab_id, date_key, checked):
-        for h in self._habits:
-            if h["id"] == hab_id:
-                h.setdefault("records", {})[date_key] = checked
-                break
-        self._refresh_habit_list()
-        self.save_data()
+        try:
+            for h in self._habits:
+                if h["id"] == hab_id:
+                    h.setdefault("records", {})[date_key] = checked
+                    break
+            self._refresh_habit_list()
+            self.save_data()
+        except Exception:
+            import traceback
+            log_path = os.path.join(SAVE_DIR, "aninote_crash.log")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n--- {datetime_module.datetime.now()} ---\n")
+                traceback.print_exc(file=lf)
+            QMessageBox.warning(
+                self, "操作失败",
+                "打卡操作出错，错误信息已写入 notes_data/aninote_crash.log。\n"
+                "请将此文件提交给开发者排查。"
+            )
 
     def _delete_habit(self, hab_id):
         if self.is_locked:
@@ -1611,7 +1765,7 @@ class HabitTrackerWindow(AniNoteWindow):
 
     def _load_habits(self):
         """从便签 JSON 的 habits_data 字段恢复数据。"""
-        if os.path.exists(self.save_file):
+        if self.save_file and os.path.exists(self.save_file):
             try:
                 with open(self.save_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -1632,8 +1786,18 @@ class HabitTrackerWindow(AniNoteWindow):
         if not os.path.exists(SAVE_DIR):
             os.makedirs(SAVE_DIR)
 
+        title = self.header.title_edit.text()
+        new_path = make_save_path(title, exclude_path=self.save_file)
+        if self.save_file and os.path.exists(self.save_file) and os.path.abspath(self.save_file) != os.path.abspath(new_path):
+            try:
+                os.remove(self.save_file)
+            except OSError:
+                pass
+        self.save_file = new_path
+
         data = {
-            "title": self.header.title_edit.text(),
+            "note_id": self.note_id,
+            "title": title,
             "html_content": self.text_edit.toHtml(),
             "x": self.x(), "y": self.y(),
             "width": self.width(), "height": self.height(),
@@ -1641,6 +1805,7 @@ class HabitTrackerWindow(AniNoteWindow):
             "is_always_on_top": getattr(self, 'is_always_on_top', True),
             "is_hidden": getattr(self, 'is_hidden', False),
             "bg_color": self.bg_color,
+            "note_hotkey": getattr(self, '_note_hotkey', ''),
             "habits_data": {
                 "week_offset": self._week_offset,
                 "habits": self._habits,
