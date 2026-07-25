@@ -1,20 +1,22 @@
-# AniNote
+# AniNote v3.3
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
 
 ## 功能
 
-- **桌面便签** — 无边框可拖拽缩放，支持锁定/置顶/隐藏
+- **桌面便签** — 无边框可拖拽缩放，四角可自由拉伸
 - **富文本编辑** — 粗体、斜体、下划线、字号、颜色、背景色，调色板自由选
-- **Material Icons** — 统一使用 Google Material Symbols 图标，界面简洁一致
+- **截图与插图** — 区域截图拖拽即得，图片自动存入便签专属文件夹，双击查看原图
+
+    ![picinsert](images/picinsert.png)
+
 - **待办事项** — 快捷插入，点击切换完成状态
 
     ![todo](images/todo.png)
 
-- **事务追踪器** — 自由打卡 / 周期循环 / 倒计时三种模式，周视图网格，支持拖拽排序，适用于二游日常提醒
+- **事务追踪器** — 自由打卡 / 周期循环 / 倒计时三种模式，周视图网格，支持拖拽排序
 
     ![missiontrack](images/missiontrack.png)
-    ![missiontrack2](images/missiontrack2.png)
 
 - **Bangumi 新番** — 绑定 UID 后自动拉取在看番剧
 
@@ -26,7 +28,8 @@
     ![control](images/control.png)
 
 - **便签导出** — 支持导出为 Word 文档（.doc），保留全部格式
-- **全局热键** — 可自定义快捷键，新建/隐藏/显示/禁用
+- **全局热键** — 可自定义快捷键，新建/隐藏/显示/控制台/禁用
+- **便签专属快捷键** — 每便签可独立绑定热键，快速呼出
 
     ![controlpanel](images/controlpanel.png)
 - **开机自启 / 系统托盘** — 不占任务栏，双击托盘图标呼出控制台
@@ -54,6 +57,24 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
 
 分发 `dist/app/` 整个文件夹即可，对方无需安装 Python。
 
+## 数据存储
+
+便签数据保存在 `notes_data/` 目录，每个便签一个独立文件夹：
+
+```
+notes_data/
+├── 会议记录/
+│   ├── data.json        ← 便签内容与设置
+│   └── img_xxx.png      ← 图片（如有）
+├── 待办事项/
+│   └── data.json
+└── 项目笔记/
+    ├── data.json
+    └── screenshot_xxx.png
+```
+
+复制整个 `notes_data/` 文件夹即可迁移全部数据。
+
 ## 项目结构
 
 ```
@@ -74,17 +95,7 @@ AniNote/
 |------|-----------|
 | 新建便签 | Alt + M |
 | 显示/隐藏全部 | Alt + N |
-| 显示全部 | Alt + Shift + N |
-| 临时禁用全部 | Ctrl + Shift + A |
-
-快捷键可在控制台「系统与个性化」页面中自定义。
-
-## 快捷键
-
-| 操作 | 默认快捷键 |
-|------|-----------|
-| 新建便签 | Alt + M |
-| 显示/隐藏全部 | Alt + N |
+| 呼出控制台 | Alt + C |
 | 显示全部 | Alt + Shift + N |
 | 临时禁用全部 | Ctrl + Shift + A |
 
