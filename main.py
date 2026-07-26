@@ -1364,7 +1364,8 @@ class AniNoteWindow(QWidget):
                     self.bg_color = data.get("bg_color", [255, 249, 196, 242])
                     self._note_hotkey = data.get("note_hotkey", "")
                     if self._note_hotkey:
-                        global_signaler.register_note_hotkey.emit(self.note_id, self._note_hotkey)
+                        # 延迟注册：确保 app.exec() 已启动，消息循环就绪
+                        QTimer.singleShot(0, lambda nid=self.note_id, hk=self._note_hotkey: global_signaler.register_note_hotkey.emit(nid, hk))
                     self.format_panel.opacity_slider.setValue(int(round(self.bg_color[3] / 2.55)))
                     self._apply_lock_ui()
             except Exception as e:

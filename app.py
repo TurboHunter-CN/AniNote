@@ -328,6 +328,74 @@ def main():
     # 将验证后的实际路径同步给核心引擎
     note_app.SAVE_DIR = save_dir
 
+    # 便签独立快捷键 —— 必须在加载便签之前连接信号
+    _per_note_hk = {}  # note_id -> hotkey_str
+    _shared_hk = {}    # hotkey_str -> (hk_id, [note_ids])
+
+    def _on_register_note_hotkey(note_id, hotkey_str):
+        """注册便签独立快捷键。同一组合键只注册一次，触发时广播到所有绑定的便签。"""
+        _on_unregister_note_hotkey(note_id)
+        if not hotkey_str.strip():
+            return
+        _per_note_hk[note_id] = hotkey_str
+        key = hotkey_str.lower().strip()
+        if key in _shared_hk:
+            _shared_hk[key][1].append(note_id)
+        else:
+            def show_notes():
+                for nid in _shared_hk.get(key, (0, []))[1]:
+                    for note in note_app.ACTIVE_NOTES:
+                        if note.note_id == nid:
+                            if note.isHidden():
+                                note.show()
+                            note.raise_()
+                            note.activateWindow()
+                            break
+                    else:
+                        open_note_by_id(nid)
+            hk_id = hotkey_manager.register(hotkey_str, show_notes)
+            if hk_id >= 0:
+                _shared_hk[key] = (hk_id, [note_id])
+
+    def _on_unregister_note_hotkey(note_id):
+        """注销便签独立快捷键。"""
+        hotkey_str = _per_note_hk.pop(note_id, None)
+        if not hotkey_str:
+            return
+        key = hotkey_str.lower().strip()
+        if key in _shared_hk:
+            hk_id, note_ids = _shared_hk[key]
+            if note_id in note_ids:
+                note_ids.remove(note_id)
+            if not note_ids:
+                hotkey_manager.unregister_by_id(hk_id)
+                del _shared_hk[key]
+
+    def _on_check_hotkey_conflict(hotkey_str, callback):
+        """检查快捷键是否被其他便签占用。callback(conflict_names_list)"""
+        conflicts = []
+        key = hotkey_str.lower().strip()
+        for nid, hk in _per_note_hk.items():
+            if hk.lower().strip() != key:
+                continue
+            for item in os.listdir(note_app.SAVE_DIR):
+                item_path = os.path.join(note_app.SAVE_DIR, item)
+                data_file = os.path.join(item_path, "data.json") if os.path.isdir(item_path) else None
+                if data_file and os.path.exists(data_file):
+                    try:
+                        with open(data_file, 'r', encoding='utf-8') as fh:
+                            jdata = json.load(fh)
+                        if jdata.get("note_id") == nid:
+                            conflicts.append(jdata.get("title", item))
+                            break
+                    except:
+                        pass
+        callback(conflicts)
+
+    note_app.global_signaler.register_note_hotkey.connect(_on_register_note_hotkey)
+    note_app.global_signaler.unregister_note_hotkey.connect(_on_unregister_note_hotkey)
+    note_app.global_signaler.check_hotkey_conflict.connect(_on_check_hotkey_conflict)
+
     # 迁移旧版单文件到文件夹
     note_app.migrate_legacy_notes()
 
@@ -502,80 +570,6 @@ def main():
     )
 
     # 便签独立快捷键管理
-    _per_note_hk = {}  # note_id -> hotkey_str
-    _shared_hk = {}    # hotkey_str -> (hk_id, [note_ids])
-
-    def _on_register_note_hotkey(note_id, hotkey_str):
-        """注册便签独立快捷键。同一组合键只注册一次，触发时广播到所有绑定的便签。"""
-        # 先注销旧键（从共享组中移除）
-        _on_unregister_note_hotkey(note_id)
-
-        if not hotkey_str.strip():
-            return
-
-        _per_note_hk[note_id] = hotkey_str
-        key = hotkey_str.lower().strip()
-
-        if key in _shared_hk:
-            # 组合键已存在，加入便签列表
-            _shared_hk[key][1].append(note_id)
-        else:
-            # 首次注册该组合键
-            def show_notes():
-                for nid in _shared_hk.get(key, (0, []))[1]:
-                    for note in note_app.ACTIVE_NOTES:
-                        if note.note_id == nid:
-                            if note.isHidden():
-                                note.show()
-                            note.raise_()
-                            note.activateWindow()
-                            break
-                    else:
-                        open_note_by_id(nid)
-
-            hk_id = hotkey_manager.register(hotkey_str, show_notes)
-            if hk_id >= 0:
-                _shared_hk[key] = (hk_id, [note_id])
-
-    def _on_unregister_note_hotkey(note_id):
-        """注销便签独立快捷键。"""
-        hotkey_str = _per_note_hk.pop(note_id, None)
-        if not hotkey_str:
-            return
-        key = hotkey_str.lower().strip()
-        if key in _shared_hk:
-            hk_id, note_ids = _shared_hk[key]
-            if note_id in note_ids:
-                note_ids.remove(note_id)
-            if not note_ids:
-                # 没有便签使用了，注销系统热键
-                hotkey_manager.unregister_by_id(hk_id)
-                del _shared_hk[key]
-
-    def _on_check_hotkey_conflict(hotkey_str, callback):
-        """检查快捷键是否被其他便签占用。callback(conflict_names_list)"""
-        conflicts = []
-        key = hotkey_str.lower().strip()
-        for nid, hk in _per_note_hk.items():
-            if hk.lower().strip() != key:
-                continue
-            for fn in os.listdir(note_app.SAVE_DIR):
-                if not fn.endswith('.json'):
-                    continue
-                try:
-                    with open(os.path.join(note_app.SAVE_DIR, fn), 'r', encoding='utf-8') as fh:
-                        jdata = json.load(fh)
-                    if jdata.get("note_id") == nid:
-                        conflicts.append(jdata.get("title", fn.replace('.json', '')))
-                        break
-                except:
-                    pass
-        callback(conflicts)
-
-    note_app.global_signaler.register_note_hotkey.connect(_on_register_note_hotkey)
-    note_app.global_signaler.unregister_note_hotkey.connect(_on_unregister_note_hotkey)
-    note_app.global_signaler.check_hotkey_conflict.connect(_on_check_hotkey_conflict)
-
     def open_note_by_id(note_id):
         """按 ID 显示便签；如果未实例化则创建。"""
         for note in note_app.ACTIVE_NOTES:
