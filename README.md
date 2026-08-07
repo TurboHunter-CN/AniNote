@@ -59,7 +59,7 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
 
 ## 发布新版本（含自动更新）
 
-软件内置自动更新：启动时自动检查 GitHub Releases，发现新版本会弹窗提示，用户确认后自动下载并替换文件（保留 `notes_data/` 与 `aninote_config.json`，不会动用户数据）。
+软件内置自动更新：启动时自动检查仓库根目录的版本清单 `latest_version.json`（不走 GitHub API，避免未认证限流），发现新版本会弹窗提示，用户确认后自动下载并替换文件（保留 `notes_data/` 与 `aninote_config.json`，不会动用户数据）。
 
 发布流程：
 
@@ -69,9 +69,22 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
    python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
    ```
 3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
-4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v3.5`），Release body 写更新日志（Markdown，更新后会在软件内展示），上传步骤 3 的 zip
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v3.5`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.zip`）
+5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
+   ```json
+   {
+       "version": "3.5",
+       "notes": "本次更新：\n- 新增自动更新功能",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v3.5/AniNote-v3.5.zip",
+       "sha256": ""
+   }
+   ```
+   - `version`：最新版本号（允许 `v` 前缀）
+   - `notes`：更新日志（Markdown，更新完成后在软件内展示）——**只写用户可见的功能变化**
+   - `zip_url`：Release 附件的下载直链
+   - `sha256`：可选，zip 文件的 SHA256 校验值（推荐填写，防止下载被篡改）
 
-> 注意：软件通过 GitHub API 读取 `latest` release，因此请勿在低版本之上发布更高版本的 tag 后删除重发；tag 号必须与 `VERSION` 一致（允许 `v` 前缀差异）。
+> 注意：`latest_version.json` 未提交前，用户端会一直认为"无更新"；清单更新与 Release 发布需配套完成。
 
 ## 数据存储
 

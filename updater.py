@@ -3,9 +3,10 @@
 AniNote 自动更新模块 — 版本检查、下载、生成替换脚本。
 
 工作流程:
-1. check_for_update(): 请求 GitHub Releases API 获取最新版本信息
+1. check_for_update(): 读取仓库中的版本清单 latest_version.json
+   （绕开 GitHub API 60 次/时/IP 的未认证限流；清单由发布者维护）
 2. compare_versions(): 语义化版本号对比（支持 3.4 / v3.5 / 3.11）
-3. download_update(): 流式下载 release 附件 zip，带进度回调
+3. download_update(): 流式下载 zip，带进度回调与 SHA256 校验
 4. write_update_script(): 生成 update.bat，主程序退出后替换文件并重启
 
 替换策略（Windows exe 运行中无法覆盖）:
@@ -19,21 +20,19 @@ import os
 import re
 import sys
 import json
+import time
 import tempfile
 import requests
 
 GITHUB_REPO = "TurboHunter-CN/AniNote"
-API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# 版本清单：发布者在仓库根目录维护，raw 域名不参与 GitHub API 限流
+VERSION_LIST_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/latest_version.json"
+)
 VERSION_MARK_NAME = ".last_version.json"   # 存于程序目录，更新后展示日志用
 
-# GitHub REST API 规范请求头：
-# - User-Agent 必填（官方推荐 "AppName/Version (contact)" 格式）
-# - Accept 使用官方推荐媒体类型
-# - X-GitHub-Api-Version 显式声明 API 版本
-API_HEADERS = {
-    "User-Agent": "AniNote-Updater/3.4 (https://github.com/TurboHunter-CN/AniNote)",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
+UA_HEADER = {
+    "User-Agent": "AniNote-Updater/3.5 (https://github.com/TurboHunter-CN/AniNote)",
 }
 
 
@@ -82,7 +81,15 @@ def _proxy_config(proxy_str=""):
 
 
 def check_for_update(timeout=10, proxy_str=""):
-    """查询 GitHub 最新 release。
+    """读取仓库根目录的版本清单 latest_version.json，获取最新版本信息。
+
+    清单格式（发布者维护）:
+    {
+        "version": "3.5",                          # 最新版本号（允许 v 前缀）
+        "notes": "更新日志 Markdown 文本",           # 更新后展示
+        "zip_url": "https://github.com/.../AniNote-v3.5.zip",  # 安装包直链
+        "sha256": "可选：zip 的 SHA256 校验值"       # 防下载篡改
+    }
 
     Args:
         timeout: 请求超时秒数。
@@ -95,46 +102,48 @@ def check_for_update(timeout=10, proxy_str=""):
             "notes": "更新日志 Markdown 文本",
             "zip_url": "下载地址",
             "zip_name": "附件文件名",
-            "published_at": "发布时间",
+            "sha256": "SHA256 或空串",
         }
-        网络失败 / 无 zip 附件时返回 None。
+        网络失败 / 清单缺失或字段不全时返回 None。
     """
     try:
-        resp = requests.get(API_URL, timeout=timeout, headers=API_HEADERS,
+        # 加时间戳查询参数，绕过 raw 文件 CDN 缓存
+        url = f"{VERSION_LIST_URL}?t={int(time.time())}"
+        resp = requests.get(url, timeout=timeout, headers=UA_HEADER,
                             proxies=_proxy_config(proxy_str))
         resp.raise_for_status()
         data = resp.json()
     except Exception:
         return None
 
-    tag = str(data.get("tag_name", "")).lstrip("vV")
-    if not tag:
-        return None
-
-    assets = data.get("assets", []) or []
-    zip_asset = next((a for a in assets if str(a.get("name", "")).lower().endswith(".zip")), None)
-    if not zip_asset:
+    version = str(data.get("version", "")).lstrip("vV")
+    zip_url = str(data.get("zip_url", ""))
+    if not version or not zip_url:
         return None
 
     return {
-        "latest_version": tag,
-        "notes": data.get("body", "") or "",
-        "zip_url": zip_asset.get("browser_download_url", ""),
-        "zip_name": zip_asset.get("name", ""),
-        "published_at": data.get("published_at", ""),
+        "latest_version": version,
+        "notes": data.get("notes", "") or "",
+        "zip_url": zip_url,
+        "zip_name": os.path.basename(zip_url.split("?")[0]),
+        "sha256": data.get("sha256", "") or "",
     }
 
 
-def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=""):
+def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str="",
+                    sha256=""):
     """流式下载 zip 到 dest_path，逐块写入并回调进度。
 
     progress_cb(received_bytes, total_bytes)
     proxy_str: 可选代理，如 "127.0.0.1:7890"。
+    sha256: 可选期望校验值；非空时下载后校验，不匹配视为失败（防下载被篡改）。
     Returns:
-        True 成功 / False 失败（网络中断、非 200、写盘失败）
+        True 成功 / False 失败（网络中断、非 200、写盘失败、校验不通过）
     """
+    import hashlib
+    hasher = hashlib.sha256() if sha256 else None
     try:
-        with requests.get(zip_url, stream=True, timeout=timeout, headers=API_HEADERS,
+        with requests.get(zip_url, stream=True, timeout=timeout, headers=UA_HEADER,
                           proxies=_proxy_config(proxy_str)) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0) or 0)
@@ -145,9 +154,13 @@ def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=
                     if not chunk:
                         continue
                     f.write(chunk)
+                    if hasher:
+                        hasher.update(chunk)
                     received += len(chunk)
                     if progress_cb:
                         progress_cb(received, total)
+        if hasher and hasher.hexdigest().lower() != str(sha256).lower():
+            raise ValueError("SHA256 mismatch")
         return True
     except Exception:
         try:

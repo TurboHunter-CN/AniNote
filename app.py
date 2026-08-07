@@ -850,7 +850,8 @@ def main():
 
             ok = updater.download_update(info["zip_url"], zip_path,
                                          progress_cb=progress_cb,
-                                         proxy_str=note_app.load_config().get("api_proxy", ""))
+                                         proxy_str=note_app.load_config().get("api_proxy", ""),
+                                         sha256=info.get("sha256", ""))
             if cancel_flag["cancelled"]:
                 QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
                 return
@@ -864,8 +865,7 @@ def main():
                     ),
                 ))
                 QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
-                return
-            # 写入更新标记（供新版本展示日志）并生成替换脚本
+                return            # 写入更新标记（供新版本展示日志）并生成替换脚本
             updater.mark_updated(note_app.VERSION, info["latest_version"], info.get("notes", ""))
             bat_path = updater.write_update_script(updater.app_base_dir(), zip_path)
             QMetaObject.invokeMethod(dlg, "accept", Qt.QueuedConnection)
@@ -888,7 +888,10 @@ def main():
         info = updater.check_for_update(proxy_str=proxy)
         if info is None:
             if manual:
-                QMessageBox.information(None, "检查更新", "无法连接到更新服务器，请稍后再试。")
+                QMessageBox.information(
+                    None, "检查更新",
+                    "无法获取版本信息，请检查网络或代理设置后重试。"
+                )
             return
         if updater.compare_versions(info["latest_version"], note_app.VERSION) <= 0:
             if manual:
