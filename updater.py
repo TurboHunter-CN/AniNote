@@ -130,20 +130,39 @@ def check_for_update(timeout=10, proxy_str=""):
     }
 
 
+# GitHub 加速镜像（下载兜底，大陆网络无需代理即可访问）
+DOWNLOAD_MIRRORS = [
+    "https://gh-proxy.com/{url}",
+    "https://ghfast.top/{url}",
+    "https://ghproxy.net/{url}",
+]
+
+
 def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str="",
                     sha256=""):
     """流式下载 zip 到 dest_path，逐块写入并回调进度。
+
+    优先尝试原站直链；连接失败时自动依次切换 GitHub 加速镜像兜底。
 
     progress_cb(received_bytes, total_bytes)
     proxy_str: 可选代理，如 "127.0.0.1:7890"。
     sha256: 可选期望校验值；非空时下载后校验，不匹配视为失败（防下载被篡改）。
     Returns:
-        True 成功 / False 失败（网络中断、非 200、写盘失败、校验不通过）
+        True 成功 / False 失败（所有源均失败、校验不通过）
     """
+    candidates = [zip_url] + [m.format(url=zip_url) for m in DOWNLOAD_MIRRORS]
+    for cand in candidates:
+        if _download_one(cand, dest_path, progress_cb, timeout, proxy_str, sha256):
+            return True
+    return False
+
+
+def _download_one(url, dest_path, progress_cb, timeout, proxy_str, sha256):
+    """单源下载，失败返回 False（并清理半成品文件）。"""
     import hashlib
     hasher = hashlib.sha256() if sha256 else None
     try:
-        with requests.get(zip_url, stream=True, timeout=timeout, headers=UA_HEADER,
+        with requests.get(url, stream=True, timeout=timeout, headers=UA_HEADER,
                           proxies=_proxy_config(proxy_str)) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0) or 0)

@@ -793,6 +793,16 @@ def main():
 
     def perform_update(info):
         """下载新版本并触发替换。"""
+        # 跨线程信号桥：下载线程 → 主线程 UI
+        class _UpdateBridge(QObject):
+            finished_ok = Signal()
+            failed = Signal(str)
+            cancelled = Signal()
+        bridge = _UpdateBridge()
+        bridge.failed.connect(lambda msg: QMessageBox.warning(None, "更新失败", msg))
+        bridge.finished_ok.connect(dlg.accept)
+        bridge.cancelled.connect(dlg.reject)
+
         # 下载进度对话框
         dlg = QDialog()
         dlg.setWindowTitle("正在下载更新")
@@ -853,22 +863,19 @@ def main():
                                          proxy_str=note_app.load_config().get("api_proxy", ""),
                                          sha256=info.get("sha256", ""))
             if cancel_flag["cancelled"]:
-                QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
+                bridge.cancelled.emit()
                 return
             if not ok:
-                QTimer.singleShot(0, lambda: (
-                    QMessageBox.warning(
-                        None, "更新失败",
-                        "下载失败，请检查网络连接后重试。\n\n"
-                        "大陆网络环境下建议在「控制面板 → API 代理地址」"
-                        "中填写本地代理端口后再试。"
-                    ),
-                ))
-                QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
-                return            # 写入更新标记（供新版本展示日志）并生成替换脚本
+                bridge.failed.emit(
+                    "下载失败，请检查网络连接后重试。\n\n"
+                    "大陆网络环境下建议在「控制面板 → API 代理地址」"
+                    "中填写本地代理端口后再试。"
+                )
+                return
+            # 写入更新标记（供新版本展示日志）并生成替换脚本
             updater.mark_updated(note_app.VERSION, info["latest_version"], info.get("notes", ""))
             bat_path = updater.write_update_script(updater.app_base_dir(), zip_path)
-            QMetaObject.invokeMethod(dlg, "accept", Qt.QueuedConnection)
+            bridge.finished_ok.emit()
             QTimer.singleShot(200, lambda: (
                 [n.save_data() for n in note_app.ACTIVE_NOTES],
                 tray_icon.hide(),
