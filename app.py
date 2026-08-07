@@ -793,16 +793,6 @@ def main():
 
     def perform_update(info):
         """下载新版本并触发替换。"""
-        # 跨线程信号桥：下载线程 → 主线程 UI
-        class _UpdateBridge(QObject):
-            finished_ok = Signal()
-            failed = Signal(str)
-            cancelled = Signal()
-        bridge = _UpdateBridge()
-        bridge.failed.connect(lambda msg: QMessageBox.warning(None, "更新失败", msg))
-        bridge.finished_ok.connect(dlg.accept)
-        bridge.cancelled.connect(dlg.reject)
-
         # 下载进度对话框
         dlg = QDialog()
         dlg.setWindowTitle("正在下载更新")
@@ -836,6 +826,16 @@ def main():
         layout.addWidget(cancel_btn, 0, Qt.AlignRight)
         cancel_flag = {"cancelled": False}
         cancel_btn.clicked.connect(lambda: cancel_flag.__setitem__("cancelled", True))
+
+        # 跨线程信号桥：下载线程 → 主线程 UI（须在 dlg 创建之后连接）
+        class _UpdateBridge(QObject):
+            finished_ok = Signal()
+            failed = Signal(str)
+            cancelled = Signal()
+        bridge = _UpdateBridge()
+        bridge.failed.connect(lambda msg: QMessageBox.warning(None, "更新失败", msg))
+        bridge.finished_ok.connect(dlg.accept)
+        bridge.cancelled.connect(dlg.reject)
 
         dlg.show()
         dlg.setWindowModality(Qt.WindowModal)
@@ -890,7 +890,12 @@ def main():
         # 更新脚本已启动，主程序即将退出
 
     def check_update_flow(manual=False):
-        """检查更新；manual=True 时无论是否有新版都给出反馈。"""
+        """检查更新；manual=True 时无论是否有新版都给出反馈。
+
+        Returns:
+            True = 检查成功（无论有无新版）；False = 检查失败（网络/清单不可达）。
+            供自动检查失败后安排重试。
+        """
         proxy = note_app.load_config().get("api_proxy", "")
         info = updater.check_for_update(proxy_str=proxy)
         if info is None:
@@ -899,22 +904,27 @@ def main():
                     None, "检查更新",
                     "无法获取版本信息，请检查网络或代理设置后重试。"
                 )
-            return
+            return False
         if updater.compare_versions(info["latest_version"], note_app.VERSION) <= 0:
             if manual:
                 QMessageBox.information(None, "检查更新", f"当前已是最新版本 v{note_app.VERSION}。")
-            return
+            return True
         cfg = note_app.load_config()
         if info["latest_version"] == cfg.get("ignored_version", ""):
-            return
+            return True
         if show_update_dialog(info):
             perform_update(info)
+        return True
 
-    def check_update_auto():
+    def check_update_auto(retries=2):
+        """启动后自动检查更新；失败则延迟 60 秒重试（最多 retries 次），
+        应对启动初期网络/代理尚未就绪的情况。"""
         cfg = note_app.load_config()
         if not cfg.get("auto_update", True):
             return
-        check_update_flow(manual=False)
+        ok = check_update_flow(manual=False)
+        if not ok and retries > 0:
+            QTimer.singleShot(60000, lambda: check_update_auto(retries - 1))
 
     def show_updated_log():
         """更新完成后首次启动，展示本次更新日志。"""
