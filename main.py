@@ -9,19 +9,21 @@ import sys
 import json
 import os
 import re
+import shutil
 import time
+import urllib.parse
 import uuid
 import datetime as datetime_module
 
-VERSION = "3.3"
+VERSION = "3.5"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFrame, QMenu, QGraphicsDropShadowEffect, QPushButton,
-    QColorDialog, QMessageBox, QSizePolicy, QFontDialog,
+    QColorDialog, QMessageBox, QSizePolicy,
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
-    QFileDialog, QRubberBand,
+    QFileDialog, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QEvent, QRect, QPoint
 from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage, QPainter, QPen, QBrush
@@ -57,6 +59,8 @@ DEFAULT_CONFIG = {
     "api_proxy": "",
     "last_bangumi_sync": "",        # 上次同步日期（YYYY-MM-DD），用于每日仅自动刷新一次
     "export_dir": "default",        # "default" 表示使用程序同级目录下的「导出的便签文本」文件夹
+    "auto_update": True,            # 启动时自动检查 GitHub 新版本
+    "ignored_version": "",          # 用户选择"忽略此版本"时记录，不再提示
 }
 
 
@@ -103,7 +107,6 @@ class GlobalSignaler(QObject):
     note_updated_signal = Signal()
     open_panel_signal = Signal()
     config_changed_signal = Signal()
-    force_sync_bangumi_signal = Signal()
     # 便签独立快捷键
     register_note_hotkey = Signal(str, str)   # note_id, hotkey_str
     unregister_note_hotkey = Signal(str)      # note_id
@@ -335,7 +338,7 @@ class HeaderBar(QWidget):
         self.parent_window.save_data()
 
 
-# ---------- 缩放手柄 ----------
+# ---------- 现代风格通用对话框 ----------
 
 class ResizeHandle(QWidget):
     """便签四角拖拽缩放控件。"""
@@ -495,7 +498,11 @@ class FormatPanel(QFrame):
             btn = QPushButton()
             btn.setFixedSize(24, 24)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color: {c}; border-radius: 12px; border: 1px solid #ccc;")
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {c}; border-radius: 12px;"
+                f" border: 2px solid rgba(0,0,0,0.08); }}"
+                " QPushButton:hover { border: 2px solid rgba(0,0,0,0.3); }"
+            )
             btn.clicked.connect(lambda checked, color=c: self.parent_window.change_font_color_direct(color))
             layout.addWidget(btn)
         
@@ -515,7 +522,11 @@ class FormatPanel(QFrame):
             btn = QPushButton()
             btn.setFixedSize(24, 24)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color: rgb({r}, {g}, {b}); border-radius: 12px; border: 1px solid #ccc;")
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: rgb({r}, {g}, {b}); border-radius: 12px;"
+                f" border: 2px solid rgba(0,0,0,0.08); }}"
+                " QPushButton:hover { border: 2px solid rgba(0,0,0,0.3); }"
+            )
             btn.clicked.connect(lambda checked, c=(r,g,b): self.parent_window.change_bg_base_color(c))
             layout.addWidget(btn)
             
@@ -528,6 +539,15 @@ class FormatPanel(QFrame):
         self.opacity_slider.setRange(15, 100)
         self.opacity_slider.setFixedWidth(80)
         self.opacity_slider.setCursor(Qt.PointingHandCursor)
+        self.opacity_slider.setStyleSheet(
+            "QSlider::groove:horizontal {"
+            " height: 4px; background: #E0E0E0; border-radius: 2px; }"
+            " QSlider::handle:horizontal {"
+            " width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;"
+            " background: #1A73E8; }"
+            " QSlider::handle:horizontal:hover { background: #1765CC; }"
+            " QSlider::sub-page:horizontal { background: #1A73E8; border-radius: 2px; }"
+        )
         self.opacity_slider.valueChanged.connect(self.parent_window.change_bg_opacity)
         layout.addWidget(self.opacity_slider)
         
@@ -767,12 +787,10 @@ class AniNoteWindow(QWidget):
             self.is_always_on_top = False
             self.bg_color = [235, 245, 255, 242]
             self._apply_bg_color()
-
-        self.text_edit.setReadOnly(True)
+        self._apply_lock_ui()
+        # Bangumi 便签需保留链接点击能力，覆盖 _apply_lock_ui 的 NoTextInteraction
         self.text_edit.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
         self.text_edit.setOpenExternalLinks(True)
-        self.header.title_edit.setReadOnly(True)
-        self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.header.toolbar_container.hide()
 
         self.refresh_btn = QPushButton(icon("refresh"), self.header)
@@ -864,37 +882,60 @@ class AniNoteWindow(QWidget):
 
     def _open_note_hotkey_dialog(self):
         """打开便签独立快捷键设置对话框。"""
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
-        from PySide6.QtCore import QTimer
         dlg = QDialog(self)
         dlg.setWindowTitle("便签快捷键设置")
-        dlg.setFixedSize(400, 180)
-        dlg.setStyleSheet("background-color: #FFFFFF;")
+        dlg.setFixedSize(400, 200)
+        dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
+
         layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
 
         info = QLabel(f"便签「{self.header.title_edit.text()}」专属快捷键")
-        info.setStyleSheet("font-size: 14px; color: #333; font-weight: bold;")
+        info.setStyleSheet("font-size: 13px; color: #555; font-weight: 600;")
         layout.addWidget(info)
 
         current = getattr(self, '_note_hotkey', '')
         input_field = QLineEdit(current)
         input_field.setPlaceholderText("例：alt+1")
         input_field.setStyleSheet(
-            "padding: 8px 10px; border: 1px solid #D0D0D0; border-radius: 6px;"
+            "QLineEdit {"
+            " padding: 8px 12px;"
+            " border: 1px solid #D0D0D0;"
+            " border-radius: 8px;"
             " font-size: 14px;"
+            " background: #FFFFFF;"
+            " }"
+            " QLineEdit:focus { border-color: #1A73E8; }"
         )
         layout.addWidget(input_field)
 
         hint = QLabel("留空则不设置快捷键")
         hint.setStyleSheet("font-size: 12px; color: #999;")
         layout.addWidget(hint)
+        layout.addStretch()
 
-        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btn_box.button(QDialogButtonBox.Ok).setText("确定")
-        btn_box.button(QDialogButtonBox.Cancel).setText("取消")
-        layout.addWidget(btn_box)
+        # 按钮行
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet(
+            "QPushButton { padding: 8px 22px; border: 1px solid #D0D0D0;"
+            " border-radius: 8px; background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
+        )
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        ok_btn = QPushButton("确定")
+        ok_btn.setStyleSheet(
+            "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+            " QPushButton:pressed { background: #1557B0; }"
+        )
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
 
         def do_register():
             text = input_field.text().strip()
@@ -911,7 +952,7 @@ class AniNoteWindow(QWidget):
                         )
                         if reply != QMessageBox.Yes:
                             self._mark_dirty()
-                            dlg.accept()
+                            dlg.reject()
                             return
                     global_signaler.register_note_hotkey.emit(self.note_id, text)
                     self._mark_dirty()
@@ -921,8 +962,8 @@ class AniNoteWindow(QWidget):
                 self._mark_dirty()
                 dlg.accept()
 
-        btn_box.accepted.connect(do_register)
-        btn_box.rejected.connect(dlg.reject)
+        ok_btn.clicked.connect(do_register)
+        cancel_btn.clicked.connect(dlg.reject)
         dlg.exec()
 
     # ---------- 图片管理 ----------
@@ -941,11 +982,6 @@ class AniNoteWindow(QWidget):
             os.makedirs(img_dir, exist_ok=True)
         return img_dir
 
-    def _has_images(self):
-        """检测便签是否包含图片。"""
-        html = self.text_edit.toHtml()
-        return '<img ' in html.lower()
-
     def _insert_image(self):
         """从文件选择器插入图片。"""
         path, _ = QFileDialog.getOpenFileName(
@@ -958,14 +994,12 @@ class AniNoteWindow(QWidget):
 
     def _insert_image_file(self, src_path):
         """将图片复制到便签目录并插入光标处。"""
-        import shutil
         img_dir = self._note_image_dir()
         ext = os.path.splitext(src_path)[1].lower() or ".png"
         ts = int(time.time() * 1000)
         name = f"img_{ts:013d}{ext}"
         dest = os.path.join(img_dir, name)
 
-        from PySide6.QtGui import QPixmap, QImage
         if ext == ".svg":
             raster, _ = QSvgRenderer.load(src_path)
             if raster and not raster.isNull():
@@ -1027,7 +1061,6 @@ class AniNoteWindow(QWidget):
 
     def eventFilter(self, obj, event):
         """拦截 QTextEdit 内双击图片事件。"""
-        from PySide6.QtCore import QEvent
         if obj == self.text_edit.viewport() and event.type() == QEvent.MouseButtonDblClick:
             cursor = self.text_edit.cursorForPosition(event.pos())
             fmt = cursor.charFormat()
@@ -1042,7 +1075,6 @@ class AniNoteWindow(QWidget):
         """弹出窗口显示原图。"""
         # 处理 file:// 协议
         if src.startswith("file:///"):
-            import urllib.parse
             full_path = urllib.parse.unquote(src[8:])  # 去掉 file:///
             full_path = full_path.replace('/', os.sep)
         else:
@@ -1051,8 +1083,12 @@ class AniNoteWindow(QWidget):
         if not os.path.exists(full_path):
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle(src)
+        dlg.setWindowTitle("图片预览")
         dlg.setMinimumSize(200, 200)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #1E1E1E; }"
+            " QLabel { background: transparent; }"
+        )
         pixmap = QPixmap(full_path)
         if pixmap.isNull():
             return
@@ -1064,6 +1100,7 @@ class AniNoteWindow(QWidget):
         lbl = QLabel(pixmap=pixmap)
         lbl.setScaledContents(False)
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(lbl)
         dlg.adjustSize()
         dlg.exec()
@@ -1071,29 +1108,30 @@ class AniNoteWindow(QWidget):
     def show_context_menu(self, pos):
         """构建并显示右键上下文菜单。"""
         menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WA_TranslucentBackground)
         menu.setStyleSheet(
             "QMenu {"
-            " background-color: #FFFFFF;"
-            " border: 1px solid #DDDDDD;"
-            " border-radius: 6px;"
-            " padding: 3px;"
+            " background-color: #FAFAFA;"
+            " border: 1px solid #E0E0E0;"
+            " border-radius: 10px;"
+            " padding: 6px;"
             " }"
             " QMenu::item {"
-            " padding: 5px 18px;"
-            " border-radius: 3px;"
-            " margin: 1px 2px;"
+            " padding: 7px 24px;"
+            " border-radius: 6px;"
+            " margin: 1px 3px;"
             " color: #333333;"
             " font-size: 13px;"
             " }"
             " QMenu::item:selected {"
-            " background-color: #E8F4FD;"
-            " color: #0078D7;"
+            " background-color: #E8F0FE;"
+            " color: #1A73E8;"
             " }"
             " QMenu::separator {"
             " height: 1px;"
-            " background: #EEEEEE;"
-            " margin: 2px 8px;"
+            " background: #E8E8E8;"
+            " margin: 4px 12px;"
             " }"
         )
 
@@ -1247,7 +1285,6 @@ class AniNoteWindow(QWidget):
                 os.remove(self.save_file)
                 # 尝试删除旧文件夹（失败了也无所谓，里面可能有图片）
                 if old_dir != SAVE_DIR and os.path.isdir(old_dir):
-                    import shutil
                     shutil.rmtree(old_dir, ignore_errors=True)
             except OSError:
                 pass
@@ -1257,7 +1294,6 @@ class AniNoteWindow(QWidget):
         html = self.text_edit.toHtml()
         note_dir = os.path.dirname(self.save_file).replace('\\', '/')
         # 处理 file:// URL（含 URL 编码），还原为相对路径
-        import urllib.parse
         def _unfile_src(m):
             raw = m.group(1)
             decoded = urllib.parse.unquote(raw)
@@ -1364,7 +1400,8 @@ class AniNoteWindow(QWidget):
                     self.bg_color = data.get("bg_color", [255, 249, 196, 242])
                     self._note_hotkey = data.get("note_hotkey", "")
                     if self._note_hotkey:
-                        global_signaler.register_note_hotkey.emit(self.note_id, self._note_hotkey)
+                        # 延迟注册：确保 app.exec() 已启动，消息循环就绪
+                        QTimer.singleShot(0, lambda nid=self.note_id, hk=self._note_hotkey: global_signaler.register_note_hotkey.emit(nid, hk))
                     self.format_panel.opacity_slider.setValue(int(round(self.bg_color[3] / 2.55)))
                     self._apply_lock_ui()
             except Exception as e:
@@ -1962,21 +1999,26 @@ class HabitTrackerWindow(AniNoteWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("新建事务")
-        dialog.setFixedSize(380, 360)
-        dialog.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        dialog.setFixedSize(400, 430)
+        dialog.setStyleSheet("QDialog { background: #FAFAFA; }")
         layout = QVBoxLayout(dialog)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
 
         # 名称
-        name_lbl = QLabel("事务名称：")
-        name_lbl.setStyleSheet("font-size: 13px; color: #333;")
+        name_lbl = QLabel("事务名称")
+        name_lbl.setStyleSheet("font-size: 13px; color: #555; font-weight: 600;")
         name_input = QLineEdit()
         name_input.setPlaceholderText("例如：早睡早起")
-        name_input.setStyleSheet("padding: 8px; border: 1px solid #ccc; border-radius: 5px; font-size: 14px;")
+        name_input.setStyleSheet(
+            "QLineEdit { padding: 8px 12px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 14px; background: #FFFFFF; }"
+            " QLineEdit:focus { border-color: #1A73E8; }"
+        )
 
         # 颜色
-        color_lbl = QLabel("标记颜色：")
-        color_lbl.setStyleSheet("font-size: 13px; color: #333; margin-top: 4px;")
+        color_lbl = QLabel("标记颜色")
+        color_lbl.setStyleSheet("font-size: 13px; color: #555; font-weight: 600; margin-top: 2px;")
         preset_colors = ["#E81123", "#FF8C00", "#107C10", "#0078D7", "#881798", "#333333"]
         color_btns = []
         selected_color = [preset_colors[0]]
@@ -1984,27 +2026,44 @@ class HabitTrackerWindow(AniNoteWindow):
         def on_color_click(c):
             selected_color[0] = c
             for b, oc in zip(color_btns, preset_colors):
-                highlight = "3px solid #0078D7" if oc == c else "1px solid #ccc"
-                b.setStyleSheet(
-                    f"QPushButton {{ background-color: {oc}; border-radius: 11px; "
-                    f"border: {highlight}; }}"
-                )
+                if oc == c:
+                    # 选中态：白色内圈 + 色块描边
+                    b.setStyleSheet(
+                        f"QPushButton {{ background-color: {oc}; border-radius: 14px;"
+                        f" border: 3px solid #FFFFFF; outline: 2px solid {oc}; }}"
+                    )
+                else:
+                    b.setStyleSheet(
+                        f"QPushButton {{ background-color: {oc}; border-radius: 14px;"
+                        f" border: 2px solid rgba(0,0,0,0.08); }}"
+                        " QPushButton:hover { border: 2px solid rgba(0,0,0,0.25); }"
+                    )
 
         color_layout = QHBoxLayout()
-        color_layout.setSpacing(6)
+        color_layout.setSpacing(10)
         for c in preset_colors:
             btn = QPushButton()
-            btn.setFixedSize(22, 22)
+            btn.setFixedSize(28, 28)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(f"background-color: {c}; border-radius: 11px; border: 1px solid #ccc;")
+            if c == preset_colors[0]:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {c}; border-radius: 14px;"
+                    f" border: 3px solid #FFFFFF; outline: 2px solid {c}; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {c}; border-radius: 14px;"
+                    f" border: 2px solid rgba(0,0,0,0.08); }}"
+                    " QPushButton:hover { border: 2px solid rgba(0,0,0,0.25); }"
+                )
             btn.clicked.connect(lambda checked, clr=c: on_color_click(clr))
             color_layout.addWidget(btn)
             color_btns.append(btn)
         color_layout.addStretch()
 
         # 模式选择
-        mode_lbl = QLabel("打卡模式：")
-        mode_lbl.setStyleSheet("font-size: 13px; color: #333; margin-top: 4px;")
+        mode_lbl = QLabel("打卡模式")
+        mode_lbl.setStyleSheet("font-size: 13px; color: #555; font-weight: 600; margin-top: 4px;")
         mode_layout = QHBoxLayout()
         mode_layout.setSpacing(15)
         radio_free = QRadioButton("自由打卡")
@@ -2033,7 +2092,11 @@ class HabitTrackerWindow(AniNoteWindow):
         param_input.setValue(7)
         param_input.setSuffix(" 天")
         param_input.setFixedWidth(100)
-        param_input.setStyleSheet("padding: 4px; border: 1px solid #ccc; border-radius: 4px;")
+        param_input.setStyleSheet(
+            "QSpinBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; }"
+            " QSpinBox:focus { border-color: #1A73E8; }"
+        )
         suffix_lbl = QLabel("循环")
         suffix_lbl.setStyleSheet("font-size: 13px; color: #333;")
         days_row.addWidget(param_lbl)
@@ -2053,7 +2116,11 @@ class HabitTrackerWindow(AniNoteWindow):
         date_edit.setCalendarPopup(True)
         date_edit.setDate(QDate.currentDate())
         date_edit.setDisplayFormat("yyyy-MM-dd")
-        date_edit.setStyleSheet("padding: 4px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;")
+        date_edit.setStyleSheet(
+            "QDateEdit { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; }"
+            " QDateEdit:focus { border-color: #1A73E8; }"
+        )
         date_edit.setFixedWidth(140)
         date_hint = QLabel("（周期将匹配此起点）")
         date_hint.setStyleSheet("font-size: 11px; color: #999;")
@@ -2086,10 +2153,21 @@ class HabitTrackerWindow(AniNoteWindow):
 
         # 按钮
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
         cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet(
+            "QPushButton { padding: 8px 22px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
+        )
         cancel_btn.clicked.connect(dialog.reject)
         ok_btn = QPushButton("添加")
-        ok_btn.setStyleSheet("background: #0078D7; color: white; padding: 6px 20px; border-radius: 5px; font-weight: bold;")
+        ok_btn.setStyleSheet(
+            "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+            " QPushButton:pressed { background: #1557B0; }"
+        )
         ok_btn.clicked.connect(dialog.accept)
         btn_layout.addStretch()
         btn_layout.addWidget(cancel_btn)
@@ -2195,10 +2273,28 @@ class HabitTrackerWindow(AniNoteWindow):
                 pass
         self.save_file = new_path
 
+        # 图片路径归一化 + 孤儿清理（与父类保持一致）
+        html = self.text_edit.toHtml()
+        note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+        def _unfile_src(m):
+            raw = m.group(1)
+            decoded = urllib.parse.unquote(raw)
+            for prefix in ('file:///', 'file://', 'file:'):
+                if decoded.startswith(prefix):
+                    decoded = decoded[len(prefix):]
+                    break
+            try:
+                rel = os.path.relpath(decoded, note_dir.replace('/', os.sep))
+                return f'src="{rel.replace(os.sep, "/")}"'
+            except ValueError:
+                return m.group(0)
+        html = re.sub(r'src="(file://[^"]+)"', _unfile_src, html)
+        _cleanup_orphan_images(note_dir, html)
+
         data = {
             "note_id": self.note_id,
             "title": title,
-            "html_content": self.text_edit.toHtml(),
+            "html_content": html,
             "x": self.x(), "y": self.y(),
             "width": self.width(), "height": self.height(),
             "is_locked": self.is_locked,

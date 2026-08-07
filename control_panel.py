@@ -5,7 +5,7 @@ AniNote 控制面板 — 便签墙管理、系统设置、关于页面。
 字体、快捷键、Bangumi 集成、自启等），以及与主引擎的双向通信。
 """
 
-import sys
+
 import os
 import json
 
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont, QColor, QTextDocument, QCursor, QPainter
 from PySide6.QtCore import (
-    Qt, Signal, Property, QPropertyAnimation, QEasingCurve, QRect, QTimer,
+    Qt, Signal, Property, QPropertyAnimation, QEasingCurve, QRect, QTimer, QSize,
 )
 
 from main import load_config, save_config, SAVE_DIR
@@ -59,6 +59,11 @@ class ToggleSwitch(QCheckBox):
         self.animation.stop()
         self.animation.setEndValue(1.0 if state else 0.0)
         self.animation.start()
+
+    def sizeHint(self):
+        """按文本实际宽度计算控件宽度，避免文字被裁剪。"""
+        text_w = self.fontMetrics().horizontalAdvance(self.text())
+        return QSize(42 + 12 + text_w, max(self.fontMetrics().height() + 8, 26))
 
     def showEvent(self, event):
         # 面板打开时重置滚珠位置，避免动画残留
@@ -221,25 +226,26 @@ class NoteCard(QFrame):
 
     def show_context_menu(self, pos):
         menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WA_TranslucentBackground)
         # 不使用 set_icon_font 以免 Material Symbols 拉丁字符替换系统字体
         menu.setStyleSheet(
             "QMenu {"
-            " background-color: #FFFFFF;"
-            " border: 1px solid #DDDDDD;"
-            " border-radius: 6px;"
-            " padding: 3px;"
+            " background-color: #FAFAFA;"
+            " border: 1px solid #E0E0E0;"
+            " border-radius: 10px;"
+            " padding: 6px;"
             " }"
             " QMenu::item {"
-            " padding: 5px 18px;"
-            " border-radius: 3px;"
-            " margin: 1px 2px;"
+            " padding: 7px 24px;"
+            " border-radius: 6px;"
+            " margin: 1px 3px;"
             " color: #333333;"
             " font-size: 13px;"
             " }"
             " QMenu::item:selected {"
-            " background-color: #E8F4FD;"
-            " color: #0078D7;"
+            " background-color: #E8F0FE;"
+            " color: #1A73E8;"
             " }"
         )
         top_action = menu.addAction(
@@ -365,6 +371,7 @@ class ControlPanel(QWidget):
     request_export_note = Signal(str)
     request_set_note_hotkey = Signal(str)
     settings_changed = Signal(dict)
+    request_check_update = Signal()
 
     # 导航按钮默认/选中样式（QPushButton 保留用于兼容）
     NAV_STYLE_NORMAL = (
@@ -922,6 +929,30 @@ class ControlPanel(QWidget):
         autostart_wrap_layout.setContentsMargins(0, 5, 0, 5)
         autostart_wrap_layout.addWidget(self.autostart_checkbox)
 
+        # 自动更新
+        self.auto_update_checkbox = ToggleSwitch("启动时自动检查更新")
+        self.auto_update_checkbox.setChecked(cfg.get("auto_update", True))
+        cf3 = self.auto_update_checkbox.font()
+        cf3.setPixelSize(14)
+        self.auto_update_checkbox.setFont(cf3)
+        auto_update_wrapper = QWidget()
+        auto_update_wrap_layout = QVBoxLayout(auto_update_wrapper)
+        auto_update_wrap_layout.setContentsMargins(0, 5, 0, 5)
+        auto_update_wrap_layout.addWidget(self.auto_update_checkbox)
+
+        # 立即检查更新按钮
+        update_btn = QPushButton("立即检查更新")
+        update_btn.setStyleSheet(
+            "QPushButton { padding: 6px 16px; border: 1px solid #D0D0D0;"
+            " border-radius: 6px; background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
+        )
+        update_btn.clicked.connect(self.request_check_update.emit)
+        update_btn_layout = QHBoxLayout()
+        update_btn_layout.addWidget(auto_update_wrapper)
+        update_btn_layout.addWidget(update_btn)
+        update_btn_layout.addStretch()
+
         # 装配表单
         def _lbl(text):
             lbl = QLabel(text)
@@ -944,6 +975,7 @@ class ControlPanel(QWidget):
         form_layout.addRow(_lbl("<b>API 代理地址：</b>"), proxy_layout)
         form_layout.addRow(_lbl("<b>新番追踪功能：</b>"), bangumi_wrapper)
         form_layout.addRow(_lbl("<b>系统后台行为：</b>"), autostart_wrapper)
+        form_layout.addRow(_lbl("<b>自动更新：</b>"), update_btn_layout)
 
         inner_layout.addLayout(form_layout)
         inner_layout.addStretch()
@@ -1009,6 +1041,8 @@ class ControlPanel(QWidget):
             "api_proxy": self.proxy_input.text().strip(),
             "save_dir": final_save_dir,
             "export_dir": final_export_dir,
+            "auto_update": self.auto_update_checkbox.isChecked(),
+            "ignored_version": old_cfg.get("ignored_version", ""),
             "is_first_run": old_cfg.get("is_first_run", False),
         }
         save_config(cfg)

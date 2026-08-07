@@ -1,4 +1,4 @@
-# AniNote v3.3
+# AniNote v3.5
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
 
@@ -57,6 +57,22 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
 
 分发 `dist/app/` 整个文件夹即可，对方无需安装 Python。
 
+## 发布新版本（含自动更新）
+
+软件内置自动更新：启动时自动检查 GitHub Releases，发现新版本会弹窗提示，用户确认后自动下载并替换文件（保留 `notes_data/` 与 `aninote_config.json`，不会动用户数据）。
+
+发布流程：
+
+1. **改版本号**：同步修改 `main.py` 的 `VERSION`、`pyproject.toml` 的 `version`
+2. **打包**：
+   ```bash
+   python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
+   ```
+3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v3.5`），Release body 写更新日志（Markdown，更新后会在软件内展示），上传步骤 3 的 zip
+
+> 注意：软件通过 GitHub API 读取 `latest` release，因此请勿在低版本之上发布更高版本的 tag 后删除重发；tag 号必须与 `VERSION` 一致（允许 `v` 前缀差异）。
+
 ## 数据存储
 
 便签数据保存在 `notes_data/` 目录，每个便签一个独立文件夹：
@@ -83,7 +99,6 @@ AniNote/
 ├── main.py                           # 便签窗口、事务追踪器、配置
 ├── control_panel.py                  # 控制台 UI（便签墙、设置页）
 ├── icons.py                          # Material Icons 图标系统
-├── theme.py                          # 设计系统常量
 ├── MaterialSymbolsOutlined_Static.ttf # 图标字体
 ├── Newicon.ico                       # 托盘图标 + 打包用 exe 图标
 └── notes_data/                       # 便签数据目录（自动创建）

@@ -9,15 +9,21 @@ import winreg
 import requests
 import ctypes
 import threading
+import subprocess
 import datetime
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QObject, Signal, QAbstractNativeEventFilter
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PySide6.QtCore import Qt, QObject, Signal, QAbstractNativeEventFilter, QTimer, QMetaObject
+from PySide6.QtWidgets import (
+    QApplication, QSystemTrayIcon, QMenu, QMessageBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QPlainTextEdit, QProgressBar,
+)
 from PySide6.QtGui import QIcon, QAction
 
 import main as note_app
 import control_panel as cp_app
+import updater
 
 
 # ==========================================
@@ -294,7 +300,17 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.installNativeEventFilter(hotkey_manager)
-    
+
+    # 静默 libpng iCCP 色彩配置警告（外部 PNG 常见，无害但噪音大）
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _msg_handler(mode, context, message):
+        if "libpng" in message and "iCCP" in message:
+            return
+        print(f"{message}", file=sys.stderr)
+
+    qInstallMessageHandler(_msg_handler)
+
     if getattr(sys, 'frozen', False):
         BASE_DIR = sys._MEIPASS          # PyInstaller 临时解压目录，--add-data 文件在这里
     else:
@@ -327,6 +343,84 @@ def main():
 
     # 将验证后的实际路径同步给核心引擎
     note_app.SAVE_DIR = save_dir
+
+    def _find_note_file_path(note_id):
+        """在 SAVE_DIR 中按 note_id 查找 data.json 路径（兼容文件夹模式）。"""
+        for item in os.listdir(note_app.SAVE_DIR):
+            item_path = os.path.join(note_app.SAVE_DIR, item)
+            data_file = os.path.join(item_path, "data.json") if os.path.isdir(item_path) else None
+            if data_file and os.path.exists(data_file):
+                try:
+                    with open(data_file, 'r', encoding='utf-8') as fh:
+                        if json.load(fh).get("note_id") == note_id:
+                            return data_file
+                except (json.JSONDecodeError, OSError):
+                    pass
+        return None
+
+    # 便签独立快捷键 —— 必须在加载便签之前连接信号
+    _per_note_hk = {}  # note_id -> hotkey_str
+    _shared_hk = {}    # hotkey_str -> (hk_id, [note_ids])
+
+    def _on_register_note_hotkey(note_id, hotkey_str):
+        """注册便签独立快捷键。同一组合键只注册一次，触发时广播到所有绑定的便签。"""
+        _on_unregister_note_hotkey(note_id)
+        if not hotkey_str.strip():
+            return
+        _per_note_hk[note_id] = hotkey_str
+        key = hotkey_str.lower().strip()
+        if key in _shared_hk:
+            _shared_hk[key][1].append(note_id)
+        else:
+            def show_notes():
+                for nid in _shared_hk.get(key, (0, []))[1]:
+                    for note in note_app.ACTIVE_NOTES:
+                        if note.note_id == nid:
+                            if note.isHidden():
+                                note.show()
+                            note.raise_()
+                            note.activateWindow()
+                            break
+                    else:
+                        open_note_by_id(nid)
+            hk_id = hotkey_manager.register(hotkey_str, show_notes)
+            if hk_id >= 0:
+                _shared_hk[key] = (hk_id, [note_id])
+
+    def _on_unregister_note_hotkey(note_id):
+        """注销便签独立快捷键。"""
+        hotkey_str = _per_note_hk.pop(note_id, None)
+        if not hotkey_str:
+            return
+        key = hotkey_str.lower().strip()
+        if key in _shared_hk:
+            hk_id, note_ids = _shared_hk[key]
+            if note_id in note_ids:
+                note_ids.remove(note_id)
+            if not note_ids:
+                hotkey_manager.unregister_by_id(hk_id)
+                del _shared_hk[key]
+
+    def _on_check_hotkey_conflict(hotkey_str, callback):
+        """检查快捷键是否被其他便签占用。callback(conflict_names_list)"""
+        conflicts = []
+        key = hotkey_str.lower().strip()
+        for nid, hk in _per_note_hk.items():
+            if hk.lower().strip() != key:
+                continue
+            fpath = _find_note_file_path(nid)
+            if fpath:
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as fh:
+                        jdata = json.load(fh)
+                    conflicts.append(jdata.get("title", ""))
+                except:
+                    pass
+        callback(conflicts)
+
+    note_app.global_signaler.register_note_hotkey.connect(_on_register_note_hotkey)
+    note_app.global_signaler.unregister_note_hotkey.connect(_on_unregister_note_hotkey)
+    note_app.global_signaler.check_hotkey_conflict.connect(_on_check_hotkey_conflict)
 
     # 迁移旧版单文件到文件夹
     note_app.migrate_legacy_notes()
@@ -383,7 +477,6 @@ def main():
                 note.raise_()
                 note.activateWindow()
 
-    # 控制面板
     # 控制面板
     panel = cp_app.ControlPanel()
     
@@ -502,80 +595,6 @@ def main():
     )
 
     # 便签独立快捷键管理
-    _per_note_hk = {}  # note_id -> hotkey_str
-    _shared_hk = {}    # hotkey_str -> (hk_id, [note_ids])
-
-    def _on_register_note_hotkey(note_id, hotkey_str):
-        """注册便签独立快捷键。同一组合键只注册一次，触发时广播到所有绑定的便签。"""
-        # 先注销旧键（从共享组中移除）
-        _on_unregister_note_hotkey(note_id)
-
-        if not hotkey_str.strip():
-            return
-
-        _per_note_hk[note_id] = hotkey_str
-        key = hotkey_str.lower().strip()
-
-        if key in _shared_hk:
-            # 组合键已存在，加入便签列表
-            _shared_hk[key][1].append(note_id)
-        else:
-            # 首次注册该组合键
-            def show_notes():
-                for nid in _shared_hk.get(key, (0, []))[1]:
-                    for note in note_app.ACTIVE_NOTES:
-                        if note.note_id == nid:
-                            if note.isHidden():
-                                note.show()
-                            note.raise_()
-                            note.activateWindow()
-                            break
-                    else:
-                        open_note_by_id(nid)
-
-            hk_id = hotkey_manager.register(hotkey_str, show_notes)
-            if hk_id >= 0:
-                _shared_hk[key] = (hk_id, [note_id])
-
-    def _on_unregister_note_hotkey(note_id):
-        """注销便签独立快捷键。"""
-        hotkey_str = _per_note_hk.pop(note_id, None)
-        if not hotkey_str:
-            return
-        key = hotkey_str.lower().strip()
-        if key in _shared_hk:
-            hk_id, note_ids = _shared_hk[key]
-            if note_id in note_ids:
-                note_ids.remove(note_id)
-            if not note_ids:
-                # 没有便签使用了，注销系统热键
-                hotkey_manager.unregister_by_id(hk_id)
-                del _shared_hk[key]
-
-    def _on_check_hotkey_conflict(hotkey_str, callback):
-        """检查快捷键是否被其他便签占用。callback(conflict_names_list)"""
-        conflicts = []
-        key = hotkey_str.lower().strip()
-        for nid, hk in _per_note_hk.items():
-            if hk.lower().strip() != key:
-                continue
-            for fn in os.listdir(note_app.SAVE_DIR):
-                if not fn.endswith('.json'):
-                    continue
-                try:
-                    with open(os.path.join(note_app.SAVE_DIR, fn), 'r', encoding='utf-8') as fh:
-                        jdata = json.load(fh)
-                    if jdata.get("note_id") == nid:
-                        conflicts.append(jdata.get("title", fn.replace('.json', '')))
-                        break
-                except:
-                    pass
-        callback(conflicts)
-
-    note_app.global_signaler.register_note_hotkey.connect(_on_register_note_hotkey)
-    note_app.global_signaler.unregister_note_hotkey.connect(_on_unregister_note_hotkey)
-    note_app.global_signaler.check_hotkey_conflict.connect(_on_check_hotkey_conflict)
-
     def open_note_by_id(note_id):
         """按 ID 显示便签；如果未实例化则创建。"""
         for note in note_app.ACTIVE_NOTES:
@@ -598,32 +617,11 @@ def main():
             if note.note_id == nid:
                 note.delete_note(confirm=False)
                 return
-        # 便签未实例化，通过扫描目录按 note_id 查找文件
-        for fn in os.listdir(note_app.SAVE_DIR):
-            item_path = os.path.join(note_app.SAVE_DIR, fn)
-            # 文件夹模式
-            if os.path.isdir(item_path):
-                data_file = os.path.join(item_path, "data.json")
-                if os.path.exists(data_file):
-                    try:
-                        with open(data_file, 'r', encoding='utf-8') as fh:
-                            data = json.load(fh)
-                        if data.get("note_id") == nid:
-                            import shutil
-                            shutil.rmtree(item_path)
-                            break
-                    except (json.JSONDecodeError, OSError):
-                        pass
-            # 单文件模式
-            elif fn.endswith('.json'):
-                try:
-                    with open(item_path, 'r', encoding='utf-8') as fh:
-                        data = json.load(fh)
-                    if data.get("note_id") == nid:
-                        os.remove(item_path)
-                        break
-                except (json.JSONDecodeError, OSError):
-                    pass
+        # 便签未实例化，按 note_id 查找并删除
+        fpath = _find_note_file_path(nid)
+        if fpath:
+            import shutil
+            shutil.rmtree(os.path.dirname(fpath))
         panel.refresh_notes_wall()
 
     def set_note_top(nid, is_top):
@@ -638,21 +636,16 @@ def main():
                 panel.refresh_notes_wall()
                 return
 
-        # 便签未实例化，通过扫描目录按 note_id 查找文件
-        for fn in os.listdir(note_app.SAVE_DIR):
-            if not fn.endswith('.json'):
-                continue
-            fpath = os.path.join(note_app.SAVE_DIR, fn)
+        # 便签未实例化，按 note_id 查找并更新
+        fpath = _find_note_file_path(nid)
+        if fpath:
             try:
                 with open(fpath, "r", encoding="utf-8") as fi:
                     data = json.load(fi)
-                if data.get("note_id") != nid:
-                    continue
                 data["is_always_on_top"] = is_top
                 with open(fpath, "w", encoding="utf-8") as fo:
                     json.dump(data, fo, ensure_ascii=False, indent=4)
                 panel.refresh_notes_wall()
-                break
             except Exception:
                 pass
 
@@ -674,22 +667,9 @@ def main():
         Word / WPS 可直接打开，加粗/斜体/颜色/字号/待办项全部保留。
         """
         try:
-            # 扫描查找文件
-            file_path = None
-            for fn in os.listdir(note_app.SAVE_DIR):
-                if not fn.endswith('.json'):
-                    continue
-                fp = os.path.join(note_app.SAVE_DIR, fn)
-                try:
-                    with open(fp, 'r', encoding='utf-8') as fh:
-                        jdata = json.load(fh)
-                    if jdata.get("note_id") == nid:
-                        file_path = fp
-                        break
-                except:
-                    pass
+            file_path = _find_note_file_path(nid)
             if not file_path:
-                QMessageBox.warning(panel, "导出失败", "未找到该便签的数据文件。")
+                QMessageBox.warning(panel, "导出失败", "未��到该便签的数据文件。")
                 return
 
             with open(file_path, "r", encoding="utf-8") as f:
@@ -740,36 +720,259 @@ def main():
     panel.request_set_top.connect(set_note_top)
     panel.request_export_note.connect(export_note_by_id)
     panel.request_set_note_hotkey.connect(_open_note_hotkey_by_id)
+    panel.request_check_update.connect(lambda: check_update_flow(manual=True))
+
+    # ==========================================
+    #  自动更新
+    # ==========================================
+
+    def show_update_dialog(info):
+        """弹出「发现新版本」对话框，返回 True=用户选择立即更新。"""
+        dlg = QDialog()
+        dlg.setWindowTitle("发现新版本")
+        dlg.setFixedSize(520, 460)
+        dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        header = QLabel(
+            f"<span style='font-size:16px;font-weight:600;color:#1A1A1A;'>"
+            f"发现新版本 v{info['latest_version']}</span>"
+            f"<span style='font-size:13px;color:#999;margin-left:10px;'>"
+            f"当前 v{note_app.VERSION}</span>"
+        )
+        layout.addWidget(header)
+
+        notes = QPlainTextEdit()
+        notes.setReadOnly(True)
+        notes.setPlainText(info.get("notes", "（本次更新没有附更新日志）"))
+        notes.setStyleSheet(
+            "QPlainTextEdit { border: 1px solid #E0E0E0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; padding: 10px; }"
+        )
+        layout.addWidget(notes, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_later = QPushButton("稍后")
+        btn_later.setStyleSheet(
+            "QPushButton { padding: 8px 20px; border: 1px solid #D0D0D0;"
+            " border-radius: 8px; background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; }"
+        )
+        btn_later.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_later)
+
+        btn_ignore = QPushButton("忽略此版本")
+        btn_ignore.setStyleSheet(
+            "QPushButton { padding: 8px 20px; border: none; border-radius: 8px;"
+            " background: transparent; font-size: 13px; color: #999; }"
+            " QPushButton:hover { color: #555; }"
+        )
+        btn_ignore.clicked.connect(lambda: (_ignore_version(info["latest_version"]), dlg.reject()))
+        btn_row.addWidget(btn_ignore)
+
+        btn_update = QPushButton("立即更新")
+        btn_update.setStyleSheet(
+            "QPushButton { padding: 8px 28px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+        )
+        btn_update.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_update)
+        layout.addLayout(btn_row)
+
+        return dlg.exec() == QDialog.Accepted
+
+    def _ignore_version(version):
+        cfg = note_app.load_config()
+        cfg["ignored_version"] = version
+        note_app.save_config(cfg)
+
+    def perform_update(info):
+        """下载新版本并触发替换。"""
+        # 下载进度对话框
+        dlg = QDialog()
+        dlg.setWindowTitle("正在下载更新")
+        dlg.setFixedSize(420, 150)
+        dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        lbl = QLabel(f"正在下载 v{info['latest_version']}…")
+        lbl.setStyleSheet("font-size: 14px; color: #333;")
+        layout.addWidget(lbl)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setStyleSheet(
+            "QProgressBar { border: none; border-radius: 5px; background: #E0E0E0;"
+            " height: 10px; text-align: center; font-size: 10px; color: transparent; }"
+            " QProgressBar::chunk { background: #1A73E8; border-radius: 5px; }"
+        )
+        layout.addWidget(bar)
+        status = QLabel("连接服务器中…")
+        status.setStyleSheet("font-size: 12px; color: #999;")
+        layout.addWidget(status)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet(
+            "QPushButton { padding: 6px 18px; border: 1px solid #D0D0D0; border-radius: 6px;"
+            " background: #FFFFFF; font-size: 12px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; }"
+        )
+        cancel_btn.clicked.connect(dlg.reject)
+        layout.addWidget(cancel_btn, 0, Qt.AlignRight)
+        cancel_flag = {"cancelled": False}
+        cancel_btn.clicked.connect(lambda: cancel_flag.__setitem__("cancelled", True))
+
+        dlg.show()
+        dlg.setWindowModality(Qt.WindowModal)
+        app.processEvents()
+
+        def worker():
+            download_dir = updater.temp_download_dir()
+            zip_path = os.path.join(download_dir, f"AniNote-v{info['latest_version']}.zip")
+
+            def progress_cb(received, total):
+                if cancel_flag["cancelled"]:
+                    return
+                pct = int(received * 100 / total) if total else 0
+                QMetaObject.invokeMethod(
+                    bar, "setValue", Qt.QueuedConnection, pct
+                )
+                QMetaObject.invokeMethod(
+                    status, "setText", Qt.QueuedConnection,
+                    f"已下载 {received // 1024} KB / {total // 1024} KB"
+                    if total else f"已下载 {received // 1024} KB"
+                )
+
+            ok = updater.download_update(info["zip_url"], zip_path,
+                                         progress_cb=progress_cb,
+                                         proxy_str=note_app.load_config().get("api_proxy", ""))
+            if cancel_flag["cancelled"]:
+                QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
+                return
+            if not ok:
+                QTimer.singleShot(0, lambda: (
+                    QMessageBox.warning(
+                        None, "更新失败",
+                        "下载失败，请检查网络连接后重试。\n\n"
+                        "大陆网络环境下建议在「控制面板 → API 代理地址」"
+                        "中填写本地代理端口后再试。"
+                    ),
+                ))
+                QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
+                return
+            # 写入更新标记（供新版本展示日志）并生成替换脚本
+            updater.mark_updated(note_app.VERSION, info["latest_version"], info.get("notes", ""))
+            bat_path = updater.write_update_script(updater.app_base_dir(), zip_path)
+            QMetaObject.invokeMethod(dlg, "accept", Qt.QueuedConnection)
+            QTimer.singleShot(200, lambda: (
+                [n.save_data() for n in note_app.ACTIVE_NOTES],
+                tray_icon.hide(),
+                subprocess.Popen([bat_path], shell=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW),
+                app.quit(),
+            ))
+
+        threading.Thread(target=worker, daemon=True).start()
+        if dlg.exec() != QDialog.Accepted and not cancel_flag["cancelled"]:
+            return
+        # 更新脚本已启动，主程序即将退出
+
+    def check_update_flow(manual=False):
+        """检查更新；manual=True 时无论是否有新版都给出反馈。"""
+        proxy = note_app.load_config().get("api_proxy", "")
+        info = updater.check_for_update(proxy_str=proxy)
+        if info is None:
+            if manual:
+                QMessageBox.information(None, "检查更新", "无法连接到更新服务器，请稍后再试。")
+            return
+        if updater.compare_versions(info["latest_version"], note_app.VERSION) <= 0:
+            if manual:
+                QMessageBox.information(None, "检查更新", f"当前已是最新版本 v{note_app.VERSION}。")
+            return
+        cfg = note_app.load_config()
+        if info["latest_version"] == cfg.get("ignored_version", ""):
+            return
+        if show_update_dialog(info):
+            perform_update(info)
+
+    def check_update_auto():
+        cfg = note_app.load_config()
+        if not cfg.get("auto_update", True):
+            return
+        check_update_flow(manual=False)
+
+    def show_updated_log():
+        """更新完成后首次启动，展示本次更新日志。"""
+        mark = updater.read_update_mark()
+        if not mark:
+            return
+        dlg = QDialog()
+        dlg.setWindowTitle("更新完成")
+        dlg.setFixedSize(520, 440)
+        dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        header = QLabel(
+            f"<span style='font-size:16px;font-weight:600;color:#1A1A1A;'>"
+            f"已更新到 v{mark.get('to', '')}</span>"
+            f"<span style='font-size:13px;color:#999;margin-left:10px;'>"
+            f"从 v{mark.get('from', '')} 升级</span>"
+        )
+        layout.addWidget(header)
+        notes = QPlainTextEdit()
+        notes.setReadOnly(True)
+        notes.setPlainText(mark.get("notes", "") or "（本次更新没有附更新日志）")
+        notes.setStyleSheet(
+            "QPlainTextEdit { border: 1px solid #E0E0E0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; padding: 10px; }"
+        )
+        layout.addWidget(notes, 1)
+        ok_btn = QPushButton("知道了")
+        ok_btn.setStyleSheet(
+            "QPushButton { padding: 8px 30px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+        )
+        ok_btn.clicked.connect(dlg.accept)
+        layout.addWidget(ok_btn, 0, Qt.AlignRight)
+        dlg.exec()
 
     # ==========================================
     #  系统托盘菜单
     # ==========================================
 
     menu = QMenu()
+    menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
     menu.setAttribute(Qt.WA_TranslucentBackground)
     menu.setStyleSheet(
         "QMenu {"
-        " background-color: #FFFFFF;"
-        " border: 1px solid #DDDDDD;"
-        " border-radius: 6px;"
-        " padding: 3px;"
+        " background-color: #FAFAFA;"
+        " border: 1px solid #E0E0E0;"
+        " border-radius: 10px;"
+        " padding: 6px;"
         " font-family: 'Microsoft YaHei';"
         " }"
         " QMenu::item {"
-        " padding: 5px 22px;"
-        " border-radius: 3px;"
-        " margin: 1px 2px;"
+        " padding: 7px 24px;"
+        " border-radius: 6px;"
+        " margin: 1px 3px;"
         " color: #333333;"
         " font-size: 13px;"
         " }"
         " QMenu::item:selected {"
-        " background-color: #E8F4FD;"
-        " color: #0078D7;"
+        " background-color: #E8F0FE;"
+        " color: #1A73E8;"
         " }"
         " QMenu::separator {"
         " height: 1px;"
-        " background: #EEEEEE;"
-        " margin: 2px 8px;"
+        " background: #E8E8E8;"
+        " margin: 4px 12px;"
         " }"
     )
 
@@ -789,6 +992,9 @@ def main():
     action_panel.triggered.connect(
         show_and_focus_panel)
 
+    action_check_update = QAction("检查更新…", app)
+    action_check_update.triggered.connect(lambda: check_update_flow(manual=True))
+
     action_exit = QAction("彻底退出 AniNote", app)
     action_exit.triggered.connect(lambda: (
         [note.save_data() for note in note_app.ACTIVE_NOTES],
@@ -800,6 +1006,8 @@ def main():
     menu.addAction(action_toggle)
     menu.addSeparator()
     menu.addAction(action_panel)
+    menu.addSeparator()
+    menu.addAction(action_check_update)
     menu.addSeparator()
     menu.addAction(action_exit)
     tray_icon.setContextMenu(menu)
@@ -882,6 +1090,13 @@ def main():
         note_app.global_signaler.config_changed_signal.emit()
 
     panel.settings_changed.connect(apply_new_settings)
+
+    # 更新完成后首次启动：展示更新日志
+    show_updated_log()
+
+    # 延迟自动检查更新（等界面就绪，避免启动卡顿）
+    QTimer.singleShot(5000, check_update_auto)
+
     sys.exit(app.exec())
 
 
