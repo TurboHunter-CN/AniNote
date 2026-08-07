@@ -891,32 +891,68 @@ def main():
             return
         # 更新脚本已启动，主程序即将退出
 
-    def check_update_flow(manual=False):
-        """检查更新；manual=True 时无论是否有新版都给出反馈。
+    # 更新检查并发控制
+    # - token：手动检查时递增，进行中/排队中的旧检查结果作废（打断自动检查）
+    # - busy：一次只允许一个检查在网络上跑
+    # - dialog_open：更新弹窗已打开时忽略新检查，避免重复弹窗
+    check_ctl = {"token": 0, "busy": False, "dialog_open": False, "timer": None,
+                 "manual": False}
 
-        Returns:
-            True = 检查成功（无论有无新版）；False = 检查失败（网络/清单不可达）。
-            供自动检查失败后安排重试。
+    def check_update_flow(manual=False):
+        """发起一次更新检查（网络请求在后台线程，不阻塞 UI）。
+
+        manual=True（用户点击）：作废任何进行中的自动检查，立即重新检查。
+        Returns: True=已发起检查；False=未发起（已有弹窗打开等）。
         """
+        if check_ctl["dialog_open"]:
+            return False
+        if manual:
+            # 手动检查打断自动：取消重试定时器 + 作废进行中检查的结果
+            check_ctl["token"] += 1
+            if check_ctl["timer"]:
+                check_ctl["timer"].stop()
+                check_ctl["timer"] = None
+        elif check_ctl["busy"]:
+            return False
+        token = check_ctl["token"]
+        check_ctl["busy"] = True
+        check_ctl["manual"] = manual
         proxy = note_app.load_config().get("api_proxy", "")
-        info = updater.check_for_update(proxy_str=proxy)
+
+        def worker():
+            info = updater.check_for_update(proxy_str=proxy)
+            QTimer.singleShot(0, lambda: _on_check_done(info, token))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _on_check_done(info, token):
+        check_ctl["busy"] = False
+        if token != check_ctl["token"]:
+            return  # 已被更新的手动检查作废
+        manual = check_ctl["manual"]
+        if check_ctl["dialog_open"]:
+            return
         if info is None:
             if manual:
                 QMessageBox.information(
                     None, "检查更新",
                     "无法获取版本信息，请检查网络或代理设置后重试。"
                 )
-            return False
+            return
         if updater.compare_versions(info["latest_version"], note_app.VERSION) <= 0:
             if manual:
                 QMessageBox.information(None, "检查更新", f"当前已是最新版本 v{note_app.VERSION}。")
-            return True
+            return
         cfg = note_app.load_config()
         if info["latest_version"] == cfg.get("ignored_version", ""):
-            return True
-        if show_update_dialog(info):
-            perform_update(info)
-        return True
+            return
+        check_ctl["dialog_open"] = True
+        try:
+            if show_update_dialog(info):
+                perform_update(info)
+        finally:
+            check_ctl["dialog_open"] = False
 
     def check_update_auto(retries=2):
         """启动后自动检查更新；失败则延迟 60 秒重试（最多 retries 次），
@@ -926,7 +962,11 @@ def main():
             return
         ok = check_update_flow(manual=False)
         if not ok and retries > 0:
-            QTimer.singleShot(60000, lambda: check_update_auto(retries - 1))
+            t = QTimer()
+            t.setSingleShot(True)
+            t.timeout.connect(lambda: check_update_auto(retries - 1))
+            t.start(60000)
+            check_ctl["timer"] = t
 
     def show_updated_log():
         """更新完成后首次启动，展示本次更新日志。"""
