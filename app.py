@@ -860,19 +860,26 @@ def main():
                     if total else f"已下载 {received // 1024} KB"
                 )
 
-            ok = updater.download_update(info["zip_url"], zip_path,
-                                         progress_cb=progress_cb,
-                                         proxy_str=note_app.load_config().get("api_proxy", ""),
-                                         sha256=info.get("sha256", ""))
+            ok, fail_reason = updater.download_update(
+                info["zip_url"], zip_path,
+                progress_cb=progress_cb,
+                proxy_str=note_app.load_config().get("api_proxy", ""),
+                sha256=info.get("sha256", ""))
             if cancel_flag["cancelled"]:
                 bridge.cancelled.emit()
                 return
             if not ok:
-                bridge.failed.emit(
-                    "下载失败，请检查网络连接后重试。\n\n"
-                    "大陆网络环境下建议在「控制面板 → API 代理地址」"
-                    "中填写本地代理端口后再试。"
-                )
+                if fail_reason == "checksum":
+                    bridge.failed.emit(
+                        "文件下载完成但校验失败（文件可能被篡改，或版本清单中的"
+                        "校验值不正确）。\n\n请稍后重试，或联系作者检查版本清单。"
+                    )
+                else:
+                    bridge.failed.emit(
+                        "下载失败，请检查网络连接后重试。\n\n"
+                        "大陆网络环境下建议在「控制面板 → API 代理地址」"
+                        "中填写本地代理端口后再试。"
+                    )
                 return
             # 写入更新标记（供新版本展示日志）并生成替换脚本
             updater.mark_updated(note_app.VERSION, info["latest_version"], info.get("notes", ""))

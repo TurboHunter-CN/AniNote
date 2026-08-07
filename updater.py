@@ -149,20 +149,24 @@ def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=
     proxy_str: 可选代理，如 "127.0.0.1:7890"。
     sha256: 可选期望校验值；非空时下载后校验，不匹配视为失败（防下载被篡改）。
     Returns:
-        True 成功 / False 失败（所有源均失败、校验不通过）
+        (True, "") 成功；
+        (False, reason) 失败，reason 为 "network"（网络/连接）或 "checksum"（校验不通过）。
     """
     px = _proxy_config(proxy_str)
     # 原站走代理；镜像强制不走代理（{"http": None} 覆盖系统代理）
     no_proxy = {"http": None, "https": None}
     candidates = [(zip_url, px)] + [(m.format(url=zip_url), no_proxy) for m in DOWNLOAD_MIRRORS]
+    last_reason = "network"
     for cand_url, cand_px in candidates:
-        if _download_one(cand_url, dest_path, progress_cb, timeout, cand_px, sha256):
-            return True
-    return False
+        ok, reason = _download_one(cand_url, dest_path, progress_cb, timeout, cand_px, sha256)
+        if ok:
+            return (True, "")
+        last_reason = reason
+    return (False, last_reason)
 
 
 def _download_one(url, dest_path, progress_cb, timeout, proxies, sha256):
-    """单源下载，失败返回 False（并清理半成品文件）。"""
+    """单源下载，失败返回 (False, reason)。"""
     import hashlib
     hasher = hashlib.sha256() if sha256 else None
     try:
@@ -183,15 +187,20 @@ def _download_one(url, dest_path, progress_cb, timeout, proxies, sha256):
                     if progress_cb:
                         progress_cb(received, total)
         if hasher and hasher.hexdigest().lower() != str(sha256).lower():
-            raise ValueError("SHA256 mismatch")
-        return True
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except OSError:
+                pass
+            return (False, "checksum")
+        return (True, "")
     except Exception:
         try:
             if os.path.exists(dest_path):
                 os.remove(dest_path)
         except OSError:
             pass
-        return False
+        return (False, "network")
 
 
 def write_update_script(base_dir, zip_path):
