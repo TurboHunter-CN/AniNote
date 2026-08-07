@@ -992,7 +992,7 @@ def main():
     action_panel.triggered.connect(
         show_and_focus_panel)
 
-    action_check_update = QAction("检查更新…", app)
+    action_check_update = QAction("检查更新", app)
     action_check_update.triggered.connect(lambda: check_update_flow(manual=True))
 
     action_exit = QAction("彻底退出 AniNote", app)

@@ -679,6 +679,25 @@ class ControlPanel(QWidget):
                     raw_text = doc.toPlainText().strip()
                     if not raw_text:
                         raw_text = "[空便签内容]"
+
+                    # 事务追踪便签：html_content 只有占位图片/空勾选，
+                    # 真正内容在 habits_data 中，生成统计摘要作为卡片预览。
+                    habits_data = data.get("habits_data") or {}
+                    habits = habits_data.get("habits") or []
+                    if habits:
+                        import datetime as _dt
+                        today = _dt.date.today().isoformat()
+                        # 每日打卡统计仅针对"自由打卡"模式（周期/倒计时不记每日记录）
+                        free_habits = [h for h in habits if h.get("mode") == "free"]
+                        if free_habits:
+                            done = sum(1 for h in free_habits
+                                       if (h.get("records") or {}).get(today))
+                            line1 = f"{len(habits)} 个事务 · 今日 {done}/{len(free_habits)} 已打卡"
+                        else:
+                            line1 = f"{len(habits)} 个事务 · 周期/倒计时"
+                        names = " · ".join(h.get("name", "?") for h in habits)
+                        raw_text = line1 + "\n" + names
+
                     bg_color = data.get("bg_color", [255, 249, 196, 242])
                     data_list.append({
                         "id": data.get("note_id", ""),
