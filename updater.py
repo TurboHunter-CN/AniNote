@@ -156,17 +156,28 @@ def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=
     # 原站走代理；镜像强制不走代理（{"http": None} 覆盖系统代理）
     no_proxy = {"http": None, "https": None}
     candidates = [(zip_url, px)] + [(m.format(url=zip_url), no_proxy) for m in DOWNLOAD_MIRRORS]
+    errors = []
     last_reason = "network"
     for cand_url, cand_px in candidates:
-        ok, reason = _download_one(cand_url, dest_path, progress_cb, timeout, cand_px, sha256)
+        ok, reason, err = _download_one(cand_url, dest_path, progress_cb, timeout,
+                                        cand_px, sha256)
         if ok:
             return (True, "")
         last_reason = reason
+        errors.append(f"[{cand_url}]\n  -> {err}")
+    # 全部失败：把各源错误写入诊断日志，便于定位网络问题
+    try:
+        log_dir = os.path.dirname(dest_path) or tempfile.gettempdir()
+        log_path = os.path.join(log_dir, "download_error.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(errors))
+    except OSError:
+        pass
     return (False, last_reason)
 
 
 def _download_one(url, dest_path, progress_cb, timeout, proxies, sha256):
-    """单源下载，失败返回 (False, reason)。"""
+    """单源下载，失败返回 (False, reason, err详情)。"""
     import hashlib
     hasher = hashlib.sha256() if sha256 else None
     try:
@@ -192,15 +203,15 @@ def _download_one(url, dest_path, progress_cb, timeout, proxies, sha256):
                     os.remove(dest_path)
             except OSError:
                 pass
-            return (False, "checksum")
-        return (True, "")
-    except Exception:
+            return (False, "checksum", "SHA256 mismatch")
+        return (True, "", "")
+    except Exception as e:
         try:
             if os.path.exists(dest_path):
                 os.remove(dest_path)
         except OSError:
             pass
-        return (False, "network")
+        return (False, "network", f"{type(e).__name__}: {e}")
 
 
 def write_update_script(base_dir, zip_path):

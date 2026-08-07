@@ -1,4 +1,4 @@
-# AniNote v3.5
+# AniNote v4.0
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
 

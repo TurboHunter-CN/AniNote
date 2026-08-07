@@ -13,7 +13,7 @@ import subprocess
 import datetime
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QObject, Signal, QAbstractNativeEventFilter, QTimer, QMetaObject
+from PySide6.QtCore import Qt, QObject, Signal, QAbstractNativeEventFilter, QTimer
 from PySide6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QMessageBox,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -834,9 +834,22 @@ def main():
             download_ready = Signal(str)   # 携带 update.bat 路径
             failed = Signal(str)
             cancelled = Signal()
+            progress = Signal(int, int)    # (received, total)
         bridge = _UpdateBridge()
-        bridge.failed.connect(lambda msg: QMessageBox.warning(None, "更新失败", msg))
-        bridge.cancelled.connect(dlg.reject)
+
+        def _on_failed(msg):
+            QMessageBox.warning(None, "更新失败", msg)
+            dlg.reject()   # 关闭下载进度对话框
+
+        def _update_progress(received, total):
+            if cancel_flag["cancelled"]:
+                return
+            pct = int(received * 100 / total) if total else 0
+            bar.setValue(pct)
+            if total:
+                status.setText(f"已下载 {received // 1024} KB / {total // 1024} KB")
+            else:
+                status.setText(f"已下载 {received // 1024} KB")
 
         def _on_download_ready(bat_path):
             dlg.accept()
@@ -848,28 +861,19 @@ def main():
                                  creationflags=subprocess.CREATE_NO_WINDOW),
                 app.quit(),
             ))
-        bridge.download_ready.connect(_on_download_ready)
 
-        dlg.show()
-        dlg.setWindowModality(Qt.WindowModal)
-        app.processEvents()
+        bridge.failed.connect(_on_failed)
+        bridge.cancelled.connect(dlg.reject)
+        bridge.progress.connect(_update_progress)
+        bridge.download_ready.connect(_on_download_ready)
 
         def worker():
             download_dir = updater.temp_download_dir()
             zip_path = os.path.join(download_dir, f"AniNote-v{info['latest_version']}.zip")
 
             def progress_cb(received, total):
-                if cancel_flag["cancelled"]:
-                    return
-                pct = int(received * 100 / total) if total else 0
-                QMetaObject.invokeMethod(
-                    bar, "setValue", Qt.QueuedConnection, pct
-                )
-                QMetaObject.invokeMethod(
-                    status, "setText", Qt.QueuedConnection,
-                    f"已下载 {received // 1024} KB / {total // 1024} KB"
-                    if total else f"已下载 {received // 1024} KB"
-                )
+                if not cancel_flag["cancelled"]:
+                    bridge.progress.emit(received, total)
 
             ok, fail_reason = updater.download_update(
                 info["zip_url"], zip_path,
@@ -886,10 +890,12 @@ def main():
                         "校验值不正确）。\n\n请稍后重试，或联系作者检查版本清单。"
                     )
                 else:
+                    log_path = os.path.join(os.path.dirname(zip_path), "download_error.log")
                     bridge.failed.emit(
                         "下载失败，请检查网络连接后重试。\n\n"
                         "大陆网络环境下建议在「控制面板 → API 代理地址」"
-                        "中填写本地代理端口后再试。"
+                        "中填写本地代理端口后再试。\n\n"
+                        f"详细原因见：{log_path}"
                     )
                 return
             # 写入更新标记（供新版本展示日志）并生成替换脚本
