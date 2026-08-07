@@ -142,7 +142,8 @@ def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=
                     sha256=""):
     """流式下载 zip 到 dest_path，逐块写入并回调进度。
 
-    优先尝试原站直链；连接失败时自动依次切换 GitHub 加速镜像兜底。
+    优先尝试原站直链（走用户代理）；失败时自动依次切换 GitHub 加速镜像兜底。
+    镜像专为大陆网络直连设计，请求不走代理（避免代理规则干扰镜像域名）。
 
     progress_cb(received_bytes, total_bytes)
     proxy_str: 可选代理，如 "127.0.0.1:7890"。
@@ -150,20 +151,23 @@ def download_update(zip_url, dest_path, progress_cb=None, timeout=30, proxy_str=
     Returns:
         True 成功 / False 失败（所有源均失败、校验不通过）
     """
-    candidates = [zip_url] + [m.format(url=zip_url) for m in DOWNLOAD_MIRRORS]
-    for cand in candidates:
-        if _download_one(cand, dest_path, progress_cb, timeout, proxy_str, sha256):
+    px = _proxy_config(proxy_str)
+    # 原站走代理；镜像强制不走代理（{"http": None} 覆盖系统代理）
+    no_proxy = {"http": None, "https": None}
+    candidates = [(zip_url, px)] + [(m.format(url=zip_url), no_proxy) for m in DOWNLOAD_MIRRORS]
+    for cand_url, cand_px in candidates:
+        if _download_one(cand_url, dest_path, progress_cb, timeout, cand_px, sha256):
             return True
     return False
 
 
-def _download_one(url, dest_path, progress_cb, timeout, proxy_str, sha256):
+def _download_one(url, dest_path, progress_cb, timeout, proxies, sha256):
     """单源下载，失败返回 False（并清理半成品文件）。"""
     import hashlib
     hasher = hashlib.sha256() if sha256 else None
     try:
         with requests.get(url, stream=True, timeout=timeout, headers=UA_HEADER,
-                          proxies=_proxy_config(proxy_str)) as r:
+                          proxies=proxies) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0) or 0)
             received = 0

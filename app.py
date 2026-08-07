@@ -728,7 +728,8 @@ def main():
 
     def show_update_dialog(info):
         """弹出「发现新版本」对话框，返回 True=用户选择立即更新。"""
-        dlg = QDialog()
+        dlg = QDialog(panel)
+        dlg.setWindowModality(Qt.WindowModal)
         dlg.setWindowTitle("发现新版本")
         dlg.setFixedSize(520, 460)
         dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
@@ -794,7 +795,8 @@ def main():
     def perform_update(info):
         """下载新版本并触发替换。"""
         # 下载进度对话框
-        dlg = QDialog()
+        dlg = QDialog(panel)
+        dlg.setWindowModality(Qt.WindowModal)
         dlg.setWindowTitle("正在下载更新")
         dlg.setFixedSize(420, 150)
         dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
@@ -931,7 +933,8 @@ def main():
         mark = updater.read_update_mark()
         if not mark:
             return
-        dlg = QDialog()
+        dlg = QDialog(panel)
+        dlg.setWindowModality(Qt.WindowModal)
         dlg.setWindowTitle("更新完成")
         dlg.setFixedSize(520, 440)
         dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
