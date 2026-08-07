@@ -831,13 +831,24 @@ def main():
 
         # 跨线程信号桥：下载线程 → 主线程 UI（须在 dlg 创建之后连接）
         class _UpdateBridge(QObject):
-            finished_ok = Signal()
+            download_ready = Signal(str)   # 携带 update.bat 路径
             failed = Signal(str)
             cancelled = Signal()
         bridge = _UpdateBridge()
         bridge.failed.connect(lambda msg: QMessageBox.warning(None, "更新失败", msg))
-        bridge.finished_ok.connect(dlg.accept)
         bridge.cancelled.connect(dlg.reject)
+
+        def _on_download_ready(bat_path):
+            dlg.accept()
+            # 主线程中调度收尾：保存便签 → 隐藏托盘 → 启动替换脚本 → 退出
+            QTimer.singleShot(200, lambda: (
+                [n.save_data() for n in note_app.ACTIVE_NOTES],
+                tray_icon.hide(),
+                subprocess.Popen([bat_path], shell=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW),
+                app.quit(),
+            ))
+        bridge.download_ready.connect(_on_download_ready)
 
         dlg.show()
         dlg.setWindowModality(Qt.WindowModal)
@@ -884,14 +895,7 @@ def main():
             # 写入更新标记（供新版本展示日志）并生成替换脚本
             updater.mark_updated(note_app.VERSION, info["latest_version"], info.get("notes", ""))
             bat_path = updater.write_update_script(updater.app_base_dir(), zip_path)
-            bridge.finished_ok.emit()
-            QTimer.singleShot(200, lambda: (
-                [n.save_data() for n in note_app.ACTIVE_NOTES],
-                tray_icon.hide(),
-                subprocess.Popen([bat_path], shell=True,
-                                 creationflags=subprocess.CREATE_NO_WINDOW),
-                app.quit(),
-            ))
+            bridge.download_ready.emit(bat_path)
 
         threading.Thread(target=worker, daemon=True).start()
         if dlg.exec() != QDialog.Accepted and not cancel_flag["cancelled"]:
@@ -905,33 +909,9 @@ def main():
     check_ctl = {"token": 0, "busy": False, "dialog_open": False, "timer": None,
                  "manual": False}
 
-    def check_update_flow(manual=False):
-        """发起一次更新检查（网络请求在后台线程，不阻塞 UI）。
-
-        manual=True（用户点击）：作废任何进行中的自动检查，立即重新检查。
-        Returns: True=已发起检查；False=未发起（已有弹窗打开等）。
-        """
-        if check_ctl["dialog_open"]:
-            return False
-        if manual:
-            # 手动检查打断自动：取消重试定时器 + 作废进行中检查的结果
-            check_ctl["token"] += 1
-            if check_ctl["timer"]:
-                check_ctl["timer"].stop()
-                check_ctl["timer"] = None
-        elif check_ctl["busy"]:
-            return False
-        token = check_ctl["token"]
-        check_ctl["busy"] = True
-        check_ctl["manual"] = manual
-        proxy = note_app.load_config().get("api_proxy", "")
-
-        def worker():
-            info = updater.check_for_update(proxy_str=proxy)
-            QTimer.singleShot(0, lambda: _on_check_done(info, token))
-
-        threading.Thread(target=worker, daemon=True).start()
-        return True
+    class _CheckBridge(QObject):
+        """后台检查线程 → 主线程的结果信号桥（跨线程自动 Queued 执行）。"""
+        done = Signal(object, int)   # (info, token)
 
     def _on_check_done(info, token):
         check_ctl["busy"] = False
@@ -960,6 +940,37 @@ def main():
                 perform_update(info)
         finally:
             check_ctl["dialog_open"] = False
+
+    check_bridge = _CheckBridge()
+    check_bridge.done.connect(_on_check_done)
+
+    def check_update_flow(manual=False):
+        """发起一次更新检查（网络请求在后台线程，不阻塞 UI）。
+
+        manual=True（用户点击）：作废任何进行中的自动检查，立即重新检查。
+        Returns: True=已发起检查；False=未发起（已有弹窗打开等）。
+        """
+        if check_ctl["dialog_open"]:
+            return False
+        if manual:
+            # 手动检查打断自动：取消重试定时器 + 作废进行中检查的结果
+            check_ctl["token"] += 1
+            if check_ctl["timer"]:
+                check_ctl["timer"].stop()
+                check_ctl["timer"] = None
+        elif check_ctl["busy"]:
+            return False
+        token = check_ctl["token"]
+        check_ctl["busy"] = True
+        check_ctl["manual"] = manual
+        proxy = note_app.load_config().get("api_proxy", "")
+
+        def worker():
+            info = updater.check_for_update(proxy_str=proxy)
+            check_bridge.done.emit(info, token)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def check_update_auto(retries=2):
         """启动后自动检查更新；失败则延迟 60 秒重试（最多 retries 次），
