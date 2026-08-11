@@ -146,9 +146,10 @@ def generate_schedule_html(schedule):
         </tr>
     """
     for i in range(max_rows):
-        y_name = yesterday_list[i] if i < len(yesterday_list) else ""
-        t_name = today_list[i] if i < len(today_list) else ""
-        m_name = tomorrow_list[i] if i < len(tomorrow_list) else ""
+        # 数据不足的日子用 &nbsp; 占位，避免空单元格导致表格塌陷/异常显示
+        y_name = yesterday_list[i] if i < len(yesterday_list) else "&nbsp;"
+        t_name = today_list[i] if i < len(today_list) else "&nbsp;"
+        m_name = tomorrow_list[i] if i < len(tomorrow_list) else "&nbsp;"
 
         html += f"""
             <tr style='border-bottom: 1px dashed #ccc;'>
@@ -576,8 +577,8 @@ def main():
 
         threading.Thread(target=task, daemon=True).start()
 
-    # 启动时执行一次同步（日期未变则跳过 API 请求）
-    trigger_bangumi_sync(cfg)
+    # 启动时执行一次同步（日期未变则跳过 API 请求）；延迟 7 秒避开启动高峰
+    trigger_bangumi_sync(cfg, delay=7)
 
     # ==========================================
     #  信号接线

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aninote"
-version = "4.0"
+version = "4.0.1"
 description = "桌面便签工具 — 富文本编辑、待办事项、事务追踪、Bangumi 新番日历"
 readme = "README.md"
 license = {text = "MIT"}

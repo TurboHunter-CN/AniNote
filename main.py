@@ -15,7 +15,7 @@ import urllib.parse
 import uuid
 import datetime as datetime_module
 
-VERSION = "4.0"
+VERSION = "4.0.1"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,

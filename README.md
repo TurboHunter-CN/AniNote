@@ -1,4 +1,4 @@
-# AniNote v4.0
+# AniNote v4.0.1
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
 
@@ -69,13 +69,13 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
    python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
    ```
 3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
-4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v3.5`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.zip`）
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.0.1`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.zip`）
 5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
    ```json
    {
-       "version": "3.5",
+       "version": "4.0.1",
        "notes": "本次更新：\n- 新增自动更新功能",
-       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v3.5/AniNote-v3.5.zip",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.0.1/AniNote-v4.0.1.zip",
        "sha256": ""
    }
    ```
