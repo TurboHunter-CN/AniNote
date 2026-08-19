@@ -2367,8 +2367,7 @@ class BangumiScheduleWindow(AniNoteWindow):
         self._rebulding = False      # 防 resizeEvent 递归重建
         self.sync_failed.connect(self._on_sync_failed)
 
-        # 只读展示：隐藏编辑工具栏，保留刷新按钮
-        self.header.toolbar_container.hide()
+        # 保留编辑工具栏（用户可自行锁定便签），并添加刷新按钮
         self.refresh_btn = QPushButton(icon("refresh"), self.header)
         set_icon_font(self.refresh_btn, 14)
         self.refresh_btn.setToolTip("立即同步新番日历")
@@ -2389,12 +2388,11 @@ class BangumiScheduleWindow(AniNoteWindow):
         # 恢复数据
         self._load_bangumi_state()
 
-        # 首次创建 / 旧数据：浅蓝主题 + 隐藏工具栏（替代父类 _init_bangumi_mode 的外观职责）
+        # 首次创建 / 旧数据：浅蓝主题（替代父类 _init_bangumi_mode 的外观职责）
         if not (self.save_file and os.path.exists(self.save_file)):
             self.is_always_on_top = False
             self.bg_color = [235, 245, 255, 242]
             self._apply_bg_color()
-        self.header.toolbar_container.hide()
         self._apply_lock_ui()
 
         # 首次创建 / 旧数据：设置默认标题与提示
@@ -2415,14 +2413,11 @@ class BangumiScheduleWindow(AniNoteWindow):
         pass
 
     def _apply_lock_ui(self):
-        """网格模式无文本编辑：覆写父类锁定逻辑，确保工具栏与格式面板始终隐藏。
-
-        父类 _apply_lock_ui 会根据 is_locked 重新 setVisible(not locked)，
-        需要在这里把编辑工具栏与格式面板强制隐藏回来。
+        """网格模式：工具栏可见性交给父类逻辑（跟随锁定状态，用户可自行锁定）；
+        仅格式面板强制隐藏——网格无文本可编辑，显示它会挤掉下方的番剧表格。
         """
         super()._apply_lock_ui()
         self.format_panel.hide()
-        self.header.toolbar_container.hide()
 
     def _init_bangumi_default_title(self):
         """首次创建或存档标题为"未命名便签"时，使用新番便签专用标题。"""
