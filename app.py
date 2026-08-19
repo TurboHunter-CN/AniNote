@@ -12,6 +12,7 @@ import threading
 import subprocess
 import datetime
 from ctypes import wintypes
+from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import Qt, QObject, Signal, QAbstractNativeEventFilter, QTimer
 from PySide6.QtWidgets import (
@@ -20,6 +21,51 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QProgressBar,
 )
 from PySide6.QtGui import QIcon, QAction
+
+
+# 模块级：在 import 任何业务模块之前尽早静默 libpng iCCP 色彩配置警告
+# （外部 PNG 常见，无害但噪音大）。libpng 警告经 Qt 消息系统，可被拦截；
+# 另加 stderr 重定向兜底，覆盖 C 层直接写 fd2 的路径。
+def _install_iccp_filter():
+    from PySide6.QtCore import qInstallMessageHandler
+
+    def _msg_handler(mode, context, message):
+        m = str(message)
+        if "libpng" in m or "iCCP" in m:
+            return
+        print(m, file=sys.stderr)
+
+    qInstallMessageHandler(_msg_handler)
+
+
+def _install_stderr_iccp_filter():
+    """终极兜底：重定向 stderr（fd2），过滤含 libpng/iCCP 的行后透传其余输出。"""
+    try:
+        real_fd = os.dup(2)
+        r_fd, w_fd = os.pipe()
+        os.dup2(w_fd, 2)
+        os.close(w_fd)
+
+        def _pump():
+            try:
+                with os.fdopen(r_fd, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if "iCCP" in line or "libpng" in line:
+                            continue
+                        try:
+                            os.write(real_fd, line.encode("utf-8", errors="replace"))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_pump, daemon=True).start()
+    except Exception:
+        pass
+
+
+_install_iccp_filter()
+_install_stderr_iccp_filter()
 
 import main as note_app
 import control_panel as cp_app
@@ -31,11 +77,52 @@ import updater
 # ==========================================
 
 class BangumiUpdater(QObject):
-    """跨线程信号中转器，用于将网络请求结果推回主线程。"""
-    update_signal = Signal(str)
+    """跨线程信号中转器，用于将网络请求结果推回主线程。
+
+    payload 可为：dict（同步成功的番剧日程）/ "loading" / str（错误信息）。
+    """
+    update_signal = Signal(object)
 
 
 bgm_updater = BangumiUpdater()
+
+
+def _fetch_all_episodes(subject_ids, headers, proxies):
+    """并发拉取多部番剧的剧集表（失败条目跳过，不阻断主流程）。
+
+    Returns:
+        {subject_id: {"total": int, "by_date": {"YYYYMMDD": sort, ...}}}
+        by_date 的 key 为去横线日期（如 "20260818"），值为集号 sort。
+    """
+    def fetch_one(sid):
+        try:
+            r = requests.get(
+                "https://api.bgm.tv/v0/episodes",
+                params={"subject_id": sid, "limit": 100},
+                headers=headers, proxies=proxies, timeout=15,
+            )
+            if r.status_code != 200:
+                return sid, None
+            j = r.json()
+            data = j.get("data", []) or []
+            total = int(j.get("total") or len(data) or 0)
+            by_date = {}
+            for ep in data:
+                ad = str(ep.get("airdate") or "").replace("-", "")
+                if ad:
+                    by_date[ad] = int(ep.get("sort") or 0)
+            return sid, {"total": total, "by_date": by_date}
+        except Exception:
+            return sid, None
+
+    out = {}
+    if not subject_ids:
+        return out
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for sid, res in ex.map(fetch_one, subject_ids):
+            if res:
+                out[sid] = res
+    return out
 
 
 def fetch_bangumi_data(uid, proxy_str=""):
@@ -46,8 +133,9 @@ def fetch_bangumi_data(uid, proxy_str=""):
         proxy_str: 代理地址，格式如 \"127.0.0.1:7890\"，留空表示直连。
 
     Returns:
-        dict: 按星期索引的番剧名列表，{0~6: [name, ...]}；
-              失败时返回错误描述字符串。
+        dict: 按星期索引的番剧列表，{0~6: [{"name", "subject_id", "ep_status",
+              "total_eps", "episodes"}, ...]}；失败时返回错误描述字符串。
+              "episodes" 为该番剧的 {日期YYYYMMDD: 集号sort} 映射（用于自动灰判定）。
     """
     try:
         headers = {
@@ -62,7 +150,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
                 'https': f'http://{clean_proxy}',
             }
 
-        # 获取「在看」列表
+        # 获取「在看」列表（含 ep_status：用户标记看到第几集）
         url = f"https://api.bgm.tv/v0/users/{uid}/collections?subject_type=2&type=3&limit=100"
         res_coll = requests.get(url, headers=headers, proxies=proxies, timeout=15)
 
@@ -74,9 +162,12 @@ def fetch_bangumi_data(uid, proxy_str=""):
                 f"服务器返回: {snippet}"
             )
 
-        watching_ids = {item['subject_id'] for item in res_coll.json().get('data', [])}
-        if not watching_ids:
+        watching = {item['subject_id']: item for item in res_coll.json().get('data', [])}
+        if not watching:
             return {}
+
+        # 并发拉取在看番剧的剧集表：补全总集数 + 生成"日期→集号"映射（失败条目跳过）
+        eps_maps = _fetch_all_episodes(list(watching.keys()), headers, proxies)
 
         # 获取日历
         res_cal = requests.get(
@@ -88,13 +179,54 @@ def fetch_bangumi_data(uid, proxy_str=""):
 
         calendar_data = res_cal.json()
         schedule = {i: [] for i in range(7)}
+        seen_ids = set()  # 已出现在当前季度日历的在看番剧
 
         for day_data in calendar_data:
             weekday_idx = day_data['weekday']['id'] - 1
             for item in day_data.get('items', []):
-                if item['id'] in watching_ids:
-                    name = item.get('name_cn') or item.get('name') or "未知番剧"
-                    schedule[weekday_idx].append(name)
+                coll = watching.get(item['id'])
+                if coll is None:
+                    continue
+                seen_ids.add(item['id'])
+                name = item.get('name_cn') or item.get('name') or "未知番剧"
+                em = eps_maps.get(item['id']) or {}
+                # 总集数：剧集表 total 优先（条目 eps 字段可能为空），否则回退 eps 字段
+                total_eps = em.get("total") or coll.get('subject', {}).get('eps') or 0
+                schedule[weekday_idx].append({
+                    "name": name,
+                    "subject_id": item['id'],
+                    "ep_status": int(coll.get('ep_status', 0) or 0),
+                    "total_eps": int(total_eps),
+                    "episodes": em.get("by_date") or {},
+                })
+
+        # 跨季度半年番：在看但不在当前季度日历（Bangumi 日历只含当季，如《黄泉使者》）。
+        # 按最近一集播出日（无剧集表时回退首播日期）的星期归类追加，保证仍在更新的旧番可见。
+        for sid, coll in watching.items():
+            if sid in seen_ids:
+                continue
+            em = eps_maps.get(sid) or {}
+            by_date = em.get("by_date") or {}
+            weekday = None
+            if by_date:
+                try:
+                    weekday = datetime.datetime.strptime(max(by_date), "%Y%m%d").weekday()
+                except Exception:
+                    weekday = None
+            if weekday is None:
+                d0 = str(coll.get('subject', {}).get('date') or "")
+                try:
+                    weekday = datetime.datetime.strptime(d0, "%Y-%m-%d").weekday()
+                except Exception:
+                    continue  # 无法确定星期几，跳过该条目
+            name = coll.get('subject', {}).get('name_cn') or coll.get('subject', {}).get('name') or "未知番剧"
+            schedule[weekday].append({
+                "name": name,
+                "subject_id": sid,
+                "ep_status": int(coll.get('ep_status', 0) or 0),
+                "total_eps": int(em.get("total") or coll.get('subject', {}).get('eps') or 0),
+                "episodes": by_date,
+            })
 
         return schedule
     except Exception as e:
@@ -104,65 +236,6 @@ def fetch_bangumi_data(uid, proxy_str=""):
             f"错误详情: {str(e)}"
         )
 
-
-def generate_schedule_html(schedule):
-    """将番剧日程字典渲染为 HTML 表格。
-
-    Args:
-        schedule: fetch_bangumi_data 的返回值（dict / str / None）。
-
-    Returns:
-        str: 可直接 setHtml 的 HTML 片段。
-    """
-    if schedule is None:
-        return "<p style='color:#e74c3c; padding:10px;'>❌ 拉取数据失败，请检查 UID 是否正确或网络连接。</p>"
-    if isinstance(schedule, str):
-        return f"<p style='color:#e74c3c; padding:15px; font-size: 14px; line-height: 1.5;'><b>⚠️ 诊断信息：</b><br>{schedule}</p>"
-    if not schedule:
-        return "<p style='color:#666; padding:10px;'>你目前在 Bangumi 上还没有标记「在看」的番剧哦~</p>"
-
-    today_idx = datetime.datetime.now().weekday()
-    yesterday_idx = (today_idx - 1) % 7
-    tomorrow_idx = (today_idx + 1) % 7
-
-    yesterday_list = schedule.get(yesterday_idx, [])
-    today_list = schedule.get(today_idx, [])
-    tomorrow_list = schedule.get(tomorrow_idx, [])
-
-    max_rows = max(len(yesterday_list), len(today_list), len(tomorrow_list))
-    if max_rows == 0:
-        return "<p style='color:#666; padding:10px;'>最近三天都没有你追的番剧更新，好好休息一下吧~</p>"
-
-    html = f"""
-    <p style='font-size: 14px; color: #666; text-align: center; margin-bottom: 15px; margin-top: 5px;'>
-        信息来源：<a href='https://bgm.tv/calendar' style='color: #0078D7; text-decoration: none;'>Bangumi</a>
-    </p>
-    <table style='width: 100%; margin: 0 auto; border-collapse: collapse;
-                  font-size: 15px; table-layout: fixed;'>
-        <tr style='background-color: #E6F2FF; border-bottom: 2px solid #b3d7ff;'>
-            <th style='padding: 10px 8px; text-align: center; width: 33.33%; color: #666;'>昨日更新</th>
-            <th style='padding: 10px 8px; text-align: center; width: 33.33%; color: #e67e22;'>今日更新</th>
-            <th style='padding: 10px 8px; text-align: center; width: 33.33%; color: #666;'>明日更新</th>
-        </tr>
-    """
-    for i in range(max_rows):
-        # 数据不足的日子用 &nbsp; 占位，避免空单元格导致表格塌陷/异常显示
-        y_name = yesterday_list[i] if i < len(yesterday_list) else "&nbsp;"
-        t_name = today_list[i] if i < len(today_list) else "&nbsp;"
-        m_name = tomorrow_list[i] if i < len(tomorrow_list) else "&nbsp;"
-
-        html += f"""
-            <tr style='border-bottom: 1px dashed #ccc;'>
-                <td style='padding: 8px; text-align: center; color: #555;
-                           word-break: break-all; overflow-wrap: break-word;'>{y_name}</td>
-                <td style='padding: 8px; text-align: center; color: #d35400; font-weight: bold;
-                           word-break: break-all; overflow-wrap: break-word;'>{t_name}</td>
-                <td style='padding: 8px; text-align: center; color: #555;
-                           word-break: break-all; overflow-wrap: break-word;'>{m_name}</td>
-            </tr>
-        """
-    html += "</table>"
-    return html
 
 
 # ==========================================
@@ -301,16 +374,6 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.installNativeEventFilter(hotkey_manager)
-
-    # 静默 libpng iCCP 色彩配置警告（外部 PNG 常见，无害但噪音大）
-    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
-
-    def _msg_handler(mode, context, message):
-        if "libpng" in message and "iCCP" in message:
-            return
-        print(f"{message}", file=sys.stderr)
-
-    qInstallMessageHandler(_msg_handler)
 
     if getattr(sys, 'frozen', False):
         BASE_DIR = sys._MEIPASS          # PyInstaller 临时解压目录，--add-data 文件在这里
@@ -451,7 +514,7 @@ def main():
         <p><b>6. 全局快捷键</b>: <b>Alt+M</b> 新建 | <b>Alt+N</b> 隐藏/显示 | <b>Alt+C</b> 控制台（可在控制面板中自定义）。</p>
         <p><b>7. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
         <p><b>8. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
-        <p><b>9. 新番信息</b>: 在控制面板中绑定 Bangumi UID，自动拉取追番日历（大陆网络环境需自备代理）。</p>
+        <p><b>9. 新番信息</b>: 在控制面板中授权 Bangumi，自动拉取追番日历，同时允许双向标记同步看番记录（大陆网络环境需自备代理）。</p>
         <p><b>10. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
         """)
         note.save_data()
@@ -469,6 +532,8 @@ def main():
                 note_id = f.replace('.json', '')
             if note_id.startswith("habit_"):
                 note = note_app.HabitTrackerWindow(note_id=note_id)
+            elif note_id == "bangumi_schedule":
+                note = note_app.BangumiScheduleWindow(note_id=note_id)
             else:
                 note = note_app.AniNoteWindow(note_id=note_id)
             if getattr(note, 'is_hidden', False):
@@ -503,31 +568,36 @@ def main():
     #  Bangumi 同步流程
     # ==========================================
 
-    def apply_bangumi_html(html):
-        """将生成的新番 HTML 写入/更新 Bangumi 便签。"""
+    def apply_bangumi_data(payload):
+        """将拉取结果写入/更新 Bangumi 便签（原生网格渲染）。
+
+        payload: dict = 同步成功的番剧日程；"loading" = 加载中；str = 错误信息。
+        """
         target_note = None
         for note in note_app.ACTIVE_NOTES:
             if note.note_id == "bangumi_schedule":
-                target_note = note
+                # 旧版本可能残留普通便签窗口（无 _apply_schedule），需重建
+                if hasattr(note, "_apply_schedule"):
+                    target_note = note
                 break
 
         if not target_note:
-            target_note = note_app.AniNoteWindow(note_id="bangumi_schedule")
+            # 网格/工具栏/格式面板隐藏由 BangumiScheduleWindow 自身管理
+            target_note = note_app.BangumiScheduleWindow()
             target_note.resize(550, 300)
             target_note.show()
 
-        now = datetime.datetime.now()
-        weekdays = [
-            "星期一", "星期二", "星期三",
-            "星期四", "星期五", "星期六", "星期日",
-        ]
-        title_str = f"{now.month}月{now.day}日 {weekdays[now.weekday()]}新番更新"
-        target_note.header.title_edit.setText(title_str)
-        target_note.text_edit.setHtml(html)
+        if isinstance(payload, dict):
+            target_note._apply_schedule(payload)
+        elif isinstance(payload, str):
+            if payload == "loading":
+                target_note._show_loading()
+            else:
+                target_note._show_error(payload)
         target_note.save_data()
         panel.refresh_notes_wall()
 
-    bgm_updater.update_signal.connect(apply_bangumi_html)
+    bgm_updater.update_signal.connect(apply_bangumi_data)
 
     def trigger_bangumi_sync(config, delay=5, force=False):
         """启动后台线程拉取 Bangumi 数据，避免阻塞 UI。
@@ -560,16 +630,12 @@ def main():
             uid = config.get("bangumi_uid", "").strip()
             proxy_str = config.get("api_proxy", "").strip()
 
-            # 发送加载状态提示
-            bgm_updater.update_signal.emit(
-                "<div style='text-align:center; color:#999; margin-top:20px;'>"
-                "<h3>⏳</h3>"
-                "<p>正在跨次元连接 Bangumi...<br>拉取最新番剧数据</p></div>"
-            )
+            # 发送加载状态提示（窗口原生网格显示）
+            bgm_updater.update_signal.emit("loading")
 
             schedule = fetch_bangumi_data(uid, proxy_str)
-            html_content = generate_schedule_html(schedule)
-            bgm_updater.update_signal.emit(html_content)
+            # schedule 为 dict = 成功；str = 错误诊断信息
+            bgm_updater.update_signal.emit(schedule)
 
             # 记录本次同步日期
             config["last_bangumi_sync"] = today_str

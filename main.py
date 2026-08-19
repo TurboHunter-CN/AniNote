@@ -11,11 +11,12 @@ import os
 import re
 import shutil
 import time
+import threading
 import urllib.parse
 import uuid
 import datetime as datetime_module
 
-VERSION = "4.0.1"
+VERSION = "4.1.0"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1197,8 +1198,8 @@ class AniNoteWindow(QWidget):
         # 转换 Alpha 通道：Qt 取值 0-255，CSS rgba 需要 0.0-1.0
         alpha_css = a / 255.0
         
-        # 保留新番便签特有的边框
-        border_css = "border: 2px solid #b3d7ff;" if self.note_id == "bangumi_schedule" else ""
+        # 新番便签不保留特殊边框（用户要求删除蓝色外包边）
+        border_css = ""
         
         self.bg_frame.setStyleSheet(f"""
             QFrame#bg_frame {{
@@ -2323,6 +2324,524 @@ class HabitTrackerWindow(AniNoteWindow):
         # 锁定时不显示拖拽手柄
         for h in self._drag_handles.values():
             h.setVisible(not locked)
+
+
+class ClickableLabel(QLabel):
+    """支持点击信号的富文本标签（用于新番网格的番剧名 + 集数徽标）。"""
+
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class BangumiScheduleWindow(AniNoteWindow):
+    """新番便签窗口：原生网格展示追番日历。
+
+    以「今天 ± 偏移」为中心的滑动窗口视图，左右箭头每次平移一天
+    （偏移限制在 ±4 天）；缩放联动决定显示天数（3 / 5 / 7，默认 3）；
+    点击番剧名标记看过（变灰）。数据来自 Bangumi 周循环日历。
+    """
+
+    WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
+
+    # 后台反向同步线程 → 主线程的错误提示（成功静默，失败才提示）
+    sync_failed = Signal(str)
+
+    def __init__(self, note_id=None):
+        nid = note_id if note_id else "bangumi_schedule"
+        super().__init__(note_id=nid)
+
+        self.setMinimumSize(420, 320)  # 恢复原始最小尺寸
+        self.text_edit.hide()
+        self.format_panel.hide()
+
+        # 状态
+        self._center_offset = 0      # 视图中心相对今天的偏移（±4）
+        self._visible_days = 3       # 缩放联动 3/5/7
+        self._schedule = {}          # {weekday_idx: [番剧名, ...]}
+        self._watched = {}           # {date_str: [番剧名, ...]}
+        self._status_text = None     # 加载中/错误信息（非 None 时占据首行）
+        self._rebulding = False      # 防 resizeEvent 递归重建
+        self.sync_failed.connect(self._on_sync_failed)
+
+        # 只读展示：隐藏编辑工具栏，保留刷新按钮
+        self.header.toolbar_container.hide()
+        self.refresh_btn = QPushButton(icon("refresh"), self.header)
+        set_icon_font(self.refresh_btn, 14)
+        self.refresh_btn.setToolTip("立即同步新番日历")
+        self.refresh_btn.setFixedSize(22, 22)
+        self.refresh_btn.setStyleSheet(
+            "QPushButton { border: none; background: transparent; font-size: 14px; }"
+            " QPushButton:hover { background-color: rgba(0,0,0,0.1); border-radius: 4px; }"
+        )
+        self.refresh_btn.clicked.connect(lambda: global_signaler.force_sync_bangumi_signal.emit())
+        self.header.title_layout.insertWidget(self.header.title_layout.count() - 1, self.refresh_btn)
+
+        # 解除锁定：允许点击番剧名标记看过
+        self.is_locked = False
+
+        # 网格（插入到 text_edit 原位置）
+        self._build_schedule_grid()
+
+        # 恢复数据
+        self._load_bangumi_state()
+
+        # 首次创建 / 旧数据：浅蓝主题 + 隐藏工具栏（替代父类 _init_bangumi_mode 的外观职责）
+        if not (self.save_file and os.path.exists(self.save_file)):
+            self.is_always_on_top = False
+            self.bg_color = [235, 245, 255, 242]
+            self._apply_bg_color()
+        self.header.toolbar_container.hide()
+        self._apply_lock_ui()
+
+        # 首次创建 / 旧数据：设置默认标题与提示
+        self._init_bangumi_default_title()
+        if not self._schedule and not self._status_text:
+            self._status_text = "点击右上角「⟳」按钮同步新番"
+
+        # 初始渲染
+        self._refresh_view()
+
+        # 旧版本便签没有 bangumi_schedule_data：无数据时自动补一次同步
+        QTimer.singleShot(500, self._sync_if_empty)
+
+        QTimer.singleShot(0, self._show_if_not_hidden)
+
+    def _init_bangumi_mode(self):
+        """网格模式不需要父类的 HTML 只读初始化（首创建外观由子类控制）。"""
+        pass
+
+    def _apply_lock_ui(self):
+        """网格模式无文本编辑：覆写父类锁定逻辑，确保工具栏与格式面板始终隐藏。
+
+        父类 _apply_lock_ui 会根据 is_locked 重新 setVisible(not locked)，
+        需要在这里把编辑工具栏与格式面板强制隐藏回来。
+        """
+        super()._apply_lock_ui()
+        self.format_panel.hide()
+        self.header.toolbar_container.hide()
+
+    def _init_bangumi_default_title(self):
+        """首次创建或存档标题为"未命名便签"时，使用新番便签专用标题。"""
+        cur = self.header.title_edit.text().strip()
+        if not cur or cur.startswith("未命名便签"):
+            self.header.title_edit.setText("新番追番日历")
+
+    # 网格模式无文本编辑区：格式/背景操作一律忽略，防止信号回调触发
+    def change_font_family(self, font):
+        pass
+
+    def change_font_size(self, size):
+        pass
+
+    def change_font_color_direct(self, hex_color):
+        pass
+
+    def change_bg_base_color(self, rgb_tuple):
+        pass
+
+    def change_bg_opacity(self, pct):
+        pass
+
+    def _sync_if_empty(self):
+        if not self._schedule:
+            global_signaler.force_sync_bangumi_signal.emit()
+
+    def _show_if_not_hidden(self):
+        if not getattr(self, 'is_hidden', False):
+            # 只显示不抢焦点：避免同步弹窗时新便签盖住模态提示框导致无法点击
+            self.show()
+
+    # ---------- 网格构建 ----------
+
+    def _build_schedule_grid(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }
+            QScrollBar::handle:vertical { background: #D0D0D0; border-radius: 2px; min-height: 20px; }
+            QScrollBar::handle:vertical:hover { background: #A0A0A0; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        self._grid = QGridLayout(container)
+        self._grid.setContentsMargins(0, 5, 0, 5)
+        self._grid.setVerticalSpacing(4)
+        self._grid.setHorizontalSpacing(6)
+
+        scroll.setWidget(container)  # 关键：container 成为滚动区内容（之前漏写导致表格不可见）
+
+        frame_layout = self.bg_frame.layout()
+        idx = frame_layout.indexOf(self.text_edit)
+        frame_layout.insertWidget(idx, scroll)
+        self._tracker_scroll = scroll
+        self._tracker_container = container
+
+    def _clear_grid(self):
+        """清空网格全部控件。"""
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    # ---------- 视图计算 ----------
+
+    def _visible_dates(self):
+        """返回当前视图显示的日期对象列表（连续 _visible_days 天，今天偏移居中）。"""
+        today = datetime_module.date.today()
+        center = today + datetime_module.timedelta(days=self._center_offset)
+        half = (self._visible_days - 1) // 2
+        return [center + datetime_module.timedelta(days=i - half) for i in range(self._visible_days)]
+
+    # ---------- 渲染 ----------
+
+    def _refresh_view(self):
+        if self._rebulding:
+            return
+        self._rebulding = True
+        try:
+            self._clear_grid()
+            days = self._visible_days
+            today = datetime_module.date.today()
+
+            # 重置列/行配置：QGridLayout 的 stretch 是累积的，宽→窄后旧列
+            # stretch 残留会把宽度分走导致内容拥挤 + 右侧留白，必须先清零
+            for c in range(0, 9):
+                self._grid.setColumnStretch(c, 0)
+                self._grid.setColumnMinimumWidth(c, 0)
+            for r in range(0, 40):
+                self._grid.setRowStretch(r, 0)
+
+            # 列配置：col0 ◀ / col1..N 日期列 / colN+1 ▶
+            self._grid.setColumnMinimumWidth(0, 34)
+            self._grid.setColumnStretch(0, 0)
+            for c in range(1, days + 1):
+                self._grid.setColumnMinimumWidth(c, 60)
+                self._grid.setColumnStretch(c, 1)
+            self._grid.setColumnMinimumWidth(days + 1, 34)
+            self._grid.setColumnStretch(days + 1, 0)
+
+            # ── 状态行（加载中/错误）──
+            if self._status_text:
+                status = QLabel(self._status_text)
+                status.setWordWrap(True)
+                status.setAlignment(Qt.AlignCenter)
+                status.setStyleSheet(
+                    "color: #666; font-size: 13px; padding: 8px;"
+                    " background: transparent; border: none;"
+                )
+                self._grid.addWidget(status, 0, 0, 1, days + 2)
+                self._grid.setRowStretch(1, 1)
+                return
+
+            # ── 数据来源：Bangumi（第 0 行，右上角链接）──
+            src = QLabel(
+                "<a href='https://bgm.tv/calendar' style='color:#0078D7; "
+                "text-decoration:none;'>数据来源：Bangumi</a>"
+            )
+            src.setOpenExternalLinks(True)
+            src.setAlignment(Qt.AlignCenter)
+            src.setStyleSheet(
+                "font-size: 11px; color: #999; background: transparent;"
+                " padding: 0 6px 2px; border: none;"
+            )
+            self._grid.addWidget(src, 0, 0, 1, days + 2)
+
+            # ── 表头：◀ / 日期 / ▶（第 1 行，整行淡色底）──
+            btn_style = (
+                "QPushButton { border: none; background: transparent; font-size: 18px; "
+                "color: #888; padding: 4px 8px; }"
+                "QPushButton:hover { color: #333; background: rgba(0,0,0,0.05); border-radius: 4px; }"
+            )
+            prev = QPushButton("◀")
+            prev.setStyleSheet(btn_style)
+            prev.setToolTip("往前一天")
+            prev.clicked.connect(self._prev_day)
+            self._grid.addWidget(prev, 1, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+            next_btn = QPushButton("▶")
+            next_btn.setStyleSheet(btn_style)
+            next_btn.setToolTip("往后一天")
+            next_btn.clicked.connect(self._next_day)
+            self._grid.addWidget(next_btn, 1, days + 1, Qt.AlignCenter)
+
+            dates = self._visible_dates()
+            for i, d in enumerate(dates):
+                lbl = QLabel(f"{self.WEEKDAYS[d.weekday()]}\n{d.strftime('%d')}")
+                lbl.setAlignment(Qt.AlignCenter)
+                if d == today:
+                    lbl.setStyleSheet(
+                        "color: #0078D7; font-size: 14px; font-weight: bold; padding: 3px;"
+                        " background: #E8F4FD; border-radius: 6px;"
+                    )
+                else:
+                    lbl.setStyleSheet(
+                        "color: #666; font-size: 14px; font-weight: bold; padding: 3px;"
+                        " background: #F2F4F7; border-radius: 6px;"
+                    )
+                self._grid.addWidget(lbl, 1, i + 1)
+
+            # ── 番剧行（每列竖排可点击按钮）──
+            col_lists = [self._schedule.get(d.weekday(), []) for d in dates]
+            max_items = max((len(lst) for lst in col_lists), default=0)
+
+            for i in range(max_items):
+                for ci, lst in enumerate(col_lists):
+                    if i >= len(lst):
+                        continue
+                    item = lst[i]
+                    # 兼容旧数据：纯字符串 = 无集数信息；新结构 dict
+                    name = item["name"] if isinstance(item, dict) else str(item)
+                    date_key = dates[ci].strftime("%Y-%m-%d")
+                    # 看过判定：手动点击标记 + 自动灰（该日播出的集号 <= ep_status 视为已看）
+                    # 自动灰精确到"这一天的这一集"，避免之前"全部变灰"的问题
+                    watched = name in self._watched.get(date_key, [])
+                    if not watched and isinstance(item, dict):
+                        _ep = item.get("ep_status", 0)
+                        if _ep > 0:
+                            _sort = (item.get("episodes") or {}).get(date_key.replace("-", ""))
+                            if _sort is not None and _sort <= _ep:
+                                watched = True
+                    name_color = "#BBBBBB" if watched else "#555555"
+
+                    ep_badge = ""
+                    if isinstance(item, dict):
+                        ep = item.get("ep_status", 0)
+                        total = item.get("total_eps", 0)
+                        if total > 0:
+                            ep_badge = (
+                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;"
+                                f" background:#E8F4FD; border-radius:4px; padding:1px 5px;'>{ep}/{total}</span>"
+                            )
+                        elif ep > 0:
+                            # 未录入总集数（如碧蓝之海第三季）：只显示已看集数
+                            ep_badge = (
+                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;"
+                                f" background:#E8F4FD; border-radius:4px; padding:1px 5px;'>已看{ep}</span>"
+                            )
+                    lbl = ClickableLabel(
+                        f"<span style='color:{name_color}; font-size:15px;'>{name}</span>{ep_badge}"
+                    )
+                    lbl.setWordWrap(True)
+                    lbl.setCursor(Qt.PointingHandCursor)
+                    lbl.setStyleSheet(
+                        "QLabel { background: transparent; border: none;"
+                        " border-radius: 6px; padding: 5px 6px; }"
+                        "QLabel:hover { background: rgba(0,0,0,0.06); }"
+                    )
+                    lbl.clicked.connect(lambda it=item, k=date_key: self._toggle_watched(it, k))
+                    self._grid.addWidget(lbl, i + 2, ci + 1)
+
+            self._grid.setRowStretch(max_items + 2, 1)
+        finally:
+            self._rebulding = False
+
+    # ---------- 交互 ----------
+
+    def _prev_day(self):
+        if self._center_offset > -4:
+            self._center_offset -= 1
+            self._refresh_view()
+
+    def _next_day(self):
+        if self._center_offset < 4:
+            self._center_offset += 1
+            self._refresh_view()
+
+    def _toggle_watched(self, item, date_key):
+        """点击番剧名：本地标记看过（变灰），并在有授权时反向同步到 Bangumi。
+
+        item: 番剧数据 dict（含 subject_id）或旧版纯字符串。
+        date_key: 该番播出日 "YYYY-MM-DD"（如周二列对应 2026-08-18）。
+        """
+        name = item["name"] if isinstance(item, dict) else str(item)
+        lst = self._watched.setdefault(date_key, [])
+        if name in lst:
+            lst.remove(name)
+            mark = False
+        else:
+            lst.append(name)
+            mark = True
+        if not lst:
+            del self._watched[date_key]
+        self._refresh_view()
+        self._mark_dirty()
+
+        # 反向同步：仅新结构数据（有 subject_id）才可能回写 Bangumi
+        if isinstance(item, dict) and item.get("subject_id"):
+            threading.Thread(
+                target=self._sync_back, args=(item, date_key, mark), daemon=True
+            ).start()
+
+    # ---------- 反向同步（点击 → Bangumi 回写）----------
+
+    def _sync_back(self, item, date_key, mark):
+        """后台线程：按播出日反查该番剧集 → 调 Bangumi 标记/取消看过。
+
+        失败降级策略：
+        - 查不到剧集表 / 当天没有匹配剧集（如剧场版条目）→ 静默降级为本地标记
+        - 未授权 / 接口报错 → 通过 sync_failed 信号提示用户
+        """
+        try:
+            import bangumi_oauth
+            cfg = load_config()
+            proxy = cfg.get("api_proxy", "")
+            sid = item["subject_id"]
+
+            ep_ids = self._find_episode_ids_by_date(sid, date_key, proxy)
+            if not ep_ids:
+                return  # 无匹配剧集：本地标记已生效，Bangumi 侧无法精确到集，静默
+
+            ok, msg = bangumi_oauth.mark_episodes_watched(
+                sid, ep_ids, cfg, proxy_str=proxy, watched=mark
+            )
+            nm = item.get("name") or item.get("subject_id") or "该番剧"
+            if not ok:
+                self.sync_failed.emit(f"{nm}：{msg}")
+        except Exception as e:
+            nm = item.get("name") or item.get("subject_id") or "该番剧"
+            self.sync_failed.emit(f"{nm}：{type(e).__name__}: {e}")
+
+    def _find_episode_ids_by_date(self, subject_id, date_key, proxy_str=""):
+        """按播出日反查某条目当天播出的剧集 id 列表（无匹配返回 []）。
+
+        兼容 airdate 的 "2026-08-18" / "2026-8-18" 两种格式（统一去横线比较）。
+        """
+        import requests
+        headers = {
+            "User-Agent": f"HunterHasCome/AniNote/{VERSION} (https://github.com/TurboHunter-CN/AniNote)",
+            "X-Contact": "Bilibili: https://space.bilibili.com/499162799",
+        }
+        proxies = None
+        if proxy_str:
+            clean_proxy = proxy_str.replace("http://", "").replace("https://", "")
+            proxies = {"http": f"http://{clean_proxy}", "https": f"http://{clean_proxy}"}
+        r = requests.get(
+            "https://api.bgm.tv/v0/episodes",
+            params={"subject_id": subject_id, "limit": 100},
+            headers=headers, proxies=proxies, timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        target = date_key.replace("-", "")
+        out = []
+        for ep in r.json().get("data", []):
+            ad = str(ep.get("airdate") or "").replace("-", "")
+            if ad == target:
+                out.append(ep.get("id"))
+        return out
+
+    def _on_sync_failed(self, msg):
+        """主线程槽：反向同步失败的非模态提示（不阻塞交互）。"""
+        mb = QMessageBox(
+            QMessageBox.Warning, "同步到 Bangumi 失败", msg, QMessageBox.Ok, self
+        )
+        mb.setWindowModality(Qt.NonModal)
+        mb.show()
+
+    # ---------- 外部数据接口（app.py 调用）----------
+
+    def _show_loading(self):
+        self._status_text = "⏳ 正在跨次元连接 Bangumi...<br>拉取最新番剧数据"
+        self._refresh_view()
+
+    def _show_error(self, msg):
+        self._status_text = str(msg)
+        self._refresh_view()
+
+    def _apply_schedule(self, schedule):
+        """同步成功：更新番剧数据并渲染。"""
+        self._status_text = None
+        self._schedule = schedule if isinstance(schedule, dict) else {}
+        if not self._schedule:
+            self._status_text = "你目前在 Bangumi 上还没有标记「在看」的番剧哦~"
+        # 更新标题为当天日期 + 完整星期名
+        now = datetime_module.datetime.now()
+        full_weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        title_str = f"{now.month}月{now.day}日 {full_weekdays[now.weekday()]}新番更新"
+        self.header.title_edit.setText(title_str)
+        self._refresh_view()
+        self._mark_dirty()
+
+    # ---------- 缩放联动 ----------
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        avail = self.bg_frame.width() - 24
+        days = 3
+        if avail >= 820:
+            days = 7
+        elif avail >= 560:
+            days = 5
+        if days != self._visible_days:
+            self._visible_days = days
+            self._refresh_view()
+
+    # ---------- 持久化 ----------
+
+    def _load_bangumi_state(self):
+        """从便签 JSON 恢复番剧数据与标记。
+
+        注意：JSON 序列化会把 int 键（星期几）转成字符串，读取时需转回 int。
+        """
+        if self.save_file and os.path.exists(self.save_file):
+            try:
+                with open(self.save_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                raw = data.get("bangumi_schedule_data", {}) or {}
+                self._schedule = {int(k): v for k, v in raw.items()}
+                self._watched = data.get("bangumi_watched", {}) or {}
+            except Exception:
+                pass
+
+    def save_data(self):
+        """保存时附加番剧数据与看过标记。"""
+        if getattr(self, '_is_loading', False):
+            return
+        if self.width() < 250:
+            return
+        if not os.path.exists(SAVE_DIR):
+            os.makedirs(SAVE_DIR)
+
+        title = self.header.title_edit.text()
+        new_path = make_save_path(title, exclude_path=self.save_file)
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        if self.save_file and os.path.exists(self.save_file) and os.path.abspath(self.save_file) != os.path.abspath(new_path):
+            try:
+                os.remove(self.save_file)
+            except OSError:
+                pass
+        self.save_file = new_path
+
+        html = self.text_edit.toHtml()
+        note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+        _cleanup_orphan_images(note_dir, html)
+
+        data = {
+            "note_id": self.note_id,
+            "title": title,
+            "html_content": html,
+            "x": self.x(), "y": self.y(),
+            "width": self.width(), "height": self.height(),
+            "is_locked": self.is_locked,
+            "is_always_on_top": getattr(self, 'is_always_on_top', True),
+            "is_hidden": getattr(self, 'is_hidden', False),
+            "bg_color": self.bg_color,
+            "note_hotkey": getattr(self, '_note_hotkey', ''),
+            "bangumi_schedule_data": self._schedule,
+            "bangumi_watched": self._watched,
+        }
+        with open(self.save_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
 
 # ---------- 全局操作 ----------

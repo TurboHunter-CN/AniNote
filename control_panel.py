@@ -8,6 +8,9 @@ AniNote 控制面板 — 便签墙管理、系统设置、关于页面。
 
 import os
 import json
+import time
+import threading
+import webbrowser
 
 from icons import icon, set_icon_font
 
@@ -25,6 +28,7 @@ from PySide6.QtCore import (
 )
 
 from main import load_config, save_config, SAVE_DIR
+import bangumi_oauth as bgm_oauth
 
 
 # ==========================================
@@ -372,6 +376,7 @@ class ControlPanel(QWidget):
     request_set_note_hotkey = Signal(str)
     settings_changed = Signal(dict)
     request_check_update = Signal()
+    oauth_done_signal = Signal(bool, str)   # Bangumi 授权完成 (成功, 消息)
 
     # 导航按钮默认/选中样式（QPushButton 保留用于兼容）
     NAV_STYLE_NORMAL = (
@@ -406,6 +411,10 @@ class ControlPanel(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(900, 600)
         self.setMinimumSize(800, 500)
+
+        # Bangumi OAuth 状态（授权中可取消）
+        self._oauth_cancel_event = None
+        self._oauth_busy = False
 
         wrapper_layout = QVBoxLayout(self)
         wrapper_layout.setContentsMargins(15, 15, 15, 15)
@@ -875,37 +884,6 @@ class ControlPanel(QWidget):
 
         # ---------- Bangumi 设置 ----------
 
-        bangumi_layout = QHBoxLayout()
-        self.uid_input = QLineEdit(cfg.get("bangumi_uid", ""))
-        self.uid_input.setPlaceholderText("请输入你的 Bangumi UID...")
-        self.uid_input.setStyleSheet("padding: 8px; border: 1px solid #ccc; border-radius: 5px;")
-
-        # 信息图标：悬停时立即弹出提示
-        info_icon = QLabel(" ⓘ ")
-        info_icon.setToolTip("输入UID后可自动拉取新番信息")
-        info_icon.setStyleSheet("""
-            QLabel { color: #0078D7; font-size: 16px; font-weight: bold;
-                     background: transparent; border: none; }
-            QToolTip {
-                background-color: rgba(255, 255, 255, 0.95);
-                color: #333333;
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                font-size: 13px;
-                font-weight: normal;
-                padding: 6px;
-                font-family: 'Microsoft YaHei';
-            }
-        """)
-
-        def _instant_tooltip(event):
-            QToolTip.showText(QCursor.pos(), info_icon.toolTip(), info_icon)
-
-        info_icon.enterEvent = _instant_tooltip
-
-        bangumi_layout.addWidget(self.uid_input)
-        bangumi_layout.addWidget(info_icon)
-
         # 新番开关
         self.bangumi_checkbox = ToggleSwitch("开启新番信息便签")
         self.bangumi_checkbox.setChecked(cfg.get("enable_bangumi", False))
@@ -916,6 +894,50 @@ class ControlPanel(QWidget):
         bangumi_wrap_layout = QVBoxLayout(bangumi_wrapper)
         bangumi_wrap_layout.setContentsMargins(0, 5, 0, 5)
         bangumi_wrap_layout.addWidget(self.bangumi_checkbox)
+
+        # Bangumi 授权（OAuth 一键授权，内置应用凭证；UID 由授权自动获取）
+        _oauth = bgm_oauth.load_oauth(cfg)
+        bangumi_auth_layout = QVBoxLayout()
+        bangumi_auth_layout.setContentsMargins(0, 0, 0, 0)
+        bangumi_auth_layout.setSpacing(6)
+
+        oauth_row = QHBoxLayout()
+        oauth_row.setSpacing(6)
+        self.auth_btn = QPushButton("授权 Bangumi")
+        self.auth_btn.setStyleSheet(
+            "QPushButton { padding: 7px 14px; border: none; border-radius: 6px;"
+            " background: #0078D7; color: white; font-weight: bold; }"
+            " QPushButton:hover { background: #005BA1; }"
+            " QPushButton:disabled { background: #A0C8E8; }"
+        )
+        self.auth_btn.clicked.connect(self._start_bangumi_oauth)
+        self.cancel_auth_btn = QPushButton("取消授权")
+        self.cancel_auth_btn.setStyleSheet(
+            "QPushButton { padding: 7px 14px; border: 1px solid #D0D0D0; border-radius: 6px;"
+            " background: white; color: #666; }"
+            " QPushButton:hover { background: #F5F5F5; }"
+            " QPushButton:disabled { color: #BBB; background: #F8F8F8; }"
+        )
+        self.cancel_auth_btn.clicked.connect(self._cancel_bangumi_oauth)
+        self.cancel_auth_btn.setEnabled(False)
+        self.disconnect_btn = QPushButton("断开授权")
+        self.disconnect_btn.setStyleSheet(
+            "QPushButton { padding: 7px 14px; border: 1px solid #D0D0D0; border-radius: 6px;"
+            " background: white; color: #666; }"
+            " QPushButton:hover { background: #F5F5F5; }"
+        )
+        self.disconnect_btn.clicked.connect(self._disconnect_bangumi_oauth)
+        oauth_row.addWidget(self.auth_btn)
+        oauth_row.addWidget(self.cancel_auth_btn)
+        oauth_row.addWidget(self.disconnect_btn)
+        oauth_row.addStretch()
+        bangumi_auth_layout.addLayout(oauth_row)
+
+        self.oauth_status = QLabel()
+        self.oauth_status.setWordWrap(True)
+        self.oauth_status.setStyleSheet("color: #777; font-size: 12px;")
+        self._refresh_oauth_status(_oauth)
+        bangumi_auth_layout.addWidget(self.oauth_status)
 
         # 代理设置
         proxy_layout = QVBoxLayout()
@@ -990,9 +1012,9 @@ class ControlPanel(QWidget):
         form_layout.addRow(_lbl("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
         form_layout.addRow(_lbl("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
         form_layout.addRow(_lbl("<b>呼出控制台快捷键：</b>"), self.panel_hotkey_input)
-        form_layout.addRow(_lbl("<b>绑定 Bangumi UID：</b>"), bangumi_layout)
         form_layout.addRow(_lbl("<b>API 代理地址：</b>"), proxy_layout)
         form_layout.addRow(_lbl("<b>新番追踪功能：</b>"), bangumi_wrapper)
+        form_layout.addRow(_lbl("<b>Bangumi 授权：</b>"), bangumi_auth_layout)
         form_layout.addRow(_lbl("<b>系统后台行为：</b>"), autostart_wrapper)
         form_layout.addRow(_lbl("<b>自动更新：</b>"), update_btn_layout)
 
@@ -1011,6 +1033,101 @@ class ControlPanel(QWidget):
         scroll_area.setWidget(inner_widget)
         layout.addWidget(scroll_area)
         self.content_area.addWidget(page)
+
+        self.oauth_done_signal.connect(self._on_oauth_done)
+
+    # ---------- Bangumi OAuth 授权 ----------
+
+    def _refresh_oauth_status(self, oauth=None):
+        """刷新授权状态标签与按钮。"""
+        oauth = oauth if oauth is not None else bgm_oauth.load_oauth(load_config())
+        if oauth.get("access_token"):
+            uid = oauth.get("user_id", "")
+            self.oauth_status.setText(f"✅ 已授权" + (f"（用户 ID: {uid}）" if uid else ""))
+            self.oauth_status.setStyleSheet("color: #2e7d32; font-size: 12px;")
+            self.disconnect_btn.setEnabled(True)
+        else:
+            self.oauth_status.setText("未授权：点击「授权 Bangumi」一键授权，之后自动同步追番与观看进度")
+            self.oauth_status.setStyleSheet("color: #777; font-size: 12px;")
+            self.disconnect_btn.setEnabled(False)
+
+    def _start_bangumi_oauth(self):
+        if self._oauth_busy:
+            return
+        # 使用内置应用凭证一键授权（不开放自定义）
+        cid, sec = bgm_oauth.DEFAULT_CLIENT_ID, bgm_oauth.DEFAULT_CLIENT_SECRET
+
+        self._oauth_busy = True
+        self.auth_btn.setEnabled(False)
+        self.cancel_auth_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+        self.oauth_status.setText("⏳ 等待授权中...请在浏览器中完成授权（可点「取消授权」重试）")
+        self.oauth_status.setStyleSheet("color: #e67e22; font-size: 12px;")
+        self._oauth_cancel_event = threading.Event()
+        threading.Thread(
+            target=self._oauth_worker, args=(cid, sec, self._oauth_cancel_event), daemon=True
+        ).start()
+        webbrowser.open(bgm_oauth.build_authorize_url(cid))
+
+    def _cancel_bangumi_oauth(self):
+        if self._oauth_cancel_event is not None:
+            self._oauth_cancel_event.set()
+
+    def _oauth_worker(self, cid, sec, cancel_event):
+        proxy = load_config().get("api_proxy", "")
+        code = bgm_oauth.start_callback_server(timeout=60, cancel_event=cancel_event)
+        if not code:
+            self.oauth_done_signal.emit(False, "授权已取消或超时，请重试")
+            return
+        try:
+            data = bgm_oauth.exchange_code(code, cid, sec, proxy)
+            cfg = load_config()
+            oauth = bgm_oauth.load_oauth(cfg)
+            oauth["access_token"] = data.get("access_token", "")
+            oauth["refresh_token"] = data.get("refresh_token", "")
+            oauth["expires_at"] = int(time.time()) + int(data.get("expires_in", 604800))
+            oauth["user_id"] = str(data.get("user_id", ""))
+            cfg["bangumi_oauth"] = oauth
+            save_config(cfg)
+            self.oauth_done_signal.emit(True, "授权成功，观看进度将自动同步")
+        except Exception as e:
+            self.oauth_done_signal.emit(False, f"换取令牌失败: {type(e).__name__}: {e}")
+
+    def _on_oauth_done(self, ok, msg):
+        self._oauth_busy = False
+        self.auth_btn.setEnabled(True)
+        self.cancel_auth_btn.setEnabled(False)
+        self._refresh_oauth_status()
+        if ok:
+            # 授权成功：UID 自动写入配置，无需手动填写
+            cfg = load_config()
+            uid = bgm_oauth.load_oauth(cfg).get("user_id", "")
+            if uid:
+                cfg["bangumi_uid"] = str(uid)
+                save_config(cfg)
+        QMessageBox.information(self, "Bangumi 授权", msg)
+        # 授权弹窗关闭后再同步，避免新番便签盖住模态提示框
+        if ok and cfg.get("enable_bangumi", False):
+            try:
+                from main import global_signaler
+                QTimer.singleShot(800, lambda: global_signaler.force_sync_bangumi_signal.emit())
+            except Exception:
+                pass
+
+    def _disconnect_bangumi_oauth(self):
+        if self._oauth_busy:
+            QMessageBox.information(self, "Bangumi 授权", "授权进行中，请先取消")
+            return
+        cfg = load_config()
+        oauth = bgm_oauth.load_oauth(cfg)
+        oauth.pop("access_token", None)
+        oauth.pop("refresh_token", None)
+        oauth.pop("expires_at", None)
+        oauth.pop("user_id", None)
+        cfg["bangumi_oauth"] = oauth
+        save_config(cfg)
+        self._refresh_oauth_status()
+        QMessageBox.information(self, "Bangumi 授权", "已断开授权")
 
     def _browse_directory(self):
         """弹出文件夹选择对话框。"""
@@ -1055,7 +1172,6 @@ class ControlPanel(QWidget):
             "disable_all_hotkey": self.disable_all_hotkey_input.text().strip(),
             "panel_hotkey": self.panel_hotkey_input.text().strip(),
             "autostart": self.autostart_checkbox.isChecked(),
-            "bangumi_uid": self.uid_input.text().strip(),
             "enable_bangumi": self.bangumi_checkbox.isChecked(),
             "api_proxy": self.proxy_input.text().strip(),
             "save_dir": final_save_dir,
@@ -1063,21 +1179,34 @@ class ControlPanel(QWidget):
             "auto_update": self.auto_update_checkbox.isChecked(),
             "ignored_version": old_cfg.get("ignored_version", ""),
             "is_first_run": old_cfg.get("is_first_run", False),
+            "bangumi_uid": old_cfg.get("bangumi_uid", ""),
+            "bangumi_oauth": old_cfg.get("bangumi_oauth", {}),
         }
         save_config(cfg)
         self.settings_changed.emit(cfg)
 
         old_save_dir = old_cfg.get("save_dir", os.path.abspath(SAVE_DIR))
         if new_dir != old_save_dir:
-            QMessageBox.warning(
-                self, "需要重启",
+            # 非模态：避免阻塞新番便签同步等下一步交互
+            self._settings_toast = QMessageBox(
+                QMessageBox.Warning, "需要重启",
                 "设置已保存，快捷键已实时生效！\n\n"
                 "【注意】\n若你更改了数据存储目录，"
                 "请手动将旧文件迁移至新目录，"
-                "并重启本程序以使其完全生效。"
+                "并重启本程序以使其完全生效。",
+                QMessageBox.Ok, self
             )
+            self._settings_toast.setWindowModality(Qt.NonModal)
+            self._settings_toast.show()
         else:
-            QMessageBox.information(self, "成功", "设置已保存，快捷键已实时生效！")
+            # 非模态提示：不阻塞交互（避免同步弹出新番便签时被弹窗卡住）
+            self._settings_toast = QMessageBox(
+                QMessageBox.Information, "成功",
+                "设置已保存，快捷键已实时生效！",
+                QMessageBox.Ok, self
+            )
+            self._settings_toast.setWindowModality(Qt.NonModal)
+            self._settings_toast.show()
 
     # ---------- 关于页面 ----------
 
