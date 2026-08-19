@@ -18,7 +18,7 @@
 
     ![missiontrack](images/missiontrack.png)
 
-- **Bangumi 新番** — 绑定 UID 后自动拉取在看番剧
+- **Bangumi 新番** — 绑定 UID 后自动拉取在看番剧，点击可标记为已看，和bangumi双向同步
 
     ![animeupdate](images/animeupdate.png)
 
