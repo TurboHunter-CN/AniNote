@@ -16,7 +16,7 @@ import urllib.parse
 import uuid
 import datetime as datetime_module
 
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -2425,7 +2425,8 @@ class BangumiScheduleWindow(AniNoteWindow):
         if not cur or cur.startswith("未命名便签"):
             self.header.title_edit.setText("新番追番日历")
 
-    # 网格模式无文本编辑区：格式/背景操作一律忽略，防止信号回调触发
+    # 网格模式无文本编辑区：字体格式操作一律忽略（无 text_edit，调用会崩）。
+    # 背景底色 / 透明度是便签级功能，保留父类实现（用户可正常调节便签颜色与透明）。
     def change_font_family(self, font):
         pass
 
@@ -2433,12 +2434,6 @@ class BangumiScheduleWindow(AniNoteWindow):
         pass
 
     def change_font_color_direct(self, hex_color):
-        pass
-
-    def change_bg_base_color(self, rgb_tuple):
-        pass
-
-    def change_bg_opacity(self, pct):
         pass
 
     def _sync_if_empty(self):
@@ -2575,13 +2570,13 @@ class BangumiScheduleWindow(AniNoteWindow):
                 lbl.setAlignment(Qt.AlignCenter)
                 if d == today:
                     lbl.setStyleSheet(
-                        "color: #0078D7; font-size: 14px; font-weight: bold; padding: 3px;"
-                        " background: #E8F4FD; border-radius: 6px;"
+                        "color: #E67E22; font-size: 14px; font-weight: bold; padding: 3px;"
+                        " background: #FFF3E0; border-radius: 6px;"
                     )
                 else:
                     lbl.setStyleSheet(
-                        "color: #666; font-size: 14px; font-weight: bold; padding: 3px;"
-                        " background: #F2F4F7; border-radius: 6px;"
+                        "color: #5F6B7A; font-size: 14px; font-weight: bold; padding: 3px;"
+                        " background: #E8EFF6; border-radius: 6px;"
                     )
                 self._grid.addWidget(lbl, 1, i + 1)
 
@@ -2606,7 +2601,7 @@ class BangumiScheduleWindow(AniNoteWindow):
                             _sort = (item.get("episodes") or {}).get(date_key.replace("-", ""))
                             if _sort is not None and _sort <= _ep:
                                 watched = True
-                    name_color = "#BBBBBB" if watched else "#555555"
+                    name_color = "#0078D7" if watched else "#555555"
 
                     ep_badge = ""
                     if isinstance(item, dict):
