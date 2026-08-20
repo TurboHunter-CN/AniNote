@@ -2379,8 +2379,10 @@ class BangumiScheduleWindow(AniNoteWindow):
         self.refresh_btn.clicked.connect(lambda: global_signaler.force_sync_bangumi_signal.emit())
         self.header.title_layout.insertWidget(self.header.title_layout.count() - 1, self.refresh_btn)
 
-        # 解除锁定：允许点击番剧名标记看过
-        self.is_locked = False
+        # 注意：不再强制 is_locked=False。父类 __init__ 已通过 load_data()
+        # 恢复存档的锁定状态——首次创建默认解锁（父类默认 False），
+        # 用户手动锁定后重启应保持锁定。网格模式下番剧标记走 ClickableLabel
+        # 独立点击事件，锁定与否均不影响标记。
 
         # 网格（插入到 text_edit 原位置）
         self._build_schedule_grid()
