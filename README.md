@@ -1,4 +1,4 @@
-# AniNote v4.1.1
+# AniNote v4.1.2
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
 
@@ -18,7 +18,7 @@
 
     ![missiontrack](images/missiontrack.png)
 
-- **Bangumi 新番** — 绑定 UID 后自动拉取在看番剧，点击可标记为已看，和bangumi双向同步
+- **Bangumi 新番** — 一键授权绑定，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）；点击番剧名标记看过/取消并双向同步 Bangumi；右键可在 Bangumi 打开条目或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目
 
     ![animeupdate](images/animeupdate.png)
 
@@ -73,9 +73,9 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
 5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
    ```json
    {
-       "version": "4.1.1",
-       "notes": "本次更新：\n- 重构了新番便签的样式，支持双向同步",
-       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.1/AniNote-v4.1.1.zip",
+       "version": "4.1.2",
+       "notes": "本次更新：\n- 细化了新番便签的功能",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.1/AniNote-v4.1.2.zip",
        "sha256": ""
    }
    ```

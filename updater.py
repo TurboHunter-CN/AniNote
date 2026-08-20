@@ -32,7 +32,7 @@ VERSION_LIST_URL = (
 VERSION_MARK_NAME = ".last_version.json"   # 存于程序目录，更新后展示日志用
 
 UA_HEADER = {
-    "User-Agent": "AniNote-Updater/4.1.1 (https://github.com/TurboHunter-CN/AniNote)",
+    "User-Agent": "AniNote-Updater/4.1.2 (https://github.com/TurboHunter-CN/AniNote)",
 }
 
 
@@ -85,9 +85,9 @@ def check_for_update(timeout=10, proxy_str=""):
 
     清单格式（发布者维护）:
     {
-        "version": "4.1.1",                      # 最新版本号（允许 v 前缀）
+        "version": "4.1.2",                      # 最新版本号（允许 v 前缀）
         "notes": "更新日志 Markdown 文本",           # 更新后展示
-        "zip_url": "https://github.com/.../AniNote-v4.1.1.zip",  # 安装包直链
+        "zip_url": "https://github.com/.../AniNote-v4.1.2.zip",  # 安装包直链
         "sha256": "可选：zip 的 SHA256 校验值"       # 防下载篡改
     }
 
@@ -98,7 +98,7 @@ def check_for_update(timeout=10, proxy_str=""):
     Returns:
         dict 或 None:
         {
-            "latest_version": "4.1.1",
+            "latest_version": "4.1.2",
             "notes": "更新日志 Markdown 文本",
             "zip_url": "下载地址",
             "zip_name": "附件文件名",

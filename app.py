@@ -91,8 +91,12 @@ def _fetch_all_episodes(subject_ids, headers, proxies):
     """并发拉取多部番剧的剧集表（失败条目跳过，不阻断主流程）。
 
     Returns:
-        {subject_id: {"total": int, "by_date": {"YYYYMMDD": sort, ...}}}
-        by_date 的 key 为去横线日期（如 "20260818"），值为集号 sort。
+        {subject_id: {"total": int, "by_date": {"YYYYMMDD": ep, ...},
+                      "list": [{id, ep, sort, name, airdate}, ...]}}
+        by_date 的 key 为去横线日期（如 "20260818"），值为本季内集号 ep。
+        list 为完整剧集表（供集数标记弹窗预缓存，避免右键时再请求）。
+        ⚠️ 用 ep 而非 sort：ep_status 是"本季内看到第几集"（ep 基准），
+        而 sort 是绝对编号（跨季番剧可能从 13 起），两者基准不一致会误判自动灰。
     """
     def fetch_one(sid):
         try:
@@ -107,11 +111,20 @@ def _fetch_all_episodes(subject_ids, headers, proxies):
             data = j.get("data", []) or []
             total = int(j.get("total") or len(data) or 0)
             by_date = {}
+            ep_list = []
             for ep in data:
                 ad = str(ep.get("airdate") or "").replace("-", "")
                 if ad:
-                    by_date[ad] = int(ep.get("sort") or 0)
-            return sid, {"total": total, "by_date": by_date}
+                    # 优先 ep（本季内序号）；个别条目 ep 缺失时回退 sort
+                    by_date[ad] = int(ep.get("ep") or ep.get("sort") or 0)
+                ep_list.append({
+                    "id": ep.get("id"),
+                    "ep": ep.get("ep"),
+                    "sort": ep.get("sort"),
+                    "name": ep.get("name_cn") or ep.get("name") or "",
+                    "airdate": ep.get("airdate") or "",
+                })
+            return sid, {"total": total, "by_date": by_date, "list": ep_list}
         except Exception:
             return sid, None
 
@@ -198,6 +211,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
                     "ep_status": int(coll.get('ep_status', 0) or 0),
                     "total_eps": int(total_eps),
                     "episodes": em.get("by_date") or {},
+                    "episode_list": em.get("list") or [],   # 预缓存剧集表（集数弹窗免请求）
                 })
 
         # 跨季度半年番：在看但不在当前季度日历（Bangumi 日历只含当季，如《黄泉使者》）。
@@ -226,6 +240,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
                 "ep_status": int(coll.get('ep_status', 0) or 0),
                 "total_eps": int(em.get("total") or coll.get('subject', {}).get('eps') or 0),
                 "episodes": by_date,
+                "episode_list": em.get("list") or [],   # 预缓存剧集表（集数弹窗免请求）
             })
 
         return schedule
@@ -514,7 +529,7 @@ def main():
         <p><b>6. 全局快捷键</b>: <b>Alt+M</b> 新建 | <b>Alt+N</b> 隐藏/显示 | <b>Alt+C</b> 控制台（可在控制面板中自定义）。</p>
         <p><b>7. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
         <p><b>8. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
-        <p><b>9. 新番信息</b>: 在控制面板中授权 Bangumi，自动拉取追番日历，同时允许双向标记同步看番记录（大陆网络环境需自备代理）。</p>
+        <p><b>9. 新番信息</b>: 控制面板一键授权 Bangumi，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）。点击番剧名可标记看过/取消（双向同步 Bangumi）；右键番剧可「在 Bangumi 打开」或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目（大陆网络环境需自备代理）。</p>
         <p><b>10. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
         """)
         note.save_data()

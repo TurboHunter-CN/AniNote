@@ -14,9 +14,10 @@ import time
 import threading
 import urllib.parse
 import uuid
+import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.1.1"
+VERSION = "4.1.2"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
     QColorDialog, QMessageBox, QSizePolicy,
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
-    QFileDialog, QDialogButtonBox,
+    QFileDialog, QDialogButtonBox, QCheckBox,
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QEvent, QRect, QPoint
 from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage, QPainter, QPen, QBrush
@@ -1998,13 +1999,76 @@ class HabitTrackerWindow(AniNoteWindow):
         if self.is_locked:
             return
 
+        # 无边框圆角窗口（对齐控制面板风格）：dlg_bg 圆角底 + 阴影 + 自定义标题栏
         dialog = QDialog(self)
-        dialog.setWindowTitle("新建事务")
-        dialog.setFixedSize(400, 430)
-        dialog.setStyleSheet("QDialog { background: #FAFAFA; }")
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(14)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.setAttribute(Qt.WA_TranslucentBackground)
+        dialog.setFixedSize(420, 500)
+        dialog.setStyleSheet(
+            "QFrame#habit_dlg_bg { background: #FAFAFA; border-radius: 12px;"
+            " border: 1px solid #EAEAEA; }"
+        )
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(12, 12, 12, 12)
+
+        dlg_bg = QFrame()
+        dlg_bg.setObjectName("habit_dlg_bg")
+        shadow = QGraphicsDropShadowEffect(dialog)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 6)
+        dlg_bg.setGraphicsEffect(shadow)
+        outer.addWidget(dlg_bg)
+
+        layout = QVBoxLayout(dlg_bg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 自定义标题栏：标题 + 关闭按钮（hover 红），可拖拽
+        dlg_bar = QFrame()
+        dlg_bar.setStyleSheet("background: transparent;")
+        dlg_bar.setFixedHeight(45)
+        bar_layout = QHBoxLayout(dlg_bar)
+        bar_layout.setContentsMargins(20, 0, 10, 0)
+        dlg_title = QLabel("新建事务")
+        dlg_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #333;"
+            " font-family: 'Microsoft YaHei';"
+        )
+        bar_layout.addWidget(dlg_title)
+        bar_layout.addStretch()
+        dlg_close = QPushButton(icon("close"))
+        set_icon_font(dlg_close, 16)
+        dlg_close.setFixedSize(36, 30)
+        dlg_close.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: #E81123; color: white; }"
+        )
+        dlg_close.clicked.connect(dialog.reject)
+        bar_layout.addWidget(dlg_close)
+        layout.addWidget(dlg_bar)
+
+        dlg_bar._drag_pos = None
+        def _bar_press(e):
+            if e.button() == Qt.LeftButton:
+                dlg_bar._drag_pos = e.globalPosition().toPoint() - dialog.pos()
+                e.accept()
+        def _bar_move(e):
+            if dlg_bar._drag_pos is not None:
+                dialog.move(e.globalPosition().toPoint() - dlg_bar._drag_pos)
+                e.accept()
+        def _bar_release(e):
+            dlg_bar._drag_pos = None
+        dlg_bar.mousePressEvent = _bar_press
+        dlg_bar.mouseMoveEvent = _bar_move
+        dlg_bar.mouseReleaseEvent = _bar_release
+
+        content = QVBoxLayout()
+        content.setContentsMargins(24, 6, 24, 18)
+        content.setSpacing(14)
+        layout.addLayout(content, 1)
 
         # 名称
         name_lbl = QLabel("事务名称")
@@ -2174,14 +2238,14 @@ class HabitTrackerWindow(AniNoteWindow):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(ok_btn)
 
-        layout.addWidget(name_lbl)
-        layout.addWidget(name_input)
-        layout.addWidget(color_lbl)
-        layout.addLayout(color_layout)
-        layout.addWidget(mode_lbl)
-        layout.addLayout(mode_layout)
-        layout.addWidget(param_widget)
-        layout.addLayout(btn_layout)
+        content.addWidget(name_lbl)
+        content.addWidget(name_input)
+        content.addWidget(color_lbl)
+        content.addLayout(color_layout)
+        content.addWidget(mode_lbl)
+        content.addLayout(mode_layout)
+        content.addWidget(param_widget)
+        content.addLayout(btn_layout)
 
         if dialog.exec() == QDialog.Accepted and name_input.text().strip():
             mode = "free"
@@ -2327,14 +2391,25 @@ class HabitTrackerWindow(AniNoteWindow):
 
 
 class ClickableLabel(QLabel):
-    """支持点击信号的富文本标签（用于新番网格的番剧名 + 集数徽标）。"""
+    """支持点击信号 + 右键菜单的富文本标签（用于新番网格的番剧名 + 集数徽标）。"""
 
     clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bgm_item = None    # 绑定番剧数据（含 subject_id），供右键菜单使用
+        self._bgm_window = None  # 持有者窗口（BangumiScheduleWindow）
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        if self._bgm_item and self._bgm_window:
+            self._bgm_window._show_item_menu(self._bgm_item, event.globalPos())
+        else:
+            super().contextMenuEvent(event)
 
 
 class BangumiScheduleWindow(AniNoteWindow):
@@ -2362,9 +2437,11 @@ class BangumiScheduleWindow(AniNoteWindow):
         self._center_offset = 0      # 视图中心相对今天的偏移（±4）
         self._visible_days = 3       # 缩放联动 3/5/7
         self._schedule = {}          # {weekday_idx: [番剧名, ...]}
-        self._watched = {}           # {date_str: [番剧名, ...]}
+        self._watched = {}           # {date_str: [番剧名, ...]} 手动标记看过
+        self._unwatched = {}         # {date_str: [番剧名, ...]} 手动取消（覆盖自动灰）
         self._status_text = None     # 加载中/错误信息（非 None 时占据首行）
         self._rebulding = False      # 防 resizeEvent 递归重建
+        self._show_unwatched_only = False  # "只看未看"过滤开关
         self.sync_failed.connect(self._on_sync_failed)
 
         # 保留编辑工具栏（用户可自行锁定便签），并添加刷新按钮
@@ -2535,7 +2612,24 @@ class BangumiScheduleWindow(AniNoteWindow):
                 self._grid.setRowStretch(1, 1)
                 return
 
-            # ── 数据来源：Bangumi（第 0 行，右上角链接）──
+            # ── 第 0 行：只看未看按钮（左） + 数据来源 Bangumi 链接（居中）──
+            row0 = QWidget()
+            row0_layout = QHBoxLayout(row0)
+            row0_layout.setContentsMargins(4, 0, 4, 0)
+            row0_layout.setSpacing(0)
+            self._unwatched_btn = QPushButton("只看未看")
+            self._unwatched_btn.setCheckable(True)
+            self._unwatched_btn.setChecked(self._show_unwatched_only)
+            self._unwatched_btn.setCursor(Qt.PointingHandCursor)
+            self._unwatched_btn.setStyleSheet(
+                "QPushButton { border: none; border-radius: 6px; padding: 2px 8px;"
+                " font-size: 11px; color: #888; background: transparent; }"
+                "QPushButton:hover { background: rgba(0,0,0,0.06); color: #333; }"
+                "QPushButton:checked { background: #E8F4FD; color: #0078D7; font-weight: bold; }"
+            )
+            self._unwatched_btn.clicked.connect(self._toggle_unwatched_filter)
+            row0_layout.addWidget(self._unwatched_btn)
+
             src = QLabel(
                 "<a href='https://bgm.tv/calendar' style='color:#0078D7; "
                 "text-decoration:none;'>数据来源：Bangumi</a>"
@@ -2546,7 +2640,10 @@ class BangumiScheduleWindow(AniNoteWindow):
                 "font-size: 11px; color: #999; background: transparent;"
                 " padding: 0 6px 2px; border: none;"
             )
-            self._grid.addWidget(src, 0, 0, 1, days + 2)
+            row0_layout.addStretch(1)
+            row0_layout.addWidget(src, 1)
+            row0_layout.addStretch(1)
+            self._grid.addWidget(row0, 0, 0, 1, days + 2)
 
             # ── 表头：◀ / 日期 / ▶（第 1 行，整行淡色底）──
             btn_style = (
@@ -2584,6 +2681,12 @@ class BangumiScheduleWindow(AniNoteWindow):
 
             # ── 番剧行（每列竖排可点击按钮）──
             col_lists = [self._schedule.get(d.weekday(), []) for d in dates]
+            if self._show_unwatched_only:
+                # "只看未看"：过滤掉已看（手动 + 自动灰）的条目
+                col_lists = [
+                    [it for it in lst if not self._is_item_watched(it, d)]
+                    for lst, d in zip(col_lists, dates)
+                ]
             max_items = max((len(lst) for lst in col_lists), default=0)
 
             for i in range(max_items):
@@ -2594,31 +2697,25 @@ class BangumiScheduleWindow(AniNoteWindow):
                     # 兼容旧数据：纯字符串 = 无集数信息；新结构 dict
                     name = item["name"] if isinstance(item, dict) else str(item)
                     date_key = dates[ci].strftime("%Y-%m-%d")
-                    # 看过判定：手动点击标记 + 自动灰（该日播出的集号 <= ep_status 视为已看）
-                    # 自动灰精确到"这一天的这一集"，避免之前"全部变灰"的问题
-                    watched = name in self._watched.get(date_key, [])
-                    if not watched and isinstance(item, dict):
-                        _ep = item.get("ep_status", 0)
-                        if _ep > 0:
-                            _sort = (item.get("episodes") or {}).get(date_key.replace("-", ""))
-                            if _sort is not None and _sort <= _ep:
-                                watched = True
+                    # 看过判定：手动点击标记 + 自动灰（统一走 _is_item_watched）
+                    watched = self._is_item_watched(item, dates[ci])
                     name_color = "#0078D7" if watched else "#555555"
 
                     ep_badge = ""
                     if isinstance(item, dict):
                         ep = item.get("ep_status", 0)
                         total = item.get("total_eps", 0)
+                        # 徽标无底色（只蓝字）：避免便签调低透明度时底块发白显得突兀
                         if total > 0:
                             ep_badge = (
-                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;"
-                                f" background:#E8F4FD; border-radius:4px; padding:1px 5px;'>{ep}/{total}</span>"
+                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;'>"
+                                f"{ep}/{total}</span>"
                             )
                         elif ep > 0:
                             # 未录入总集数（如碧蓝之海第三季）：只显示已看集数
                             ep_badge = (
-                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;"
-                                f" background:#E8F4FD; border-radius:4px; padding:1px 5px;'>已看{ep}</span>"
+                                f" <span style='color:#0078D7; font-size:12px; font-weight:bold;'>"
+                                f"已看{ep}</span>"
                             )
                     lbl = ClickableLabel(
                         f"<span style='color:{name_color}; font-size:15px;'>{name}</span>{ep_badge}"
@@ -2631,6 +2728,8 @@ class BangumiScheduleWindow(AniNoteWindow):
                         "QLabel:hover { background: rgba(0,0,0,0.06); }"
                     )
                     lbl.clicked.connect(lambda it=item, k=date_key: self._toggle_watched(it, k))
+                    lbl._bgm_item = item          # 右键菜单数据
+                    lbl._bgm_window = self
                     self._grid.addWidget(lbl, i + 2, ci + 1)
 
             self._grid.setRowStretch(max_items + 2, 1)
@@ -2650,21 +2749,49 @@ class BangumiScheduleWindow(AniNoteWindow):
             self._refresh_view()
 
     def _toggle_watched(self, item, date_key):
-        """点击番剧名：本地标记看过（变灰），并在有授权时反向同步到 Bangumi。
+        """点击番剧名：状态开关——显示已看 → 取消看过；显示未看 → 标记看过。
+
+        开关语义（用户确认的方案）：不论当前是手动标记还是自动灰，
+        点一下严格切换到另一个显示状态（蓝→灰→蓝→灰…）。
+        取消时一律记入 _unwatched，阻止自动灰"复活"，保证序列严格交替。
 
         item: 番剧数据 dict（含 subject_id）或旧版纯字符串。
         date_key: 该番播出日 "YYYY-MM-DD"（如周二列对应 2026-08-18）。
         """
         name = item["name"] if isinstance(item, dict) else str(item)
-        lst = self._watched.setdefault(date_key, [])
-        if name in lst:
-            lst.remove(name)
+
+        # 当前显示状态：手动标记 + 自动灰（该日本季集号 ep <= ep_status），手动取消优先
+        currently_watched = name in self._watched.get(date_key, [])
+        if not currently_watched and isinstance(item, dict):
+            if name not in self._unwatched.get(date_key, []):
+                _ep = item.get("ep_status", 0)
+                if _ep > 0:
+                    _ep_num = (item.get("episodes") or {}).get(date_key.replace("-", ""))
+                    if _ep_num is not None and _ep_num <= _ep:
+                        currently_watched = True
+
+        if currently_watched:
+            # 取消看过：移除手动标记（若存在），一律记入手动取消列表
+            # （覆盖自动灰，避免下次渲染自动灰"复活"导致序列错乱）
+            lst = self._watched.get(date_key, [])
+            if name in lst:
+                lst.remove(name)
+                if not lst:
+                    del self._watched[date_key]
+            self._unwatched.setdefault(date_key, []).append(name)
             mark = False
         else:
-            lst.append(name)
+            # 标记看过：加入手动标记，并清除手动取消记录
+            lst = self._watched.setdefault(date_key, [])
+            if name not in lst:
+                lst.append(name)
+            ulst = self._unwatched.get(date_key, [])
+            if name in ulst:
+                ulst.remove(name)
+                if not ulst:
+                    del self._unwatched[date_key]
             mark = True
-        if not lst:
-            del self._watched[date_key]
+
         self._refresh_view()
         self._mark_dirty()
 
@@ -2674,29 +2801,145 @@ class BangumiScheduleWindow(AniNoteWindow):
                 target=self._sync_back, args=(item, date_key, mark), daemon=True
             ).start()
 
+    # ---------- 判定 / 过滤 ----------
+
+    def _is_item_watched(self, item, date):
+        """某番剧在指定日期是否显示为已看（手动标记 or 自动灰，手动取消优先）。"""
+        name = item["name"] if isinstance(item, dict) else str(item)
+        dk = date.strftime("%Y-%m-%d")
+        if name in self._watched.get(dk, []):
+            return True
+        if name in self._unwatched.get(dk, []):
+            return False
+        if isinstance(item, dict):
+            ep = item.get("ep_status", 0)
+            if ep > 0:
+                # episodes 映射值 = 本季内集号 ep（与 ep_status 同基准；
+                # sort 是绝对编号，跨季番剧可能从 13 起，不能用于比较）
+                n = (item.get("episodes") or {}).get(dk.replace("-", ""))
+                if n is not None and n <= ep:
+                    return True
+        return False
+
+    def _toggle_unwatched_filter(self, checked):
+        """"只看未看"过滤开关。"""
+        self._show_unwatched_only = checked
+        self._refresh_view()
+
+    # ---------- 右键菜单（番剧条目）----------
+
+    def _show_item_menu(self, item, global_pos):
+        """番剧名右键菜单：在 Bangumi 打开 / 集数标记（样式对齐便签右键菜单）。"""
+        menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)
+        menu.setStyleSheet(
+            "QMenu {"
+            " background-color: #FAFAFA;"
+            " border: 1px solid #E0E0E0;"
+            " border-radius: 10px;"
+            " padding: 6px;"
+            " }"
+            " QMenu::item {"
+            " padding: 7px 24px;"
+            " border-radius: 6px;"
+            " margin: 1px 3px;"
+            " color: #333333;"
+            " font-size: 13px;"
+            " }"
+            " QMenu::item:selected {"
+            " background-color: #E8F0FE;"
+            " color: #1A73E8;"
+            " }"
+            " QMenu::separator {"
+            " height: 1px;"
+            " background: #E8E8E8;"
+            " margin: 4px 12px;"
+            " }"
+        )
+        act_open = menu.addAction("在 Bangumi 打开")
+        act_open.triggered.connect(
+            lambda: webbrowser.open(f"https://bgm.tv/subject/{item['subject_id']}")
+        )
+        act_eps = menu.addAction("集数标记…")
+        act_eps.triggered.connect(lambda: self._show_episode_dialog(item))
+        menu.exec(global_pos)
+
+    # ---------- 集数标记弹窗 ----------
+
+    def _fetch_episode_list(self, subject_id, proxy_str=""):
+        """拉取某条目完整剧集表 [{id, ep, sort, name, airdate}]（失败返回 []）。"""
+        import requests
+        headers = {
+            "User-Agent": f"HunterHasCome/AniNote/{VERSION} (https://github.com/TurboHunter-CN/AniNote)",
+            "X-Contact": "Bilibili: https://space.bilibili.com/499162799",
+        }
+        proxies = None
+        if proxy_str:
+            clean_proxy = proxy_str.replace("http://", "").replace("https://", "")
+            proxies = {"http": f"http://{clean_proxy}", "https": f"http://{clean_proxy}"}
+        try:
+            r = requests.get(
+                "https://api.bgm.tv/v0/episodes",
+                params={"subject_id": subject_id, "limit": 100},
+                headers=headers, proxies=proxies, timeout=15,
+            )
+            if r.status_code != 200:
+                return []
+            out = []
+            for ep in r.json().get("data", []):
+                out.append({
+                    "id": ep.get("id"),
+                    "ep": ep.get("ep"),
+                    "sort": ep.get("sort"),
+                    "name": ep.get("name_cn") or ep.get("name") or "",
+                    "airdate": ep.get("airdate") or "",
+                })
+            return out
+        except Exception:
+            return []
+
+    def _show_episode_dialog(self, item):
+        """弹出该番剧的集数标记窗口。"""
+        if not isinstance(item, dict) or not item.get("subject_id"):
+            return
+        dlg = EpisodeDialog(self, item)
+        dlg.exec()
+
     # ---------- 反向同步（点击 → Bangumi 回写）----------
 
     def _sync_back(self, item, date_key, mark):
         """后台线程：按播出日反查该番剧集 → 调 Bangumi 标记/取消看过。
 
-        失败降级策略：
-        - 查不到剧集表 / 当天没有匹配剧集（如剧场版条目）→ 静默降级为本地标记
-        - 未授权 / 接口报错 → 通过 sync_failed 信号提示用户
+        失败降级策略（借鉴 Animeko 的同步可靠性设计）：
+        - 拉剧集表失败 / PATCH 失败 → 自动重试 1 次（间隔 2 秒，覆盖网络瞬时抖动）
+        - 重试后仍查不到剧集表 / 当天无匹配集 → 静默降级为本地标记
+        - 重试后仍失败（未授权 / 接口报错）→ 通过 sync_failed 信号提示用户
         """
         try:
             import bangumi_oauth
             cfg = load_config()
             proxy = cfg.get("api_proxy", "")
             sid = item["subject_id"]
+            nm = item.get("name") or item.get("subject_id") or "该番剧"
 
+            # 拉剧集表（失败重试 1 次）
             ep_ids = self._find_episode_ids_by_date(sid, date_key, proxy)
+            if not ep_ids:
+                time.sleep(2)
+                ep_ids = self._find_episode_ids_by_date(sid, date_key, proxy)
             if not ep_ids:
                 return  # 无匹配剧集：本地标记已生效，Bangumi 侧无法精确到集，静默
 
+            # PATCH 回写（失败重试 1 次）
             ok, msg = bangumi_oauth.mark_episodes_watched(
                 sid, ep_ids, cfg, proxy_str=proxy, watched=mark
             )
-            nm = item.get("name") or item.get("subject_id") or "该番剧"
+            if not ok:
+                time.sleep(2)
+                ok, msg = bangumi_oauth.mark_episodes_watched(
+                    sid, ep_ids, cfg, proxy_str=proxy, watched=mark
+                )
             if not ok:
                 self.sync_failed.emit(f"{nm}：{msg}")
         except Exception as e:
@@ -2792,6 +3035,7 @@ class BangumiScheduleWindow(AniNoteWindow):
                 raw = data.get("bangumi_schedule_data", {}) or {}
                 self._schedule = {int(k): v for k, v in raw.items()}
                 self._watched = data.get("bangumi_watched", {}) or {}
+                self._unwatched = data.get("bangumi_unwatched", {}) or {}
             except Exception:
                 pass
 
@@ -2831,9 +3075,281 @@ class BangumiScheduleWindow(AniNoteWindow):
             "note_hotkey": getattr(self, '_note_hotkey', ''),
             "bangumi_schedule_data": self._schedule,
             "bangumi_watched": self._watched,
+            "bangumi_unwatched": self._unwatched,
         }
         with open(self.save_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+class EpisodeDialog(QDialog):
+    """集数标记窗口：展示某番剧全部剧集，每集可独立勾选标记/取消，可一键全部看过。
+
+    数据在后台线程拉取（剧集表优先用便签刷新时预缓存的 episode_list，避免重复请求；
+    每集已看状态实时拉取），完成后经信号填充 UI；勾选变化即时 PATCH 回写 Bangumi。
+    """
+
+    data_ready = Signal(object)   # (episodes_list, watched_ids_or_None)
+    watched_ready = Signal(object)  # 已看状态异步到达（watched_ids_set）
+    patch_all_done = Signal()     # "全部看过"完成 → 主线程全勾选
+    refresh_request = Signal()    # 标记变更 → 主窗口 _refresh_view
+
+    # 风格统一：对齐控制面板——无边框圆角窗口（#FAFAFA 底 12px 圆角 + 白色圆角卡片 + 自定义标题栏）
+    _QSS = """
+        QFrame#dlg_bg { background: #FAFAFA; border-radius: 12px; border: 1px solid #EAEAEA; }
+        QLabel#dlg_title { font-size: 15px; font-weight: bold; color: #333;
+                           background: transparent; border: none; }
+        QLabel#dlg_loading { color: #888; font-size: 13px; background: transparent; }
+        QFrame#dlg_card { background: white; border-radius: 10px; border: 1px solid #EAEAEA; }
+        QCheckBox { font-size: 13px; color: #444; spacing: 8px;
+                    padding: 3px 6px; border-radius: 6px; background: transparent; }
+        QCheckBox:hover { background: #E8F0FE; }
+        QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px;
+                               border: 1px solid #C0C8D0; background: white; }
+        QCheckBox::indicator:hover { border-color: #0078D7; }
+        QCheckBox::indicator:checked { background: #0078D7; border-color: #0078D7; }
+        QScrollArea { border: none; background: transparent; }
+        QScrollArea > QWidget > QWidget { background: transparent; }
+        QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
+        QScrollBar::handle:vertical { background: #C0C0C0; border-radius: 3px; min-height: 20px; }
+        QScrollBar::handle:vertical:hover { background: #A0A0A0; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        QPushButton#dlg_all { padding: 8px; border: none; border-radius: 6px;
+                              background: #0078D7; color: white; font-weight: bold; }
+        QPushButton#dlg_all:hover { background: #005BA1; }
+        QPushButton#dlg_all:disabled { background: #A0C8E8; }
+    """
+
+    def __init__(self, window, item, parent=None):
+        super().__init__(parent)
+        self._window = window
+        self._item = item
+        self._eps = []
+        self._boxes = {}          # ep_id -> QCheckBox
+        self._patch_busy = False  # 防并发 PATCH
+
+        # 无边框 + 透明背景（圆角由 dlg_bg 承载），对齐控制面板外观
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(400, 480)
+        self.setStyleSheet(self._QSS)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+
+        self.bg = QFrame()
+        self.bg.setObjectName("dlg_bg")
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 6)
+        self.bg.setGraphicsEffect(shadow)
+        outer.addWidget(self.bg)
+
+        layout = QVBoxLayout(self.bg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── 自定义标题栏（对齐控制面板 CustomTitleBar，可拖拽 + 关闭按钮）──
+        bar = QFrame()
+        bar.setStyleSheet("background: transparent;")
+        bar.setFixedHeight(45)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(20, 0, 10, 0)
+        bar_layout.setSpacing(0)
+
+        title = QLabel(item.get("name", ""))
+        title.setObjectName("dlg_title")
+        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #333;"
+                            " font-family: 'Microsoft YaHei';")
+        bar_layout.addWidget(title)
+        bar_layout.addStretch()
+
+        close_btn = QPushButton(icon("close"))
+        set_icon_font(close_btn, 16)
+        close_btn.setFixedSize(36, 30)
+        close_btn.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: #E81123; color: white; }"
+        )
+        close_btn.clicked.connect(self.reject)
+        bar_layout.addWidget(close_btn)
+        layout.addWidget(bar)
+
+        # 标题栏拖拽移动（仿控制面板 CustomTitleBar）
+        bar._drag_pos = None
+        def _bar_press(e):
+            if e.button() == Qt.LeftButton:
+                bar._drag_pos = e.globalPosition().toPoint() - self.pos()
+                e.accept()
+        def _bar_move(e):
+            if bar._drag_pos is not None:
+                self.move(e.globalPosition().toPoint() - bar._drag_pos)
+                e.accept()
+        def _bar_release(e):
+            bar._drag_pos = None
+        bar.mousePressEvent = _bar_press
+        bar.mouseMoveEvent = _bar_move
+        bar.mouseReleaseEvent = _bar_release
+
+        # ── 内容区 ──
+        content = QVBoxLayout()
+        content.setContentsMargins(16, 6, 16, 14)
+        content.setSpacing(10)
+        layout.addLayout(content, 1)
+
+        self._loading = QLabel("正在加载剧集列表…")
+        self._loading.setObjectName("dlg_loading")
+        self._loading.setAlignment(Qt.AlignCenter)
+        content.addWidget(self._loading, 1)
+
+        self._card = QFrame()
+        self._card.setObjectName("dlg_card")
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        card_layout.addWidget(self._scroll)
+        self._card.hide()
+        content.addWidget(self._card, 1)
+
+        self._btn_all = QPushButton("全部看过")
+        self._btn_all.setObjectName("dlg_all")
+        self._btn_all.clicked.connect(self._mark_all)
+        self._btn_all.hide()
+        content.addWidget(self._btn_all)
+
+        self.data_ready.connect(self._fill)
+        self.watched_ready.connect(self._apply_watched)
+        self.patch_all_done.connect(self._on_patch_all_done)
+        self.refresh_request.connect(lambda: self._window._refresh_view())
+
+        threading.Thread(target=self._load, daemon=True).start()
+
+    # ---------- 数据加载 ----------
+
+    def _load(self):
+        try:
+            cfg = load_config()
+            proxy = cfg.get("api_proxy", "")
+            sid = self._item["subject_id"]
+            # 优先用便签刷新时预缓存的剧集表，避免每次打开弹窗都请求接口
+            eps = self._item.get("episode_list") or []
+            if not eps:
+                eps = self._window._fetch_episode_list(sid, proxy)
+            # 第一步：列表立即显示（watched_ids=None 表示勾选状态稍后到达）
+            self.data_ready.emit((eps, None))
+            # 第二步：后台拉每集已看状态（会变的数据不能缓存），到达后异步更新勾选
+            watched_ids = set()
+            try:
+                import bangumi_oauth
+                coll = bangumi_oauth.fetch_episode_collection(sid, cfg, proxy) or {}
+                for eid, t in coll.items():
+                    if t == bangumi_oauth.EP_COLLECT_TYPE_WATCHED:
+                        watched_ids.add(eid)
+            except Exception:
+                pass
+            self.watched_ready.emit(watched_ids)
+        except Exception:
+            self.data_ready.emit(([], set()))
+
+    def _fill(self, payload):
+        eps, watched_ids = payload
+        self._loading.hide()
+        self._btn_all.show()
+        if not eps:
+            self._loading.setText("该条目没有可标记的剧集")
+            self._loading.show()
+            self._card.hide()
+            self._btn_all.hide()
+            return
+
+        container = QWidget()
+        box_layout = QVBoxLayout(container)
+        box_layout.setContentsMargins(8, 8, 8, 8)
+        box_layout.setSpacing(4)
+
+        for ep in eps:
+            eid = ep.get("id")
+            label = f"第{ep.get('ep') or ep.get('sort')}集"
+            if ep.get("airdate"):
+                label += f"  ·  {ep['airdate']}"
+            cb = QCheckBox(label)
+            # watched_ids 为 None 时先不勾（状态异步到达后由 _apply_watched 更新）
+            if watched_ids is not None:
+                cb.setChecked(eid in watched_ids)
+            cb.toggled.connect(lambda checked, e=eid: self._toggle_ep(e, checked))
+            box_layout.addWidget(cb)
+            self._boxes[eid] = cb
+        box_layout.addStretch(1)
+        self._scroll.setWidget(container)
+        self._card.show()
+        self._scroll.show()
+
+    def _apply_watched(self, watched_ids):
+        """已看状态异步到达：批量更新勾选（blockSignals 避免触发 PATCH）。"""
+        if not watched_ids:
+            return
+        for eid, cb in self._boxes.items():
+            checked = eid in watched_ids
+            if cb.isChecked() != checked:
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+
+    # ---------- 交互 ----------
+
+    def _toggle_ep(self, ep_id, checked):
+        """单集勾选变化 → 即时 PATCH（后台线程）。"""
+        if self._patch_busy:
+            return
+        self._patch_busy = True
+
+        def work():
+            try:
+                import bangumi_oauth
+                cfg = load_config()
+                proxy = cfg.get("api_proxy", "")
+                bangumi_oauth.mark_episodes_watched(
+                    self._item["subject_id"], [ep_id], cfg,
+                    proxy_str=proxy, watched=checked,
+                )
+                self.refresh_request.emit()
+            except Exception:
+                pass
+            finally:
+                self._patch_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mark_all(self):
+        """全部看过：批量 PATCH 所有集。"""
+        ids = [ep["id"] for ep in self._eps if ep.get("id")]
+        if not ids:
+            return
+
+        def work():
+            try:
+                import bangumi_oauth
+                cfg = load_config()
+                proxy = cfg.get("api_proxy", "")
+                bangumi_oauth.mark_episodes_watched(
+                    self._item["subject_id"], ids, cfg,
+                    proxy_str=proxy, watched=True,
+                )
+                self.patch_all_done.emit()
+                self.refresh_request.emit()
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_patch_all_done(self):
+        """全部看过成功后，把弹窗内所有勾选框设为已勾。"""
+        for cb in self._boxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
 
 
 # ---------- 全局操作 ----------
