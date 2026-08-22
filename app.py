@@ -5,6 +5,7 @@ AniNote 应用入口 — 系统托盘、全局热键、Bangumi 新番同步、�
 import sys
 import os
 import json
+import re
 import winreg
 import requests
 import ctypes
@@ -522,15 +523,17 @@ def main():
         <p>这里有一份快速上手指南，看完就可以把它删掉：</p>
         <br>
         <p><b>1. 移动与缩放</b>: 按住右上角 ⋮⋮ 区域拖动便签，拖拽任意边角可自由缩放。</p>
-        <p><b>2. 右键菜单</b>: 在便签上右键，可以锁定、置顶、隐藏、导出 Word 文档。</p>
+        <p><b>2. 右键菜单</b>: 在便签上右键，可以锁定、置顶、隐藏、导出文档。</p>
         <p><b>3. 待办事项</b>: 点击顶部工具栏的待办按钮，插入可勾选的待办方块。</p>
         <p><b>4. 富文本编辑</b>: 粗体、斜体、下划线、字号、颜色、背景色，随心搭配。</p>
-        <p><b>5. 截图与插图</b>: 工具栏剪刀按钮区域截图，图片按钮从文件插入，图片自动存入便签专属文件夹。</p>
-        <p><b>6. 全局快捷键</b>: <b>Alt+M</b> 新建 | <b>Alt+N</b> 隐藏/显示 | <b>Alt+C</b> 控制台（可在控制面板中自定义）。</p>
-        <p><b>7. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
-        <p><b>8. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项。</p>
-        <p><b>9. 新番信息</b>: 控制面板一键授权 Bangumi，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）。点击番剧名可标记看过/取消（双向同步 Bangumi）；右键番剧可「在 Bangumi 打开」或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目（大陆网络环境需自备代理）。</p>
-        <p><b>10. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
+        <p><b>5. Markdown 便签</b>: 点击工具栏「Md」按钮，便签切换为左源码右实时渲染的 Markdown 模式，支持标题、列表、任务勾选、表格、代码块、引用等完整语法；右键「隐藏源码」可收起编辑区只保留渲染效果（便签宽度减半），锁定后自动只展示渲染。</p>
+        <p><b>6. 截图与插图</b>: 工具栏剪刀按钮区域截图，图片按钮从文件插入，图片自动存入便签专属文件夹。</p>
+        <p><b>7. 导出文件</b>: 工具栏下载按钮一键导出——普通便签导出 Word 文档 (.doc)，Markdown 便签导出 .md 文件；控制面板便签墙右键也可导出。</p>
+        <p><b>8. 全局快捷键</b>: <b>Alt+M</b> 新建 | <b>Alt+N</b> 隐藏/显示 | <b>Alt+C</b> 控制台（可在控制面板中自定义）。</p>
+        <p><b>9. 便签专属快捷键</b>: 点击工具栏齿轮图标，可为单个便签绑定独立快捷键，快速呼出。</p>
+        <p><b>10. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项（含「默认 Markdown 模式」开关，开启后新建便签默认进入 Markdown 模式）。</p>
+        <p><b>11. 新番信息</b>: 控制面板一键授权 Bangumi，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）。点击番剧名可标记看过/取消（双向同步 Bangumi）；右键番剧可「在 Bangumi 打开」或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目（大陆网络环境需自备代理）。</p>
+        <p><b>12. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
         """)
         note.save_data()
         note.show()
@@ -795,12 +798,78 @@ def main():
         except Exception as e:
             QMessageBox.warning(panel, "导出失败", str(e))
 
+    def export_note_by_id_md(nid):
+        """将指定便签导出为 Markdown (.md) 文件。
+
+        MD 便签直接导出源码 content_md；普通便签将富文本 HTML 转为
+        Markdown（标题/列表/粗体/待办/图片尽力保真）。图片相对路径
+        转为 file:// 绝对路径，保证在任意 Markdown 阅读器中可显示。
+        """
+        try:
+            file_path = _find_note_file_path(nid)
+            if not file_path:
+                QMessageBox.warning(panel, "导出失败", "未找到该便签的数据文件。")
+                return
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            title = data.get("title", "未命名便签").strip()
+            note_dir = os.path.dirname(file_path).replace('\\', '/')
+
+            if data.get("markdown"):
+                md_text = data.get("content_md", "")
+            else:
+                from PySide6.QtGui import QTextDocument
+                from markdown_conv import doc_to_markdown
+                doc = QTextDocument()
+                doc.setHtml(data.get("html_content", ""))
+                md_text = doc_to_markdown(doc, note_dir)
+
+            if not md_text.strip():
+                QMessageBox.information(panel, "导出", "该便签没有文字内容，跳过导出。")
+                return
+
+            # 图片相对路径 → file:// 绝对（阅读器打开 .md 时仍可显示图片）
+            def _abs_src(m):
+                rel = m.group(2)
+                if rel.startswith(("http://", "https://", "file:", "data:")):
+                    return m.group(0)
+                return f"![{m.group(1)}](file:///{note_dir}/{rel})"
+
+            md_text = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", _abs_src, md_text)
+
+            # 解析导出目录
+            cfg = note_app.load_config()
+            export_raw = cfg.get("export_dir", "default")
+            if export_raw == "default" or not export_raw:
+                export_dir = note_app.EXPORT_DIR
+            else:
+                export_dir = export_raw
+
+            os.makedirs(export_dir, exist_ok=True)
+
+            trans = str.maketrans({
+                '/': '／', '\\': '＼', ':': '：',
+                '*': '＊', '?': '？', '"': '＂',
+                '<': '＜', '>': '＞', '|': '｜',
+            })
+            safe_title = title.translate(trans)
+            md_path = os.path.join(export_dir, f"{safe_title}.md")
+
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_text)
+            QMessageBox.information(panel, "导出成功", f"已导出至：\n{md_path}")
+        except Exception as e:
+            QMessageBox.warning(panel, "导出失败", str(e))
+
     panel.request_open_note.connect(open_note_by_id)
     panel.request_new_note.connect(note_app.create_global_new_note)
     panel.request_new_habit.connect(note_app.create_global_new_habit)
     panel.request_delete_note.connect(delete_note_by_id)
     panel.request_set_top.connect(set_note_top)
     panel.request_export_note.connect(export_note_by_id)
+    panel.request_export_md_note.connect(export_note_by_id_md)
     panel.request_set_note_hotkey.connect(_open_note_hotkey_by_id)
     panel.request_check_update.connect(lambda: check_update_flow(manual=True))
 

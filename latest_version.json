@@ -1,6 +1,6 @@
 {
-    "version": "4.1.2",
-    "notes": "本次更新：\n- 细化了新番便签的功能",
-    "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.1/AniNote_v4.1.2.zip",
+    "version": "4.2.0",
+    "notes": "本次更新：\n- 新增 Markdown 语言支持便签模式\n- 便签支持导出 md 文件\n- 控制台设置页新增「默认 Markdown 模式」开关，快捷键设置收纳为折叠区",
+    "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.2/AniNote_v4.2.0.zip",
     "sha256": ""
 }

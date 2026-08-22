@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QStackedWidget, QLabel, QPushButton, QGridLayout,
     QFormLayout, QLineEdit, QCheckBox, QComboBox,
-    QScrollArea, QFrame, QToolTip, QFontComboBox,
+    QScrollArea, QFrame, QToolTip, QFontComboBox, QToolButton,
 
     QGraphicsDropShadowEffect, QSizeGrip, QMessageBox, QMenu, QFileDialog,
 )
@@ -103,6 +103,50 @@ class ToggleSwitch(QCheckBox):
 
 
 # ==========================================
+#  可折叠设置区（箭头展开）
+# ==========================================
+
+class CollapsibleSection(QWidget):
+    """可折叠设置区：箭头标题行 + 可展开内容卡片。
+
+    点击箭头标题行在展开/收起间切换（箭头方向同步旋转），
+    内容以白色圆角卡片呈现，对齐控制面板风格。
+    """
+
+    def __init__(self, title, content, parent=None):
+        super().__init__(parent)
+        self._content = content
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._btn = QToolButton()
+        self._btn.setText(title)
+        self._btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(Qt.RightArrow)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(False)
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent;"
+            " border-radius: 6px; padding: 6px 10px; font-size: 13px;"
+            " font-weight: bold; color: #333; }"
+            " QToolButton:hover { background: #E8F0FE; color: #1A73E8; }"
+            " QToolButton:checked { color: #1A73E8; }"
+        )
+        self._btn.clicked.connect(self._on_toggle)
+        layout.addWidget(self._btn)
+
+        self._content.setVisible(False)
+        layout.addWidget(self._content)
+
+    def _on_toggle(self, checked):
+        self._btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self._content.setVisible(checked)
+
+
+# ==========================================
 #  流式网格布局
 # ==========================================
 
@@ -159,6 +203,7 @@ class NoteCard(QFrame):
     delete_clicked = Signal(str)
     set_top_clicked = Signal(str, bool)
     export_clicked = Signal(str)
+    export_md_clicked = Signal(str)
     set_hotkey_clicked = Signal(str)  # note_id
 
     def __init__(self, note_info, parent=None):
@@ -258,6 +303,7 @@ class NoteCard(QFrame):
             else "置于最顶部"
         )
         export_action = menu.addAction("导出为 Word 文档 (.doc)")
+        md_export_action = menu.addAction("导出为 Markdown (.md)")
         hk_label = f"设置便签快捷键 ({self._note_hotkey.upper()})" if self._note_hotkey else "设置便签快捷键"
         hotkey_action = menu.addAction(hk_label)
         action = menu.exec(self.mapToGlobal(pos))
@@ -266,6 +312,8 @@ class NoteCard(QFrame):
             self.set_top_clicked.emit(self.note_id, self.is_top)
         elif action == export_action:
             self.export_clicked.emit(self.note_id)
+        elif action == md_export_action:
+            self.export_md_clicked.emit(self.note_id)
         elif action == hotkey_action:
             self.set_hotkey_clicked.emit(self.note_id)
 
@@ -373,6 +421,7 @@ class ControlPanel(QWidget):
     request_delete_note = Signal(str)
     request_set_top = Signal(str, bool)
     request_export_note = Signal(str)
+    request_export_md_note = Signal(str)
     request_set_note_hotkey = Signal(str)
     settings_changed = Signal(dict)
     request_check_update = Signal()
@@ -654,6 +703,7 @@ class ControlPanel(QWidget):
             card.delete_clicked.connect(self._handle_card_delete)
             card.set_top_clicked.connect(self.request_set_top.emit)
             card.export_clicked.connect(self.request_export_note.emit)
+            card.export_md_clicked.connect(self.request_export_md_note.emit)
             card.set_hotkey_clicked.connect(self.request_set_note_hotkey.emit)
             self.flow_container.add_item(card)
             visible_count += 1
@@ -981,6 +1031,17 @@ class ControlPanel(QWidget):
         auto_update_wrap_layout.setContentsMargins(0, 5, 0, 5)
         auto_update_wrap_layout.addWidget(self.auto_update_checkbox)
 
+        # 默认 Markdown 模式便签
+        self.default_md_checkbox = ToggleSwitch("新建便签默认使用 Markdown 模式")
+        self.default_md_checkbox.setChecked(cfg.get("default_markdown", False))
+        cf_md = self.default_md_checkbox.font()
+        cf_md.setPixelSize(14)
+        self.default_md_checkbox.setFont(cf_md)
+        default_md_wrapper = QWidget()
+        default_md_wrap_layout = QVBoxLayout(default_md_wrapper)
+        default_md_wrap_layout.setContentsMargins(0, 5, 0, 5)
+        default_md_wrap_layout.addWidget(self.default_md_checkbox)
+
         # 立即检查更新按钮
         update_btn = QPushButton("立即检查更新")
         update_btn.setStyleSheet(
@@ -1007,11 +1068,26 @@ class ControlPanel(QWidget):
         form_layout.addRow(_lbl("<b>文档导出目录：</b>"), export_path_layout)
         form_layout.addRow(_lbl("<b>全局便签皮肤：</b>"), self.skin_combo)
         form_layout.addRow(_lbl("<b>便签默认字体：</b>"), self.font_combo)
-        form_layout.addRow(_lbl("<b>显示/隐藏全局快捷键：</b>"), self.hotkey_input)
-        form_layout.addRow(_lbl("<b>新建便签全局快捷键：</b>"), self.new_hotkey_input)
-        form_layout.addRow(_lbl("<b>显示全部便签快捷键：</b>"), self.show_all_hotkey_input)
-        form_layout.addRow(_lbl("<b>临时禁用/恢复全部快捷键：</b>"), self.disable_all_hotkey_input)
-        form_layout.addRow(_lbl("<b>呼出控制台快捷键：</b>"), self.panel_hotkey_input)
+        form_layout.addRow(_lbl("<b>默认便签模式：</b>"), default_md_wrapper)
+
+        # 快捷键折叠区：5 项设置收缩成箭头展开
+        hotkey_card = QFrame()
+        hotkey_card.setStyleSheet(
+            "QFrame { background: #FFFFFF; border: 1px solid #EAEAEA;"
+            " border-radius: 8px; }"
+        )
+        hotkey_form = QFormLayout(hotkey_card)
+        hotkey_form.setContentsMargins(14, 12, 14, 12)
+        hotkey_form.setVerticalSpacing(12)
+        hotkey_form.setLabelAlignment(Qt.AlignLeft)
+        hotkey_form.addRow(_lbl("显示/隐藏全局快捷键："), self.hotkey_input)
+        hotkey_form.addRow(_lbl("新建便签全局快捷键："), self.new_hotkey_input)
+        hotkey_form.addRow(_lbl("显示全部便签快捷键："), self.show_all_hotkey_input)
+        hotkey_form.addRow(_lbl("临时禁用/恢复全部快捷键："), self.disable_all_hotkey_input)
+        hotkey_form.addRow(_lbl("呼出控制台快捷键："), self.panel_hotkey_input)
+        hotkey_section = CollapsibleSection("全局快捷键", hotkey_card)
+        form_layout.addRow(hotkey_section)
+
         form_layout.addRow(_lbl("<b>API 代理地址：</b>"), proxy_layout)
         form_layout.addRow(_lbl("<b>新番追踪功能：</b>"), bangumi_wrapper)
         form_layout.addRow(_lbl("<b>Bangumi 授权：</b>"), bangumi_auth_layout)
@@ -1177,6 +1253,7 @@ class ControlPanel(QWidget):
             "save_dir": final_save_dir,
             "export_dir": final_export_dir,
             "auto_update": self.auto_update_checkbox.isChecked(),
+            "default_markdown": self.default_md_checkbox.isChecked(),
             "ignored_version": old_cfg.get("ignored_version", ""),
             "is_first_run": old_cfg.get("is_first_run", False),
             "bangumi_uid": old_cfg.get("bangumi_uid", ""),

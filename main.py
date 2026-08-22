@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.1.2"
+VERSION = "4.2.0"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -25,10 +25,13 @@ from PySide6.QtWidgets import (
     QColorDialog, QMessageBox, QSizePolicy,
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
-    QFileDialog, QDialogButtonBox, QCheckBox,
+    QFileDialog, QDialogButtonBox, QCheckBox, QPlainTextEdit, QSplitter,
 )
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QEvent, QRect, QPoint
-from PySide6.QtGui import QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage, QPainter, QPen, QBrush
+from PySide6.QtGui import (
+    QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage,
+    QPainter, QPen, QBrush, QSyntaxHighlighter, QTextCharFormat,
+)
 from PySide6.QtSvg import QSvgRenderer
 
 from icons import icon, set_icon_font
@@ -97,6 +100,13 @@ if _export_raw == "default" or not _export_raw:
     EXPORT_DIR = os.path.join(BASE_DIR, "导出的便签文本")
 else:
     EXPORT_DIR = _export_raw
+
+# 文件名安全转换表（Windows 非法字符 → 全角，用于导出文件名）
+_SAFE_TRANS = str.maketrans({
+    '/': '／', '\\': '＼', ':': '：',
+    '*': '＊', '?': '？', '"': '＂',
+    '<': '＜', '>': '＞', '|': '｜',
+})
 
 
 # ---------- 全局信号中枢 ----------
@@ -238,6 +248,9 @@ class NoteTextEdit(QTextBrowser):
         super().__init__(parent_window.bg_frame)
         self.parent_window = parent_window
         self.setReadOnly(False)
+        # 禁止内部导航：QTextBrowser 默认点击链接会尝试加载目标 URL，
+        # 远程网址加载失败会把内容清空 → 改为只发 anchorClicked 信号走系统浏览器
+        self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
         self.anchorClicked.connect(QDesktopServices.openUrl)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -278,6 +291,313 @@ class NoteTextEdit(QTextBrowser):
                 text_fmt.setForeground(QColor("#999999") if new_char == '☑' else QColor("#333333"))
                 edit_cursor.mergeCharFormat(text_fmt)
                 self.parent_window.save_data()
+
+
+# ---------- Markdown 便签（分栏编辑 + 实时渲染） ----------
+
+class MarkdownHighlighter(QSyntaxHighlighter):
+    """Markdown 源码轻量语法高亮：标题/行首标记/粗体/行内代码/代码块/引用/链接。"""
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._heading = QTextCharFormat()
+        self._heading.setFontWeight(QFont.Bold)
+        self._heading.setForeground(QColor("#0C447C"))
+        self._mark = QTextCharFormat()
+        self._mark.setForeground(QColor("#0078D7"))
+        self._code_inline = QTextCharFormat()
+        self._code_inline.setForeground(QColor("#B4005A"))
+        self._code_block = QTextCharFormat()
+        self._code_block.setBackground(QColor("#F1F3F4"))
+        self._code_block.setForeground(QColor("#444444"))
+        self._bold = QTextCharFormat()
+        self._bold.setFontWeight(QFont.Bold)
+        self._strike = QTextCharFormat()
+        self._strike.setFontStrikeOut(True)
+        self._strike.setForeground(QColor("#999999"))
+        self._quote = QTextCharFormat()
+        self._quote.setForeground(QColor("#185FA5"))
+        self._link = QTextCharFormat()
+        self._link.setForeground(QColor("#0078D7"))
+        self._link.setFontUnderline(True)
+
+    def highlightBlock(self, text):
+        # 代码块（围栏状态机）
+        if self.previousBlockState() == 1:
+            if text.strip().startswith("```"):
+                self.setCurrentBlockState(0)
+                self.setFormat(0, len(text), self._code_block)
+            else:
+                self.setCurrentBlockState(1)
+                self.setFormat(0, len(text), self._code_block)
+            return
+        if text.strip().startswith("```"):
+            self.setCurrentBlockState(1)
+            self.setFormat(0, len(text), self._code_block)
+            return
+        self.setCurrentBlockState(0)
+
+        # 标题
+        m = re.match(r"^(#{1,6})\s", text)
+        if m:
+            self.setFormat(0, len(m.group(1)), self._mark)
+            self.setFormat(len(m.group(1)) + 1, len(text) - len(m.group(1)) - 1, self._heading)
+        # 行首标记：列表 / 任务 / 引用
+        m = re.match(r"^(\s*)([-*+]\s+\[[ xX]\]|[-*+]|\d+[.)]|>)", text)
+        if m:
+            self.setFormat(m.start(1), len(m.group(2)), self._mark)
+
+        # 行内：粗体 / 行内代码 / 删除线 / 链接
+        for mm in re.finditer(r"\*\*([^*]+)\*\*", text):
+            self.setFormat(mm.start(), mm.end() - mm.start(), self._bold)
+        for mm in re.finditer(r"`([^`]+)`", text):
+            self.setFormat(mm.start(), mm.end() - mm.start(), self._code_inline)
+        for mm in re.finditer(r"~~([^~]+)~~", text):
+            self.setFormat(mm.start(), mm.end() - mm.start(), self._strike)
+        for mm in re.finditer(r"\[([^\]]+)\]\(([^)\s]+)\)", text):
+            self.setFormat(mm.start(), mm.end() - mm.start(), self._link)
+
+
+class MdSourceEdit(QPlainTextEdit):
+    """MD 源码编辑器：支持点击行首 [ ]/[x] 切换任务勾选。"""
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.isReadOnly():
+            cursor = self.cursorForPosition(event.position().toPoint())
+            block = cursor.block()
+            line = block.text()
+            m = re.match(r"^(\s*[-*+]\s+\[)([ xX])(\])", line)
+            if m and cursor.positionInBlock() <= m.end(2) and event.position().toPoint().x() >= 0:
+                new_char = "x" if m.group(2) != "x" else " "
+                edit_cur = QTextCursor(block)
+                edit_cur.setPosition(block.position() + m.start(2))
+                edit_cur.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
+                edit_cur.insertText(new_char)
+                return
+        super().mouseReleaseEvent(event)
+
+
+class MarkdownSplitEdit(QWidget):
+    """Markdown 分栏编辑器：左源码（语法高亮）+ 右实时渲染（QTextBrowser）。
+
+    - textChanged → 150ms 防抖 → markdown_conv.md_to_html → setHtml
+    - 左右滚动条按比例互绑（guard 防循环）
+    - set_markdown 装载时通过 _rendering 抑制误渲染
+    - 隐藏源码 = 窗口宽度切半（视觉上像直接砍掉左半边源码），仅 MD 模式生效
+    """
+
+    src_visibility_changed = Signal(bool)  # True=源码可见（供父窗口同步眼睛按钮）
+
+    def __init__(self, parent_window, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent_window
+        self._rendering = False      # 程序性装载/渲染中，抑制脏标记
+        self._syncing_scroll = False # 滚动互绑 guard
+        self._dirty_md = False       # 源码是否被用户修改过（决定切回富文本用缓存还是重渲染）
+        self._base_dir = ""          # 便签目录，用于解析相对路径图片
+        self._locked = False         # 便签锁定（锁定只展示渲染，隐藏源码）
+        self._user_hidden_src = False  # 用户手动隐藏源码
+        self._saved_full_width = 0   # 隐藏源码前的全宽（恢复用）
+        self._orig_min_width = 320   # 原最小宽（切半后恢复用）
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setHandleWidth(3)
+        self.splitter.setChildrenCollapsible(True)
+
+        # 左：源码
+        self.src = MdSourceEdit()
+        self.src.setStyleSheet(
+            "QPlainTextEdit { border: none; background: transparent;"
+            " font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 13px;"
+            " color: #333333; }"
+        )
+        self.hl = MarkdownHighlighter(self.src.document())
+
+        # 右：渲染
+        self.preview = QTextBrowser()
+        # 禁止内部导航：点击链接不清空内容，只发 anchorClicked 走系统浏览器
+        self.preview.setOpenLinks(False)
+        self.preview.setOpenExternalLinks(False)
+        self.preview.anchorClicked.connect(QDesktopServices.openUrl)
+        self.preview.setStyleSheet(
+            "QTextBrowser { border: none; background: transparent;"
+            " font-family: 'Microsoft YaHei'; font-size: 13px; color: #333333; }"
+        )
+
+        # 细滚动条（对齐便签风格）
+        bar_qss = (
+            "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: #C0C0C0; border-radius: 3px; min-height: 20px; }"
+            " QScrollBar::handle:vertical:hover { background: #A0A0A0; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+            " QScrollBar:horizontal { background: transparent; height: 6px; margin: 0; }"
+            " QScrollBar::handle:horizontal { background: #C0C0C0; border-radius: 3px; min-width: 20px; }"
+            " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
+        )
+        self.src.verticalScrollBar().setStyleSheet(bar_qss)
+        self.preview.verticalScrollBar().setStyleSheet(bar_qss)
+
+        self.splitter.addWidget(self.src)
+        self.splitter.addWidget(self.preview)
+        self.splitter.setSizes([400, 400])
+        layout.addWidget(self.splitter)
+
+        # 防抖渲染
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(150)
+        self._render_timer.timeout.connect(self._do_render)
+        self.src.textChanged.connect(self._on_src_changed)
+
+        # 滚动同步（按比例映射，guard 防循环）
+        self.src.verticalScrollBar().valueChanged.connect(self._on_src_scroll)
+        self.preview.verticalScrollBar().valueChanged.connect(self._on_preview_scroll)
+
+    # ---------- 对外 API ----------
+
+    def set_base_dir(self, d):
+        self._base_dir = d or ""
+
+    def set_markdown(self, md, base_dir=None):
+        """程序性装载 Markdown 源码并立即渲染（不触发脏标记）。"""
+        if base_dir is not None:
+            self._base_dir = base_dir
+        self._rendering = True
+        self.src.setPlainText(md)
+        self._rendering = False
+        self._dirty_md = False
+        self._do_render()
+
+    def markdown_text(self):
+        return self.src.toPlainText()
+
+    def is_dirty(self):
+        """源码自上次装载/清除后是否被用户修改。"""
+        return self._dirty_md
+
+    def clear_dirty(self):
+        self._dirty_md = False
+
+    def set_readonly(self, ro):
+        self.src.setReadOnly(ro)
+        if ro:
+            self.src.setTextInteractionFlags(Qt.NoTextInteraction)
+            self.src.clearFocus()
+        else:
+            self.src.setTextInteractionFlags(Qt.TextEditorInteraction)
+
+    def set_locked(self, locked):
+        """便签锁定：源码只读；MD 模式下隐藏源码（窗口切半）只展示渲染。"""
+        self._locked = locked
+        self.src.setReadOnly(locked)
+        if locked:
+            self.src.setTextInteractionFlags(Qt.NoTextInteraction)
+            self.src.clearFocus()
+        else:
+            self.src.setTextInteractionFlags(Qt.TextEditorInteraction)
+        self._apply_src_visible()
+
+    def set_user_hidden_src(self, hidden):
+        """用户手动隐藏/显示源码（工具栏眼睛按钮 / 右键菜单）。"""
+        self._user_hidden_src = hidden
+        self._apply_src_visible()
+
+    def src_visible_state(self):
+        """当前源码是否可见（考虑锁定与手动隐藏）。"""
+        return not (self._locked or self._user_hidden_src)
+
+    def _apply_src_visible(self):
+        """按源码可见性更新界面：MD 模式隐藏源码 = 窗口宽度切半。
+
+        视觉上就像直接砍掉左半边源码，渲染区占满剩余宽度；
+        恢复时把记录的全宽还回去。非 MD 模式（普通便签）不切宽。
+        """
+        visible = self.src_visible_state()
+        win = self.parent_window
+        if win and getattr(getattr(win, 'editor_host', None), 'is_md', False):
+            if visible:
+                if self._saved_full_width:
+                    w = max(self._saved_full_width, self._orig_min_width)
+                    win.setMinimumWidth(self._orig_min_width)
+                    win.resize(w, win.height())
+                    self._saved_full_width = 0
+            else:
+                # 仅在首次进入隐藏状态时记录全宽并切半；锁定/重复调用不再二次切半
+                if not self._saved_full_width:
+                    self._orig_min_width = win.minimumWidth()
+                    self._saved_full_width = win.width()
+                    half = max(win.width() // 2, 200)  # 半宽临时下限，避免切到极小
+                    win.setMinimumWidth(200)
+                    win.resize(half, win.height())
+        self.src.setVisible(visible)
+        self.src_visibility_changed.emit(visible)
+
+    def insert_image_syntax(self, rel_path):
+        """在源码光标处插入 Markdown 图片语法并触发渲染。"""
+        cur = self.src.textCursor()
+        cur.insertText(f"![{os.path.basename(rel_path)}]({rel_path.replace(os.sep, '/')})")
+        self.src.setFocus()
+
+    # ---------- 内部 ----------
+
+    def _on_src_changed(self):
+        if not self._rendering:
+            self._dirty_md = True
+            self._render_timer.start()
+
+    def _do_render(self):
+        from markdown_conv import md_to_html
+        md = self.src.toPlainText()
+        html = md_to_html(md, self._base_dir)
+        self._rendering = True
+        self.preview.setHtml(html)
+        self._rendering = False
+
+    def _on_src_scroll(self, value):
+        if self._syncing_scroll:
+            return
+        self._syncing_scroll = True
+        sb_src = self.src.verticalScrollBar()
+        sb_pv = self.preview.verticalScrollBar()
+        ratio = value / max(sb_src.maximum(), 1)
+        sb_pv.setValue(int(ratio * sb_pv.maximum()))
+        self._syncing_scroll = False
+
+    def _on_preview_scroll(self, value):
+        if self._syncing_scroll:
+            return
+        self._syncing_scroll = True
+        sb_src = self.src.verticalScrollBar()
+        sb_pv = self.preview.verticalScrollBar()
+        ratio = value / max(sb_pv.maximum(), 1)
+        sb_src.setValue(int(ratio * sb_src.maximum()))
+        self._syncing_scroll = False
+
+
+class EditorHost(QWidget):
+    """便签编辑器容器：普通富文本视图（NoteTextEdit）与 Markdown 分栏视图共存。
+
+    切换 = hide/show，不销毁不重建（布局/焦点/滚动位置各自保留）。
+    is_md 标记当前激活视图；保存时按模式双写 html_content / content_md。
+    """
+
+    def __init__(self, parent_window, rich_view):
+        super().__init__(parent_window.bg_frame)
+        self.parent_window = parent_window
+        self.is_md = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.rich_view = rich_view          # NoteTextEdit（外部创建，addWidget 自动 reparent）
+        self.md_view = MarkdownSplitEdit(parent_window)
+        layout.addWidget(self.rich_view)
+        layout.addWidget(self.md_view)
+        self.md_view.hide()
 
 
 # ---------- 标题栏 ----------
@@ -651,7 +971,14 @@ class AniNoteWindow(QWidget):
             f"font-family: '{cfg['font_family']}'; color: #333333; }}"
         )
         self.text_edit.textChanged.connect(self._mark_dirty)
-        frame_layout.addWidget(self.text_edit)
+        self.editor_host = EditorHost(self, self.text_edit)
+        self.editor_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        frame_layout.addWidget(self.editor_host)
+        # 眼睛按钮与源码可见性联动
+        if not self._is_special_note():
+            self.editor_host.md_view.src_visibility_changed.connect(
+                self._update_src_vis_btn
+            )
 
         # 四角缩放手柄（作为 bg_frame 的子控件，在 resizeEvent 中定位）
         self._grips = [
@@ -665,8 +992,18 @@ class AniNoteWindow(QWidget):
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.text_edit.setContextMenuPolicy(Qt.CustomContextMenu)
         self.text_edit.customContextMenuRequested.connect(self.show_context_menu)
+        # MD 分栏的源码区与预览区右键 → 便签右键菜单
+        self.editor_host.md_view.src.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.editor_host.md_view.src.customContextMenuRequested.connect(self.show_context_menu)
+        self.editor_host.md_view.preview.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.editor_host.md_view.preview.customContextMenuRequested.connect(self.show_context_menu)
 
         self.load_data()
+
+        # 默认 Markdown 模式（仅新建便签且配置开启时生效；特殊便签排除）
+        if (not self.save_file and not self._is_special_note()
+                and load_config().get("default_markdown", False)):
+            self._set_markdown_mode(True)
 
         # Bangumi 新番便签特殊初始化
         if self.note_id == "bangumi_schedule":
@@ -767,6 +1104,62 @@ class AniNoteWindow(QWidget):
         )
         set_icon_font(self.image_btn, 14)
 
+        # 导出文件：普通模式导出 .doc，MD 模式导出 .md
+        self.export_btn = self._create_tool_btn(
+            icon("download"), "导出文件",
+            self._export_note, "color: #555; font-weight: normal;"
+        )
+        set_icon_font(self.export_btn, 14)
+
+        # Markdown 模式切换按钮（事务追踪器/新番便签无此功能）
+        if not self._is_special_note():
+            self.md_btn = QPushButton("Md")
+            self.md_btn.setToolTip("转为 Markdown 便签（左源码右实时渲染）")
+            self.md_btn.setFixedSize(28, 28)
+            self.md_btn.setCheckable(True)
+            self.md_btn.setStyleSheet(
+                "QPushButton { border: none; border-radius: 4px; font-size: 11px;"
+                " font-weight: bold; color: #555; }"
+                " QPushButton:hover { background-color: rgba(0,0,0,0.1); }"
+                " QPushButton:checked { background-color: #E8F4FD; color: #0078D7;"
+                " border: 1px solid #B5D4F4; }"
+            )
+            self.md_btn.clicked.connect(self._toggle_markdown_mode)
+            self.header.toolbar_layout.addWidget(self.md_btn)
+
+            # 源码显示/隐藏按钮（仅 MD 模式可见；眼睛睁开=显示源码，闭眼=隐藏）
+            self.src_vis_btn = QPushButton(icon("visibility"))
+            set_icon_font(self.src_vis_btn, 14)
+            self.src_vis_btn.setToolTip("隐藏源码")
+            self.src_vis_btn.setFixedSize(28, 28)
+            self.src_vis_btn.setCheckable(True)
+            self.src_vis_btn.setStyleSheet(
+                "QPushButton { border: none; border-radius: 4px; color: #555; }"
+                " QPushButton:hover { background-color: rgba(0,0,0,0.1); }"
+                " QPushButton:checked { background-color: #E8F4FD; color: #0078D7;"
+                " border: 1px solid #B5D4F4; }"
+            )
+            self.src_vis_btn.clicked.connect(self._toggle_src_visible)
+            self.header.toolbar_layout.addWidget(self.src_vis_btn)
+            self.src_vis_btn.hide()  # 默认隐藏，进入 MD 模式后显示
+
+    def _update_src_vis_btn(self, visible):
+        """眼睛按钮状态：源码可见=睁眼，隐藏=闭眼（含锁定强制隐藏）。"""
+        if not hasattr(self, 'src_vis_btn') or self.src_vis_btn is None:
+            return
+        self.src_vis_btn.setText(icon("visibility" if visible else "visibility_off"))
+        self.src_vis_btn.setToolTip("隐藏源码" if visible else "显示源码")
+        self.src_vis_btn.setChecked(not visible)
+
+    def _toggle_src_visible(self):
+        """工具栏眼睛按钮：切换源码显示/隐藏（窗口宽度同步切半/恢复）。"""
+        md = self.editor_host.md_view
+        md.set_user_hidden_src(md.src_visible_state())
+
+    def _is_special_note(self):
+        """事务追踪器与新番便签：无 Markdown 切换能力。"""
+        return self.note_id == "bangumi_schedule" or self.note_id.startswith("habit_")
+
     def _on_main_tool_clicked(self, clicked_btn, index):
         """处理主工具栏点击：互斥展开/收起二级面板"""
         for btn in self.toggle_btns:
@@ -810,6 +1203,15 @@ class AniNoteWindow(QWidget):
 
     def insert_todo(self):
         """在当前光标位置插入一个待办项。"""
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            # MD 模式：在源码光标处插入任务语法，右侧实时渲染
+            cur = self.editor_host.md_view.src.textCursor()
+            if cur.positionInBlock() > 0:
+                cur.insertBlock()
+            cur.insertText("- [ ] ")
+            self.editor_host.md_view.src.setFocus()
+            self._mark_dirty()
+            return
         cursor = self.text_edit.textCursor()
         if cursor.positionInBlock() > 0:
             cursor.insertBlock()
@@ -1010,6 +1412,13 @@ class AniNoteWindow(QWidget):
         else:
             shutil.copy2(src_path, dest)
 
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            # MD 模式：插入 Markdown 图片语法，右侧实时渲染
+            rel = os.path.basename(dest).replace(os.sep, '/')
+            self.editor_host.md_view.insert_image_syntax(rel)
+            self._mark_dirty()
+            return
+
         cursor = self.text_edit.textCursor()
         url = f"file:///{dest.replace(os.sep, '/')}"
         cursor.insertHtml(
@@ -1018,6 +1427,84 @@ class AniNoteWindow(QWidget):
             f'title="双击查看原图">'
         )
         self._mark_dirty()
+
+    # --- 导出文件 ---
+
+    def _export_note(self):
+        """工具栏导出：MD 模式导出 .md，普通模式导出 .doc。"""
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            self._export_note_md()
+        else:
+            self._export_note_doc()
+
+    def _export_dir(self):
+        """解析导出目录（默认「导出的便签文本」，可配置）。"""
+        cfg = load_config()
+        raw = cfg.get("export_dir", "default")
+        if raw == "default" or not raw:
+            return EXPORT_DIR
+        return raw
+
+    def _export_note_doc(self):
+        """导出为 Word 文档（.doc，HTML 格式，与 app.py 导出一致）。"""
+        title = self.header.title_edit.text()
+        html = self.text_edit.toHtml()
+        note_dir = self._note_image_dir().replace('\\', '/')
+
+        def _unfile(m):
+            raw = urllib.parse.unquote(m.group(1))
+            for prefix in ('file:///', 'file://', 'file:'):
+                if raw.startswith(prefix):
+                    raw = raw[len(prefix):]
+                    break
+            try:
+                rel = os.path.relpath(raw, note_dir.replace('/', os.sep))
+                return f'src="{rel.replace(os.sep, "/")}"'
+            except ValueError:
+                return m.group(0)
+
+        html = re.sub(r'src="(file://[^"]+)"', _unfile, html)
+        if not html.strip():
+            QMessageBox.information(self, "导出", "该便签没有文字内容，跳过导出。")
+            return
+        full_doc = (
+            '<html xmlns:o="urn:schemas-microsoft-com:office:office"'
+            ' xmlns:w="urn:schemas-microsoft-com:office:word"'
+            ' xmlns="http://www.w3.org/TR/REC-html40">'
+            f'<head><meta charset="utf-8"><title>{title}</title></head>'
+            f'<body>{html}</body></html>'
+        )
+        export_dir = self._export_dir()
+        os.makedirs(export_dir, exist_ok=True)
+        safe_title = title.translate(_SAFE_TRANS)
+        path = os.path.join(export_dir, f"{safe_title}.doc")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(full_doc)
+        QMessageBox.information(self, "导出成功", f"已导出至：\n{path}")
+
+    def _export_note_md(self):
+        """导出为 Markdown（.md）：取当前源码，图片相对路径转 file:// 绝对。"""
+        title = self.header.title_edit.text()
+        md_text = self.editor_host.md_view.markdown_text()
+        note_dir = self._note_image_dir().replace('\\', '/')
+
+        def _abs(m):
+            rel = m.group(2)
+            if rel.startswith(("http://", "https://", "file:", "data:")):
+                return m.group(0)
+            return f"![{m.group(1)}](file:///{note_dir}/{rel})"
+
+        md_text = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", _abs, md_text)
+        if not md_text.strip():
+            QMessageBox.information(self, "导出", "该便签没有文字内容，跳过导出。")
+            return
+        export_dir = self._export_dir()
+        os.makedirs(export_dir, exist_ok=True)
+        safe_title = title.translate(_SAFE_TRANS)
+        path = os.path.join(export_dir, f"{safe_title}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(md_text)
+        QMessageBox.information(self, "导出成功", f"已导出至：\n{path}")
 
     def _start_screenshot(self):
         """启动区域截图。"""
@@ -1048,6 +1535,15 @@ class AniNoteWindow(QWidget):
         ok = cropped_pixmap.save(dest, "PNG")
         if not ok:
             return
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            # MD 模式：插入 Markdown 图片语法，右侧实时渲染
+            rel = os.path.basename(dest).replace(os.sep, '/')
+            self.editor_host.md_view.insert_image_syntax(rel)
+            self._mark_dirty()
+            self.raise_()
+            self.activateWindow()
+            return
+
         cursor = self.text_edit.textCursor()
         url = f"file:///{dest.replace(os.sep, '/')}"
         cursor.insertHtml(
@@ -1109,6 +1605,13 @@ class AniNoteWindow(QWidget):
 
     def show_context_menu(self, pos):
         """构建并显示右键上下文菜单。"""
+        # 坐标基准：信号来自哪个控件就用哪个控件映射（MD 源码区/预览区相对窗口有偏移）
+        sender = self.sender()
+        if isinstance(sender, QWidget) and sender is not self:
+            global_pos = sender.mapToGlobal(pos)
+        else:
+            global_pos = self.mapToGlobal(pos)
+
         menu = QMenu(self)
         menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WA_TranslucentBackground)
@@ -1150,13 +1653,27 @@ class AniNoteWindow(QWidget):
         del_action = menu.addAction("删除此便签")
         menu.addSeparator()
 
+        md_action = None
+        hide_src_action = None
+        if not self._is_special_note():
+            md_action = menu.addAction(
+                "转回普通便签" if self.editor_host.is_md else "转为 Markdown 便签"
+            )
+            # 锁定时强制只展示渲染，不提供显示源码入口（避免切宽状态错乱）
+            if self.editor_host.is_md and not self.is_locked:
+                show_src = self.editor_host.md_view.src_visible_state()
+                hide_src_action = menu.addAction(
+                    "隐藏源码" if show_src else "显示源码"
+                )
+        menu.addSeparator()
+
         cfg = load_config()
         hide_action = menu.addAction(
             f"隐藏全部便签 ({cfg['toggle_hotkey'].upper()})"
         )
         show_all_action = menu.addAction("显示全部便签")
 
-        action = menu.exec(self.mapToGlobal(pos))
+        action = menu.exec(global_pos)
 
         if action == lock_action:
             self._toggle_lock()
@@ -1170,6 +1687,13 @@ class AniNoteWindow(QWidget):
             global_signaler.open_panel_signal.emit()
         elif action == del_action:
             self.delete_note()
+        elif action == md_action:
+            self._toggle_markdown_mode()
+        elif action == hide_src_action:
+            self.editor_host.md_view.set_user_hidden_src(
+                self.editor_host.md_view.src_visible_state()
+            )
+            self.save_data()
         elif action == hide_action:
             toggle_all_notes()
         elif action == show_all_action:
@@ -1184,6 +1708,8 @@ class AniNoteWindow(QWidget):
             g.setVisible(not locked)
         self.header.title_edit.setReadOnly(locked)
         self.text_edit.setReadOnly(locked)
+        if hasattr(self, 'editor_host'):
+            self.editor_host.md_view.set_locked(locked)
         if locked:
             self.text_edit.setTextInteractionFlags(Qt.NoTextInteraction)
             self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -1192,6 +1718,69 @@ class AniNoteWindow(QWidget):
         else:
             self.text_edit.setTextInteractionFlags(Qt.TextEditorInteraction)
             self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+    # --- Markdown 模式切换 ---
+
+    def _apply_md_toolbar(self, enable):
+        """MD 模式：隐藏字体/颜色按钮（源码下无意义），收起二级面板。"""
+        for i in (0, 1):  # Aa 字体, A 颜色
+            if i < len(self.toggle_btns):
+                self.toggle_btns[i].setVisible(not enable)
+        if enable:
+            self.format_panel.setVisible(False)
+            for b in self.toggle_btns:
+                b.setChecked(False)
+
+    def _toggle_markdown_mode(self):
+        """便签右键菜单：普通 ⇄ Markdown 切换。"""
+        self._set_markdown_mode(not self.editor_host.is_md)
+        self.save_data()
+
+    def _set_markdown_mode(self, enable):
+        """核心切换逻辑：双格式双写缓存，切换瞬间零转换。
+
+        普通 → MD：富文本转 MD 源码装载（图片转相对路径）。
+        MD → 普通：源码未改 → 直接用缓存 HTML（零损失）；改过 → 才用新渲染。
+        """
+        if enable == self.editor_host.is_md:
+            return
+        note_dir = ""
+        if self.save_file:
+            note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+        if enable:
+            from markdown_conv import doc_to_markdown
+            md_src = doc_to_markdown(self.text_edit.document(), note_dir)
+            self.editor_host.md_view.set_markdown(md_src, note_dir)
+            self.editor_host.rich_view.hide()
+            self.editor_host.md_view.show()
+            if hasattr(self, 'src_vis_btn'):
+                self.src_vis_btn.show()
+                self._update_src_vis_btn(
+                    self.editor_host.md_view.src_visible_state()
+                )
+        else:
+            if self.editor_host.md_view.is_dirty():
+                from markdown_conv import md_to_html
+                html = md_to_html(self.editor_host.md_view.markdown_text(), note_dir)
+                # 相对路径图片 → file:// 绝对（与 load_data 一致）
+                if note_dir:
+                    html = re.sub(
+                        r'src="([^"]+)"',
+                        lambda m: f'src="file:///{note_dir}/{m.group(1)}"'
+                        if not m.group(1).startswith(('file:', 'http:', 'data:'))
+                        else m.group(0),
+                        html,
+                    )
+                self.text_edit.setHtml(html)
+            self.editor_host.md_view.hide()
+            self.editor_host.rich_view.show()
+        self.editor_host.is_md = enable
+        self._apply_md_toolbar(enable)
+        if hasattr(self, 'md_btn'):
+            self.md_btn.setChecked(enable)
+        if not enable and hasattr(self, 'src_vis_btn'):
+            self.src_vis_btn.hide()
+        self._mark_dirty()
     
     def _apply_bg_color(self):
         """将当前的背景色和透明度动态渲染到便签底板上。"""
@@ -1272,9 +1861,20 @@ class AniNoteWindow(QWidget):
             except OSError:
                 pass
 
-        # 优先使用现有路径（避免标题未变时重复建文件夹）
-        if self.save_file and os.path.exists(self.save_file):
-            new_path = self.save_file
+        # 标题变更 → 整体重命名目录（含 data.json 与图片），保证目录名 = 标题
+        new_path = self.save_file if (self.save_file and os.path.exists(self.save_file)) else None
+        if new_path:
+            old_dir = os.path.dirname(self.save_file)
+            new_folder = os.path.join(SAVE_DIR, base)
+            if os.path.abspath(old_dir) != os.path.abspath(new_folder):
+                # 目标目录未被占用才重命名；失败（占用/权限）则沿用旧路径
+                if not os.path.exists(new_folder):
+                    try:
+                        os.rename(old_dir, new_folder)
+                        new_path = os.path.join(new_folder, "data.json")
+                        self.save_file = new_path
+                    except OSError:
+                        pass
         else:
             new_path = make_save_path(title, exclude_path=self.save_file)
 
@@ -1293,8 +1893,17 @@ class AniNoteWindow(QWidget):
 
         self.save_file = new_path
         # 将文件绝对路径的 img src 还原为相对路径
-        html = self.text_edit.toHtml()
         note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+        html = self.text_edit.toHtml()
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            # MD 模式：源码为主格式；HTML 作为渲染缓存（源码被改过才重渲染）
+            from markdown_conv import md_to_html
+            md_src = self.editor_host.md_view.markdown_text()
+            if self.editor_host.md_view.is_dirty():
+                html = md_to_html(md_src, note_dir)
+        else:
+            from markdown_conv import doc_to_markdown
+            md_src = doc_to_markdown(self.text_edit.document(), note_dir)
         # 处理 file:// URL（含 URL 编码），还原为相对路径
         def _unfile_src(m):
             raw = m.group(1)
@@ -1316,6 +1925,8 @@ class AniNoteWindow(QWidget):
             "note_id": self.note_id,
             "title": title,
             "html_content": html,
+            "markdown": bool(getattr(self, 'editor_host', None) and self.editor_host.is_md),
+            "content_md": md_src,
             "x": self.x(), "y": self.y(),
             "width": self.width(), "height": self.height(),
             "is_locked": self.is_locked,
@@ -1391,6 +2002,23 @@ class AniNoteWindow(QWidget):
                             html
                         )
                     self.text_edit.setHtml(html)
+                    # Markdown 模式恢复：读源码装载到分栏视图
+                    if data.get("markdown"):
+                        note_dir = os.path.dirname(self.save_file).replace('\\', '/')
+                        self.editor_host.md_view.set_markdown(
+                            data.get("content_md", ""), note_dir
+                        )
+                        self.editor_host.md_view.show()
+                        self.editor_host.rich_view.hide()
+                        self.editor_host.is_md = True
+                        if hasattr(self, 'md_btn'):
+                            self.md_btn.setChecked(True)
+                        if hasattr(self, 'src_vis_btn'):
+                            self.src_vis_btn.show()
+                            self._update_src_vis_btn(
+                                self.editor_host.md_view.src_visible_state()
+                            )
+                        self._apply_md_toolbar(True)
                     x = data.get("x", 100)
                     y = data.get("y", 100)
                     w = max(data.get("width", 320), 300)
@@ -1664,10 +2292,13 @@ class HabitTrackerWindow(AniNoteWindow):
         self._tracker_scroll = scroll
         self._tracker_container = container
 
-        # 插入到 text_edit 原来的位置
+        # 插入到编辑器原来的位置（text_edit 已在 editor_host 内，以其定位）
         frame_layout = self.bg_frame.layout()
-        idx = frame_layout.indexOf(self.text_edit)
+        idx = frame_layout.indexOf(self.editor_host)
+        if idx < 0:
+            idx = frame_layout.indexOf(self.text_edit)
         frame_layout.insertWidget(idx, scroll)
+        self.editor_host.hide()
 
     def _refresh_date_labels(self):
         """根据当前周偏移量刷新日期标签。"""
@@ -2549,8 +3180,11 @@ class BangumiScheduleWindow(AniNoteWindow):
         scroll.setWidget(container)  # 关键：container 成为滚动区内容（之前漏写导致表格不可见）
 
         frame_layout = self.bg_frame.layout()
-        idx = frame_layout.indexOf(self.text_edit)
+        idx = frame_layout.indexOf(self.editor_host)
+        if idx < 0:
+            idx = frame_layout.indexOf(self.text_edit)
         frame_layout.insertWidget(idx, scroll)
+        self.editor_host.hide()
         self._tracker_scroll = scroll
         self._tracker_container = container
 

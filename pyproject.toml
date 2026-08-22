@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aninote"
-version = "4.1.2"
-description = "桌面便签工具 — 富文本编辑、待办事项、事务追踪、Bangumi 新番日历"
+version = "4.2.0"
+description = "桌面便签工具 — 富文本编辑、待办事项、事务追踪、Bangumi 新番日历、Markdown 便签"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -24,6 +24,7 @@ requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.5",
     "requests>=2.28",
+    "mistune>=3.0",
 ]
 
 [project.scripts]

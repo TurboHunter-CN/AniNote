@@ -1,11 +1,14 @@
-# AniNote v4.1.2
+# AniNote v4.2.0
 
-桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历。
+桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历、Markdown 便签。
 
 ## 功能
 
 - **桌面便签** — 无边框可拖拽缩放，四角可自由拉伸
 - **富文本编辑** — 粗体、斜体、下划线、字号、颜色、背景色，调色板自由选
+- **Markdown 语言支持** — 工具栏「Md」一键将便签切换为 Markdown 模式：左源码右实时渲染分栏、语法高亮、任务列表点击勾选、滚动同步；右键可隐藏源码（便签宽度切半，仅保留渲染效果）；支持完整 GFM 语法（表格、代码块、脚注、嵌套列表等）
+
+    ![markdown](images/markdown.png)
 - **截图与插图** — 区域截图拖拽即得，图片自动存入便签专属文件夹，双击查看原图
 
     ![picinsert](images/picinsert.png)
@@ -27,7 +30,7 @@
 
     ![control](images/control.png)
 
-- **便签导出** — 支持导出为 Word 文档（.doc），保留全部格式
+- **便签导出** — 支持导出为 Word 文档（.doc，保留全部格式）与 Markdown（.md）；工具栏导出按钮按便签模式自动选择格式，控制台便签墙右键也可导出
 - **全局热键** — 可自定义快捷键，新建/隐藏/显示/控制台/禁用
 - **便签专属快捷键** — 每便签可独立绑定热键，快速呼出
 
@@ -39,13 +42,14 @@
 - Python 3.10+
 - PySide6 >= 6.5
 - requests
+- mistune >= 3.0（Markdown 渲染）
 
 ## 运行
 
 ```bash
 git clone https://github.com/TurboHunter-CN/AniNote.git
 cd AniNote
-pip install PySide6 requests
+pip install PySide6 requests mistune
 python app.py
 ```
 
@@ -68,14 +72,14 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
    ```bash
    python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
    ```
-3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
-4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.1`，4.1.x 系列统一用 `v4.1`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.zip`）
+3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.Z.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.2`，4.2.x 系列统一用 `v4.2`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.Z.zip`）
 5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
    ```json
    {
-       "version": "4.1.2",
-       "notes": "本次更新：\n- 细化了新番便签的功能",
-       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.1/AniNote-v4.1.2.zip",
+       "version": "4.2.0",
+       "notes": "本次更新：\n- 新增 Markdown 便签模式\n- 便签支持导出 Markdown 文件\n- 设置页新增默认 Markdown 模式开关",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.2/AniNote-v4.2.0.zip",
        "sha256": ""
    }
    ```
@@ -111,6 +115,7 @@ AniNote/
 ├── app.py                            # 应用入口、热键、Bangumi 逻辑
 ├── main.py                           # 便签窗口、事务追踪器、配置
 ├── control_panel.py                  # 控制台 UI（便签墙、设置页）
+├── markdown_conv.py                  # Markdown ⇄ 富文本转换（mistune 渲染）
 ├── icons.py                          # Material Icons 图标系统
 ├── MaterialSymbolsOutlined_Static.ttf # 图标字体
 ├── Newicon.ico                       # 托盘图标 + 打包用 exe 图标

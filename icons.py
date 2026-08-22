@@ -116,6 +116,8 @@ _ICONS = {
     "settings":      "\ue8b8",   # 齿轮
     "visibility":    "\ue8f4",   # 眼睛（显示）
     "visibility_off":"\ue8f5",   # 眼睛关闭（隐藏）
+    "download":      "\ue2c0",   # 下载/导出
+    "upload":        "\ue2c6",   # 上传
 
     # 状态
     "lock":          "\ue897",   # 锁
@@ -186,6 +188,8 @@ _FALLBACK_ICONS = {
     "palette":       "\u25d0",   # ◐
     "dashboard":     "\u2630",   # ☰
     "visibility":    "\u25c9",   # ◉
+    "download":      "\u2193",   # ↓
+    "upload":        "\u2191",   # ↑
     "arrow_upward":  "\u2191",   # ↑
     "arrow_downward":"\u2193",   # ↓
     "crop_square":   "\u25a1",   # □
