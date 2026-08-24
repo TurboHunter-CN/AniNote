@@ -418,6 +418,7 @@ class ControlPanel(QWidget):
     request_open_note = Signal(str)
     request_new_note = Signal()
     request_new_habit = Signal()
+    request_new_schedule = Signal()
     request_delete_note = Signal(str)
     request_set_top = Signal(str, bool)
     request_export_note = Signal(str)
@@ -458,8 +459,9 @@ class ControlPanel(QWidget):
             Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinimizeButtonHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(900, 600)
-        self.setMinimumSize(800, 500)
+        self.resize(1000, 620)
+        # 最小宽度保证顶部栏（检索/刷新/三个新建按钮）完整显示不被压缩
+        self.setMinimumSize(1000, 500)
 
         # Bangumi OAuth 状态（授权中可取消）
         self._oauth_cancel_event = None
@@ -636,10 +638,17 @@ class ControlPanel(QWidget):
 
         # 事务追踪按钮
         habit_btn = self._icon_label("playlist_add", "新建事务追踪", icon_size=16, text_size=14,
-                                      base_style="QLabel { padding: 8px 15px; color: #555; background-color: #E8E8E8; border-radius: 6px; }",
-                                      hover_style="QLabel { padding: 8px 15px; color: #555; background-color: #D0D0D0; border-radius: 6px; }")
+                                      base_style="QLabel { padding: 8px 15px; color: white; background-color: #0078D7; border-radius: 6px; }",
+                                      hover_style="QLabel { padding: 8px 15px; color: white; background-color: #005A9E; border-radius: 6px; }")
         habit_btn.mousePressEvent = lambda e: self.request_new_habit.emit()
         top_bar.addWidget(habit_btn)
+
+        # 日程表按钮
+        sched_btn = self._icon_label("calendar_today", "新建日程表", icon_size=16, text_size=14,
+                                      base_style="QLabel { padding: 8px 15px; color: white; background-color: #0078D7; border-radius: 6px; }",
+                                      hover_style="QLabel { padding: 8px 15px; color: white; background-color: #005A9E; border-radius: 6px; }")
+        sched_btn.mousePressEvent = lambda e: self.request_new_schedule.emit()
+        top_bar.addWidget(sched_btn)
 
         # 新建便签按钮
         new_btn = self._icon_label("note_add", "新建空白便签", icon_size=16, text_size=14,
@@ -718,7 +727,11 @@ class ControlPanel(QWidget):
 
     @staticmethod
     def _load_notes_from_disk():
-        """扫描存储目录，返回便签的摘要信息列表（文件夹模式）。"""
+        """扫描存储目录，返回便签的摘要信息列表（文件夹模式）。
+
+        顺带清理空目录：无 data.json 且无任何文件的残留目录（删除便签时
+        data.json 已删但目录未清，导致 notes_data 里残留空文件夹）。
+        """
         data_list = []
         if os.path.exists(SAVE_DIR):
             for item in os.listdir(SAVE_DIR):
@@ -727,6 +740,13 @@ class ControlPanel(QWidget):
                     continue
                 data_file = os.path.join(item_path, "data.json")
                 if not os.path.exists(data_file):
+                    # 残留空目录清理：目录里没有任何文件 → 直接删除
+                    try:
+                        if not os.listdir(item_path):
+                            import shutil
+                            shutil.rmtree(item_path)
+                    except OSError:
+                        pass
                     continue
                 try:
                     with open(data_file, 'r', encoding='utf-8') as f:
@@ -756,6 +776,17 @@ class ControlPanel(QWidget):
                             line1 = f"{len(habits)} 个事务 · 周期/倒计时"
                         names = " · ".join(h.get("name", "?") for h in habits)
                         raw_text = line1 + "\n" + names
+
+                    # 日程表便签：统计事件数量与今日待办，作为卡片预览。
+                    sched_data = data.get("schedule_data") or {}
+                    sched_events = sched_data.get("events") or []
+                    if sched_events:
+                        import datetime as _dt
+                        today = _dt.date.today().isoformat()
+                        today_evs = [e for e in sched_events if e.get("date") == today]
+                        todo = sum(1 for e in today_evs if not e.get("done"))
+                        raw_text = (f"{len(sched_events)} 个事件 · 今日 {len(today_evs)} 个"
+                                    f" · 待完成 {todo}")
 
                     bg_color = data.get("bg_color", [255, 249, 196, 242])
                     data_list.append({

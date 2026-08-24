@@ -534,6 +534,7 @@ def main():
         <p><b>10. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项（含「默认 Markdown 模式」开关，开启后新建便签默认进入 Markdown 模式）。</p>
         <p><b>11. 新番信息</b>: 控制面板一键授权 Bangumi，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）。点击番剧名可标记看过/取消（双向同步 Bangumi）；右键番剧可「在 Bangumi 打开」或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目（大陆网络环境需自备代理）。</p>
         <p><b>12. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
+        <p><b>13. 日程表</b>: 控制面板中新建日程表，日/周双视图时间轴（周视图为课程表效果），可自定义编辑事件（标题、日期、起止时间、颜色、备注），支持每天/周/月/年重复与提前提醒，左键单击事件标记完成。</p>
         """)
         note.save_data()
         note.show()
@@ -552,6 +553,8 @@ def main():
                 note = note_app.HabitTrackerWindow(note_id=note_id)
             elif note_id == "bangumi_schedule":
                 note = note_app.BangumiScheduleWindow(note_id=note_id)
+            elif note_id.startswith("schedule_"):
+                note = note_app.ScheduleWindow(note_id=note_id)
             else:
                 note = note_app.AniNoteWindow(note_id=note_id)
             if getattr(note, 'is_hidden', False):
@@ -678,6 +681,12 @@ def main():
     note_app.global_signaler.force_sync_bangumi_signal.connect(
         lambda: trigger_bangumi_sync(note_app.load_config(), delay=0, force=True)
     )
+    # 日程表提醒 → 系统托盘通知
+    note_app.global_signaler.schedule_remind_signal.connect(
+        lambda title, detail: tray_icon.showMessage(
+            title, detail, QSystemTrayIcon.Information, 8000
+        )
+    )
 
     # 便签独立快捷键管理
     def open_note_by_id(note_id):
@@ -691,6 +700,8 @@ def main():
                 return
         new_note = (note_app.HabitTrackerWindow(note_id=note_id)
                     if note_id.startswith("habit_")
+                    else note_app.ScheduleWindow(note_id=note_id)
+                    if note_id.startswith("schedule_")
                     else note_app.AniNoteWindow(note_id=note_id))
         new_note.is_hidden = False
         new_note.show()
@@ -865,6 +876,7 @@ def main():
 
     panel.request_open_note.connect(open_note_by_id)
     panel.request_new_note.connect(note_app.create_global_new_note)
+    panel.request_new_schedule.connect(note_app.create_global_new_schedule)
     panel.request_new_habit.connect(note_app.create_global_new_habit)
     panel.request_delete_note.connect(delete_note_by_id)
     panel.request_set_top.connect(set_note_top)

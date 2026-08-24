@@ -1,6 +1,6 @@
-# AniNote v4.2.0
+# AniNote v4.3.0
 
-桌面便签工具，支持富文本编辑、待办事项、事务追踪、Bangumi 新番日历、Markdown 便签。
+桌面便签工具，支持富文本编辑、待办事项、事务追踪、日程表、Bangumi 新番日历、Markdown 便签。
 
 ## 功能
 
@@ -20,6 +20,8 @@
 - **事务追踪器** — 自由打卡 / 周期循环 / 倒计时三种模式，周视图网格，支持拖拽排序
 
     ![missiontrack](images/missiontrack.png)
+
+- **日程表** — 日/周双视图时间轴（课程表效果），支持自定义编辑事件（标题、日期、起止时间、备注、颜色）、每日/周/月/年重复、提前提醒、左键标记完成；时间轴随窗口自适应缩放
 
 - **Bangumi 新番** — 一键授权绑定，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）；点击番剧名标记看过/取消并双向同步 Bangumi；右键可在 Bangumi 打开条目或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目
 
@@ -73,13 +75,13 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
    python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
    ```
 3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.Z.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
-4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.2`，4.2.x 系列统一用 `v4.2`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote-vX.Y.Z.zip`）
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.2`，4.2.x 系列统一用 `v4.2`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote_vX.Y.Z.zip`）
 5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
    ```json
    {
-       "version": "4.2.0",
-       "notes": "本次更新：\n- 新增 Markdown 便签模式\n- 便签支持导出 Markdown 文件\n- 设置页新增默认 Markdown 模式开关",
-       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.2/AniNote-v4.2.0.zip",
+       "version": "4.3.0",
+       "notes": "本次更新：\n- 新增日程表功能\n- 支持自定义编辑事件和日/周视图切换",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.3/AniNote_v4.3.0.zip",
        "sha256": ""
    }
    ```
@@ -113,7 +115,7 @@ notes_data/
 ```
 AniNote/
 ├── app.py                            # 应用入口、热键、Bangumi 逻辑
-├── main.py                           # 便签窗口、事务追踪器、配置
+├── main.py                           # 便签窗口、事务追踪器、日程表、配置
 ├── control_panel.py                  # 控制台 UI（便签墙、设置页）
 ├── markdown_conv.py                  # Markdown ⇄ 富文本转换（mistune 渲染）
 ├── icons.py                          # Material Icons 图标系统

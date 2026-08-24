@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,8 +26,9 @@ from PySide6.QtWidgets import (
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
     QFileDialog, QDialogButtonBox, QCheckBox, QPlainTextEdit, QSplitter,
+    QTimeEdit, QComboBox,
 )
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QEvent, QRect, QPoint
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint
 from PySide6.QtGui import (
     QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage,
     QPainter, QPen, QBrush, QSyntaxHighlighter, QTextCharFormat,
@@ -124,6 +125,8 @@ class GlobalSignaler(QObject):
     unregister_note_hotkey = Signal(str)      # note_id
     check_hotkey_conflict = Signal(str, object)  # hotkey_str, callback(list_of_names)
     force_sync_bangumi_signal = Signal()
+    # 日程表提醒（title, 详情）→ app.py 收到后用系统托盘通知
+    schedule_remind_signal = Signal(str, str)
 
 
 global_signaler = GlobalSignaler()
@@ -1157,8 +1160,10 @@ class AniNoteWindow(QWidget):
         md.set_user_hidden_src(md.src_visible_state())
 
     def _is_special_note(self):
-        """事务追踪器与新番便签：无 Markdown 切换能力。"""
-        return self.note_id == "bangumi_schedule" or self.note_id.startswith("habit_")
+        """事务追踪器、新番便签与日程表：无 Markdown 切换能力。"""
+        return (self.note_id == "bangumi_schedule"
+                or self.note_id.startswith("habit_")
+                or self.note_id.startswith("schedule_"))
 
     def _on_main_tool_clicked(self, clicked_btn, index):
         """处理主工具栏点击：互斥展开/收起二级面板"""
@@ -1180,6 +1185,7 @@ class AniNoteWindow(QWidget):
         self.is_locked = True
         if not (self.save_file and os.path.exists(self.save_file)):
             self.is_always_on_top = False
+            self.apply_window_states()   # 属性改了必须同步窗口 flag，否则置顶状态错乱
             self.bg_color = [235, 245, 255, 242]
             self._apply_bg_color()
         self._apply_lock_ui()
@@ -1280,7 +1286,8 @@ class AniNoteWindow(QWidget):
             note_dir = os.path.dirname(self.save_file)
             if note_dir != SAVE_DIR and os.path.isdir(note_dir):
                 import shutil
-                shutil.rmtree(note_dir)
+                # ignore_errors：目录内有临时/只读残留文件时也保证删干净，不留空壳
+                shutil.rmtree(note_dir, ignore_errors=True)
         self.close()
         global_signaler.note_updated_signal.emit()
 
@@ -1675,6 +1682,9 @@ class AniNoteWindow(QWidget):
 
         action = menu.exec(global_pos)
 
+        # 注意：菜单外左键关闭时 exec 返回 None。
+        # 特殊便签的 md_action / hide_src_action 为 None，直接用
+        # `action == md_action` 会因 None == None 误判触发 MD 切换 → 必须判空。
         if action == lock_action:
             self._toggle_lock()
         elif action == top_action:
@@ -1687,9 +1697,9 @@ class AniNoteWindow(QWidget):
             global_signaler.open_panel_signal.emit()
         elif action == del_action:
             self.delete_note()
-        elif action == md_action:
+        elif md_action is not None and action == md_action:
             self._toggle_markdown_mode()
-        elif action == hide_src_action:
+        elif hide_src_action is not None and action == hide_src_action:
             self.editor_host.md_view.set_user_hidden_src(
                 self.editor_host.md_view.src_visible_state()
             )
@@ -3043,6 +3053,1351 @@ class ClickableLabel(QLabel):
             super().contextMenuEvent(event)
 
 
+def _time_to_min(hhmm):
+    """"HH:MM" → 当日分钟数（如 "09:30" → 570）。"""
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return 9 * 60
+
+
+def _min_to_hhmm(mins):
+    """当日分钟数 → "HH:MM"。"""
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+class ScheduleDayHeader(QWidget):
+    """日程表日期表头（不跟随滚动）：周视图显示两行（周几 + 日期），今天列高亮。"""
+
+    WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
+    HEADER_H = 34  # 两行高度
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dates = []
+        self.time_col_w = 44
+        self.setFixedHeight(self.HEADER_H)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_dates(self, dates):
+        self.dates = dates
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        n = len(self.dates)
+        if n == 0:
+            return
+        col_w = (self.width() - self.time_col_w) / n
+        today = datetime_module.date.today()
+        for c, d in enumerate(self.dates):
+            x0 = int(self.time_col_w + c * col_w)
+            x1 = int(self.time_col_w + (c + 1) * col_w)
+            is_today = (d == today)
+            if is_today:
+                # 今天列：浅蓝圆角底
+                painter.fillRect(x0 + 4, 2, max(x1 - x0 - 8, 10),
+                                 self.HEADER_H - 4, QColor(232, 244, 253))
+        for c, d in enumerate(self.dates):
+            x0 = int(self.time_col_w + c * col_w)
+            x1 = int(self.time_col_w + (c + 1) * col_w)
+            cw = x1 - x0
+            is_today = (d == today)
+            rect = QRect(x0, 0, cw, self.HEADER_H)
+            if is_today:
+                painter.setPen(QColor(0, 120, 215))
+                font = painter.font()
+                font.setBold(True)
+                painter.setFont(font)
+            else:
+                painter.setPen(QColor(95, 107, 122))
+                font = painter.font()
+                font.setBold(False)
+                painter.setFont(font)
+            # 上排：周几
+            painter.drawText(rect.adjusted(0, 1, 0, -self.HEADER_H // 2),
+                             Qt.AlignCenter, self.WEEKDAYS[d.weekday()])
+            # 下排：日期
+            painter.drawText(rect.adjusted(0, self.HEADER_H // 2, 0, -1),
+                             Qt.AlignCenter, str(d.day))
+        # 底边分隔线
+        painter.setPen(QPen(QColor(220, 224, 229), 1))
+        painter.drawLine(0, self.HEADER_H - 1, self.width(), self.HEADER_H - 1)
+
+
+class ScheduleGridArea(QWidget):
+    """日程表时间轴画布：绘制整点刻度线 + 承载绝对定位的事件块（不含表头）。
+
+    时间轴默认 6:00 - 21:00；若事件超出该范围，_compute_axis 会动态拉长
+    起点/终点（取整到整点），翻页后按新视图事件重新计算即自然恢复。
+    表头日期行由独立的 `ScheduleDayHeader` 显示（不跟随滚动）。
+    """
+
+    resized = Signal()    # 画布尺寸变化（含滚动条出现/消失导致的宽度变化）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.axis_start = 6 * 60      # 轴起点（分钟）
+        self.axis_end = 21 * 60       # 轴终点（分钟）
+        self.hour_h = 44              # 每小时像素高度（自适应，见 _update_hour_h）
+        self.time_col_w = 44          # 左侧时间刻度列宽（与表头一致）
+        self.day_cols = 7             # 列数：日视图 1 / 周视图 7
+        self._blocks = []             # [(block, col_idx, lane, lane_count)]
+        self.pad_top = 16             # 轴首尾留白：保证 6:00 / 21:00 标签完整渲染
+        self.pad_bottom = 16
+        self.MIN_HOUR_H = 18          # 每小时最小像素（防止过度压缩）
+        self.MAX_HOUR_H = 80          # 每小时最大像素（拉长时行距更宽，清晰度更高）
+        self._updating_scale = False  # 防 setMinimumHeight 触发递归 resize
+        self.setMinimumHeight(120)
+
+    # ---------- 几何 ----------
+
+    def total_minutes(self):
+        return self.axis_end - self.axis_start
+
+    def total_height(self):
+        return (self.pad_top + self.pad_bottom
+                + max(int(self.total_minutes() / 60 * self.hour_h), 120))
+
+    def _viewport_height(self):
+        """向上查找 QScrollArea 的视口高度（画布实际可见区域高度）。"""
+        p = self.parent()
+        while p is not None:
+            if isinstance(p, QScrollArea):
+                return p.viewport().height()
+            p = p.parent()
+        return self.height()
+
+    def _update_hour_h(self):
+        """自适应缩放：按视口可见高度反推每小时像素，让整日行程尽量完整可见。
+
+        窗口越大 → 每小时像素越多（更清晰）；窗口越小 → 压缩到下限 18px，
+        此时整日总高超出视口，才出现滚动条。
+        """
+        if self._updating_scale:
+            return
+        self._updating_scale = True
+        try:
+            avail = self._viewport_height() - self.pad_top - self.pad_bottom
+            hours = self.total_minutes() / 60.0
+            if hours <= 0 or avail <= 0:
+                return
+            self.hour_h = max(self.MIN_HOUR_H, min(self.MAX_HOUR_H, avail / hours))
+            # 需要的最小高度：小时高未到下限时 = 视口高（无滚动）；到下限后 = 更高（出现滚动）
+            need = self.pad_top + self.pad_bottom + int(hours * self.hour_h)
+            self.setMinimumHeight(max(need, 120))
+            self.update()
+            self._relayout()
+        finally:
+            self._updating_scale = False
+
+    def set_axis(self, start_min, end_min):
+        self.axis_start = start_min
+        self.axis_end = end_min
+        # 时间范围变化后重新缩放适配（如拉长到 5:00-23:00 时缩小比例保持完整可见）
+        self._update_hour_h()
+        self.update()
+
+    def set_day_cols(self, n):
+        self.day_cols = max(1, n)
+        self.update()
+        self._relayout()
+
+    def _col_width(self):
+        area_w = max(self.width() - self.time_col_w, 50)
+        return area_w / self.day_cols
+
+    # ---------- 事件块管理 ----------
+
+    def clear_blocks(self):
+        for blk, *_ in self._blocks:
+            blk.deleteLater()
+        self._blocks = []
+
+    def add_block(self, block, col_idx, lane, lane_count):
+        self._blocks.append((block, col_idx, lane, lane_count))
+        block.setParent(self)
+        block.show()
+        self._relayout()
+
+    def _relayout(self):
+        col_w = self._col_width()
+        for block, col_idx, lane, lane_count in self._blocks:
+            ev = block.event_data
+            s = _time_to_min(ev.get("start", "09:00"))
+            e = _time_to_min(ev.get("end", "10:00"))
+            y = self.pad_top + int((s - self.axis_start) / 60 * self.hour_h)
+            h = max(int((e - s) / 60 * self.hour_h), 18)
+            w = max(int(col_w / lane_count) - 2, 24)
+            x = int(self.time_col_w + col_idx * col_w + lane * (w + 2))
+            block.setGeometry(x, y + 1, w, h)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_hour_h()
+        self.resized.emit()
+
+    # ---------- 绘制 ----------
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        start_h = self.axis_start // 60
+        end_h = (self.axis_end + 59) // 60
+        # 刻度密度自适应：每小时像素 < 26 时改为每 2 小时一条线，避免缩小后过于密集
+        step = 1 if self.hour_h >= 26 else 2
+        for hh in range(start_h, end_h + 1, step):
+            y = self.pad_top + int((hh * 60 - self.axis_start) / 60 * self.hour_h)
+            # 左侧时间标签
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(
+                QRect(2, y - 8, self.time_col_w - 8, 16),
+                Qt.AlignRight | Qt.AlignVCenter, f"{hh:02d}:00"
+            )
+            # 整点横线
+            painter.setPen(QPen(QColor(228, 228, 228), 1))
+            painter.drawLine(self.time_col_w, y, self.width(), y)
+        # 列分隔线
+        col_w = self._col_width()
+        for c in range(1, self.day_cols):
+            x = self.time_col_w + int(c * col_w)
+            painter.setPen(QPen(QColor(240, 240, 240), 1))
+            painter.drawLine(x, self.pad_top, x, self.height() - self.pad_bottom)
+        super().paintEvent(event)
+
+
+class ScheduleBlock(QFrame):
+    """日程表事件块：彩色圆角色块，左键标记完成，右键弹出编辑菜单。
+
+    hover 时在事件条上下显示具体开始/结束时间（默认隐藏）。
+    date 参数：该块对应的事件日期（重复事件按日期判断完成状态）。
+    """
+
+    clicked = Signal()
+
+    def __init__(self, event_data, expanded, parent=None, date=None):
+        super().__init__(parent)
+        self.event_data = event_data
+        self.expanded = expanded      # 日视图 True（展开备注）/ 周视图 False（缩略）
+        self.date = date              # 该块对应的事件日期（datetime.date）
+        self._window = None
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._hover = False
+        self._build_ui()
+        self._apply_style()
+
+    def _is_done(self):
+        """该日期下事件是否已完成（重复事件查 done_dates，单次查 done）。"""
+        ev = self.event_data
+        if ev.get("repeat") and ev.get("repeat") != "none":
+            dk = self.date.strftime("%Y-%m-%d") if self.date else ""
+            return bool((ev.get("done_dates") or {}).get(dk, False))
+        return bool(ev.get("done", False))
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(2)
+        ev = self.event_data
+        # 顶部时间标签（hover 显示具体开始时间，左上角、无底色）
+        self._start_lbl = QLabel(ev.get("start", "09:00"))
+        self._start_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._start_lbl.setVisible(False)
+        layout.addWidget(self._start_lbl)
+        # 标题
+        self._title_lbl = QLabel(ev.get("title", ""))
+        self._title_lbl.setStyleSheet("background: transparent; border: none; font-weight: bold;")
+        layout.addWidget(self._title_lbl)
+        # 展开模式：时间范围 + 备注
+        if self.expanded:
+            self._time_lbl = QLabel(f"{ev.get('start', '09:00')} - {ev.get('end', '10:00')}")
+            self._time_lbl.setStyleSheet("background: transparent; border: none; font-size: 11px;")
+            layout.addWidget(self._time_lbl)
+            note = ev.get("note", "")
+            if note:
+                self._note_lbl = QLabel(note)
+                self._note_lbl.setWordWrap(True)
+                self._note_lbl.setStyleSheet("background: transparent; border: none; font-size: 12px;")
+                layout.addWidget(self._note_lbl)
+        # 底部时间标签（hover 显示具体结束时间，左下角、无底色）
+        self._end_lbl = QLabel(ev.get("end", "10:00"))
+        self._end_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._end_lbl.setVisible(False)
+        layout.addWidget(self._end_lbl)
+
+    def _apply_style(self):
+        ev = self.event_data
+        color = ev.get("color", "#0078D7")
+        done = self._is_done()
+        if done:
+            bg = "#ECECEC"
+            border = "#BDBDBD"
+            text = "#9E9E9E"
+            time_text = "#9E9E9E"
+        else:
+            c = QColor(color)
+            bg = f"rgba({c.red()},{c.green()},{c.blue()},60)"
+            border = color
+            text = "#333333"
+            # hover 时间标签：无底色，用与标题同色的深色文字
+            time_text = "#555555"
+        self.setStyleSheet(
+            f"QFrame {{ background: {bg}; border: none;"
+            f" border-left: 3px solid {border}; border-radius: 5px; }}"
+            f"QFrame:hover {{ background: {bg}; border: 1px solid {border};"
+            f" border-left: 3px solid {border}; }}"
+        )
+        self._title_lbl.setStyleSheet(
+            f"background: transparent; border: none; font-weight: bold; color: {text};"
+            f" font-size: {'13px' if self.expanded else '12px'};"
+        )
+        # 时间标签：无底色、小字、左上/左下角
+        time_style = (
+            f"background: transparent; border: none; color: {time_text};"
+            f" font-size: 10px; font-weight: bold;"
+        )
+        self._start_lbl.setStyleSheet(time_style)
+        self._end_lbl.setStyleSheet(time_style)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self._start_lbl.setVisible(True)
+        self._end_lbl.setVisible(True)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._start_lbl.setVisible(False)
+        self._end_lbl.setVisible(False)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        if self._window:
+            self._window._show_block_menu(self.event_data, event.globalPos())
+        else:
+            super().contextMenuEvent(event)
+
+
+class ScheduleWindow(AniNoteWindow):
+    """日程表便签窗口，继承便签的全部功能。
+
+    支持日视图（事件展开备注）与周视图（课程表缩略，7 列按时间分布）
+    双模式切换；时间轴默认 6:00-21:00，事件超出时自动拉长，翻页恢复。
+    数据存储在便签 JSON 的 schedule_data 中。
+    """
+
+    WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
+
+    def __init__(self, note_id=None):
+        nid = note_id if note_id else f"schedule_{uuid.uuid4().hex[:8]}"
+        super().__init__(note_id=nid)
+
+        self.setMinimumSize(520, 360)
+        self.text_edit.hide()
+        self.format_panel.hide()
+
+        # 状态
+        self._view_mode = "week"      # "day" | "week"
+        self._center_date = datetime_module.date.today()
+        self._events = []             # [{id, title, date, start, end, note, color, done}]
+        self._rebuilding = False      # 防 resizeEvent 递归
+
+        # 网格（插入到 text_edit 原位置）
+        self._build_schedule_grid()
+
+        # 恢复数据
+        self._load_schedule()
+
+        # 首次创建：浅蓝主题 + 默认标题
+        if not (self.save_file and os.path.exists(self.save_file)):
+            self.is_always_on_top = False
+            self.apply_window_states()   # 属性改了必须同步窗口 flag，否则置顶状态错乱
+            self.bg_color = [235, 245, 255, 242]
+            self._apply_bg_color()
+            self.header.title_edit.setText("日程表")
+        self._apply_lock_ui()
+
+        self._refresh_view()
+
+        QTimer.singleShot(0, self._show_if_not_hidden)
+
+        # 提醒检查：每 20 秒扫描一次，到点触发系统通知
+        self._remind_fired = set()   # 已触发的 (event_id, date_str) 组合，避免重复提醒
+        self._remind_timer = QTimer(self)
+        self._remind_timer.setInterval(20000)
+        self._remind_timer.timeout.connect(self._check_reminders)
+        self._remind_timer.start()
+
+    def _init_bangumi_mode(self):
+        pass
+
+    def _apply_lock_ui(self):
+        super()._apply_lock_ui()
+        self.format_panel.hide()
+        if not hasattr(self, '_top_widget'):
+            return
+        locked = self.is_locked
+        # 锁定下保留顶部工具行（今天/日/周/◀▶/日期范围）和日期表头（保留日周视图点击切换），
+        # 仅隐藏底部"新的事件"按钮（编辑/新建入口全部关闭）
+        self._bottom_widget.setVisible(not locked)
+        # 左键标记完成保留可用（对齐新番便签：锁定不影响条目标记）
+
+    # 网格模式无文本编辑区：字体格式操作一律忽略
+    def change_font_family(self, font):
+        pass
+
+    def change_font_size(self, size):
+        pass
+
+    def change_font_color_direct(self, hex_color):
+        pass
+
+    def _show_if_not_hidden(self):
+        if not getattr(self, 'is_hidden', False):
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    # ---------- 网格构建 ----------
+
+    def _build_schedule_grid(self):
+        # 外层容器：顶部工具行（固定） + 日期表头（固定，不跟随滚动） + 滚动区 + 底部操作栏（固定）
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(4)
+
+        # 顶部工具行（不跟随滚动）
+        self._build_top_bar(outer)
+
+        # 日期表头（两行：周几 + 日期；今天高亮；不跟随滚动）
+        self._day_header = ScheduleDayHeader()
+        outer.addWidget(self._day_header)
+
+        # 滚动区：仅包含时间轴画布（超高时滚动，工具行/日期表头/底部按钮保持可见）
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }
+            QScrollBar::handle:vertical { background: #D0D0D0; border-radius: 2px; min-height: 20px; }
+            QScrollBar::handle:vertical:hover { background: #A0A0A0; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        self._grid_area = ScheduleGridArea()
+        inner_layout.addWidget(self._grid_area)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        # 监听 viewport resize：viewport 宽度即画布可用宽度（已扣除滚动条占位），
+        # 用它同步日期表头宽度，确保两列对齐
+        scroll.viewport().installEventFilter(self)
+        self._scroll_viewport = scroll.viewport()
+
+        # 底部操作栏（不跟随滚动）
+        self._build_bottom_actions(outer)
+
+        frame_layout = self.bg_frame.layout()
+        idx = frame_layout.indexOf(self.editor_host)
+        if idx < 0:
+            idx = frame_layout.indexOf(self.text_edit)
+        frame_layout.insertWidget(idx, container)
+        self.editor_host.hide()
+        self._tracker_scroll = scroll
+        self._tracker_container = container
+
+    def eventFilter(self, obj, event):
+        """监听滚动区 viewport 尺寸变化，同步日期表头宽度（列对齐）。
+
+        在 Resize 事件里 viewport 宽度已是新值，直接同步无需延迟。
+        """
+        if obj is getattr(self, '_scroll_viewport', None) and event.type() == QEvent.Resize:
+            self._sync_day_header_width()
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        """窗口缩放时驱动时间轴自适应缩放 + 日期表头宽度同步。
+
+        注意：不能只依赖 grid_area 自身的 resizeEvent——窗口缩小时画布可能被
+        minimumHeight 撑住不触发 resize，因此由窗口级 resize 统一驱动。
+        """
+        super().resizeEvent(event)
+        if hasattr(self, '_grid_area') and self._grid_area is not None:
+            self._grid_area._update_hour_h()
+        self._sync_day_header_width()
+
+    def _sync_day_header_width(self):
+        """同步日期表头宽度到画布可用宽度（viewport 宽度，含滚动条占位差异）。"""
+        if hasattr(self, '_day_header') and self._day_header is not None:
+            vp = getattr(self, '_scroll_viewport', None)
+            w = vp.width() if vp is not None else self._grid_area.width()
+            self._day_header.setFixedWidth(w)
+
+    def _build_top_bar(self, outer):
+        top = QWidget()
+        top.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(top)
+        row.setContentsMargins(4, 0, 4, 0)
+        row.setSpacing(6)
+
+        # 左侧：今天 + 日/周切换
+        today_btn = QPushButton("今天")
+        today_btn.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; padding: 3px 10px;"
+            " font-size: 12px; color: #0078D7; background: #E8F4FD; font-weight: bold; }"
+            "QPushButton:hover { background: #D0E9FB; }"
+        )
+        today_btn.setCursor(Qt.PointingHandCursor)
+        today_btn.clicked.connect(self._go_today)
+        row.addWidget(today_btn)
+
+        seg = QWidget()
+        seg.setStyleSheet("background: transparent;")
+        seg_layout = QHBoxLayout(seg)
+        seg_layout.setContentsMargins(0, 0, 0, 0)
+        seg_layout.setSpacing(2)
+        self._btn_day = QPushButton("日")
+        self._btn_week = QPushButton("周")
+        seg_style = (
+            "QPushButton { border: 1px solid #D0D0D0; border-radius: 6px; padding: 3px 12px;"
+            " font-size: 12px; color: #777; background: #FFFFFF; }"
+            "QPushButton:hover { background: #F0F0F0; }"
+            "QPushButton:checked { background: #0078D7; color: white; border-color: #0078D7;"
+            " font-weight: bold; }"
+        )
+        self._btn_day.setCheckable(True)
+        self._btn_week.setCheckable(True)
+        self._btn_day.setStyleSheet(seg_style)
+        self._btn_week.setStyleSheet(seg_style)
+        self._btn_day.clicked.connect(lambda: self._switch_view("day"))
+        self._btn_week.clicked.connect(lambda: self._switch_view("week"))
+        seg_layout.addWidget(self._btn_day)
+        seg_layout.addWidget(self._btn_week)
+        row.addWidget(seg)
+
+        row.addStretch(1)
+
+        # 右侧：◀ 日期范围 ▶
+        btn_style = (
+            "QPushButton { border: none; background: transparent; font-size: 16px; "
+            "color: #888; padding: 2px 8px; }"
+            "QPushButton:hover { color: #333; background: rgba(0,0,0,0.05); border-radius: 4px; }"
+        )
+        self._btn_prev = QPushButton("◀")
+        self._btn_prev.setStyleSheet(btn_style)
+        self._btn_prev.setToolTip("向前一天/一周")
+        self._btn_prev.clicked.connect(self._prev_step)
+        row.addWidget(self._btn_prev)
+
+        self._range_lbl = QLabel()
+        self._range_lbl.setAlignment(Qt.AlignCenter)
+        self._range_lbl.setStyleSheet(
+            "color: #333; font-size: 14px; font-weight: bold; background: transparent;"
+        )
+        row.addWidget(self._range_lbl)
+
+        self._btn_next = QPushButton("▶")
+        self._btn_next.setStyleSheet(btn_style)
+        self._btn_next.setToolTip("向后一天/一周")
+        self._btn_next.clicked.connect(self._next_step)
+        row.addWidget(self._btn_next)
+
+        outer.addWidget(top)
+        self._top_widget = top
+
+    def _build_bottom_actions(self, outer):
+        bottom = QWidget()
+        bottom.setStyleSheet("background: transparent;")
+        bottom_layout = QHBoxLayout(bottom)
+        bottom_layout.setContentsMargins(0, 2, 0, 2)
+        bottom_layout.addStretch()
+        add_btn = QPushButton("＋ 新的事件")
+        add_btn.setStyleSheet(
+            "QPushButton { padding: 6px 18px; border-radius: 8px; font-size: 13px; "
+            "font-weight: bold; background: #0078D7; color: white; border: none; }"
+            "QPushButton:hover { background: #005A9E; }"
+        )
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.clicked.connect(lambda: self._show_event_dialog(None))
+        bottom_layout.addWidget(add_btn)
+        outer.addWidget(bottom)
+        self._bottom_widget = bottom
+
+    # ---------- 视图计算 ----------
+
+    def _visible_dates(self):
+        """当前视图的日期列表。日视图：[center_date]；周视图：center_date 所在周 7 天。"""
+        if self._view_mode == "day":
+            return [self._center_date]
+        monday = self._center_date - datetime_module.timedelta(days=self._center_date.weekday())
+        return [monday + datetime_module.timedelta(days=i) for i in range(7)]
+
+    def _events_for_date(self, date):
+        """返回在指定日期出现的事件（含重复展开）。
+
+        事件 repeat 规则：
+          "none" / 缺省   → 仅事件本身日期出现
+          "daily"         → 事件日期当天及之后每天出现
+          "weekly"        → 事件日期当天及之后每周同星期几出现
+          "monthly"       → 事件日期当天及之后每月同日出现
+          "yearly"        → 事件日期当天及之后每年同月同日出现
+        """
+        out = []
+        for ev in self._events:
+            try:
+                base = datetime_module.date.fromisoformat(ev.get("date", ""))
+            except ValueError:
+                continue
+            repeat = ev.get("repeat", "none")
+            if date < base:
+                continue
+            if repeat == "daily":
+                out.append(ev)
+            elif repeat == "weekly":
+                if date.weekday() == base.weekday():
+                    out.append(ev)
+            elif repeat == "monthly":
+                if date.day == base.day:
+                    out.append(ev)
+            elif repeat == "yearly":
+                if date.month == base.month and date.day == base.day:
+                    out.append(ev)
+            else:
+                if date == base:
+                    out.append(ev)
+        return out
+
+    def _compute_axis(self, events):
+        """根据当前视图事件计算时间轴范围（分钟），默认 6:00-21:00，超出则拉长到整点。"""
+        start = 6 * 60
+        end = 21 * 60
+        for ev in events:
+            s = _time_to_min(ev.get("start", "09:00"))
+            e = _time_to_min(ev.get("end", "10:00"))
+            if s < start:
+                start = (s // 60) * 60
+            if e > end:
+                end = ((e + 59) // 60) * 60
+        return start, end
+
+    def _assign_lanes(self, events):
+        """同列事件贪心分道，返回 {event_id: lane_index}，重叠事件横向避让。"""
+        sorted_evs = sorted(events, key=lambda e: _time_to_min(e.get("start", "09:00")))
+        lane_ends = []
+        lane_of = {}
+        for ev in sorted_evs:
+            s = _time_to_min(ev.get("start", "09:00"))
+            e = _time_to_min(ev.get("end", "10:00"))
+            placed = False
+            for i, le in enumerate(lane_ends):
+                if s >= le:
+                    lane_ends[i] = max(le, e)
+                    lane_of[ev["id"]] = i
+                    placed = True
+                    break
+            if not placed:
+                lane_ends.append(e)
+                lane_of[ev["id"]] = len(lane_ends) - 1
+        return lane_of
+
+    @staticmethod
+    def _repeat_matches(date, base, repeat):
+        """判断 date 是否符合 repeat 规则的某一期（相对 base 起始日）。
+
+        monthly 通用规则：匹配 min(base.day, 该月最后一天)。
+        例：31 号起始 → 2 月 28/29、4 月 30；30 号起始 → 2 月 28/29；
+            29 号起始 → 2 月 28（非闰年）/29（闰年）；28 号起始 → 每月 28。
+        """
+        if repeat == "daily":
+            return True
+        if repeat == "weekly":
+            return date.weekday() == base.weekday()
+        if repeat == "monthly":
+            import calendar
+            last_day = calendar.monthrange(date.year, date.month)[1]
+            return date.day == min(base.day, last_day)
+        if repeat == "yearly":
+            return date.month == base.month and date.day == base.day
+        return False
+
+    def _materialize_repeat(self, ev, batch_id):
+        """将重复事件物化为实体条目（起始日 → 起始日 + 400 天）。
+
+        每个匹配日期生成一条独立实体（repeat 置 none、独立 id、共享 batch_id），
+        让每个日子都有真实条目，可单独编辑 / 删除 / 标记完成。
+        done_dates 按日期映射到对应实体的 done。
+        """
+        base = datetime_module.date.fromisoformat(ev["date"])
+        end = base + datetime_module.timedelta(days=400)
+        done_dates = ev.get("done_dates") or {}
+        rep = ev.get("repeat", "none")
+        items = []
+        cur = base
+        guard = 0
+        while cur <= end and guard < 500:
+            if self._repeat_matches(cur, base, rep):
+                item = dict(ev)
+                item["id"] = uuid.uuid4().hex[:8]
+                item["date"] = cur.strftime("%Y-%m-%d")
+                item["repeat"] = "none"        # 实体不再按周期展开
+                item["batch_id"] = batch_id    # 批次标识（用于整体替换/删除）
+                dk = cur.strftime("%Y-%m-%d")
+                item["done"] = bool(done_dates.get(dk, False))
+                item.pop("done_dates", None)
+                items.append(item)
+            cur += datetime_module.timedelta(days=1)
+            guard += 1
+        return items
+
+    # ---------- 渲染 ----------
+
+    def _refresh_view(self):
+        if self._rebuilding:
+            return
+        self._rebuilding = True
+        try:
+            dates = self._visible_dates()
+            all_events = [ev for d in dates for ev in self._events_for_date(d)]
+
+            # 时间轴动态范围（翻页后自动恢复默认 6-21）
+            axis_start, axis_end = self._compute_axis(all_events)
+            self._grid_area.set_axis(axis_start, axis_end)
+            self._grid_area.set_day_cols(len(dates))
+            self._day_header.set_dates(dates)
+            # 首次构建后同步表头宽度（viewport 宽度此时已确定）
+            self._sync_day_header_width()
+
+            # 顶部范围标签 + 视图切换按钮状态
+            self._update_range_label(dates)
+            self._btn_day.setChecked(self._view_mode == "day")
+            self._btn_week.setChecked(self._view_mode == "week")
+
+            # 重建事件块
+            self._grid_area.clear_blocks()
+            for ci, d in enumerate(dates):
+                day_events = self._events_for_date(d)
+                if not day_events:
+                    continue
+                lane_of = self._assign_lanes(day_events)
+                lane_count = max(len(set(lane_of.values())), 1)
+                for ev in day_events:
+                    block = ScheduleBlock(ev, self._view_mode == "day", date=d)
+                    block._window = self
+                    block.clicked.connect(lambda e=ev, dt=d: self._toggle_done(e, dt))
+                    self._grid_area.add_block(block, ci, lane_of[ev["id"]], lane_count)
+        finally:
+            self._rebuilding = False
+
+    def _update_range_label(self, dates):
+        if self._view_mode == "day":
+            d = dates[0]
+            today = datetime_module.date.today()
+            marker = "今天" if d == today else f"{d.month}月{d.day}日"
+            self._range_lbl.setText(f"{marker} 周{self.WEEKDAYS[d.weekday()]}")
+        else:
+            first, last = dates[0], dates[-1]
+            self._range_lbl.setText(f"{first.month}月{first.day}日 - {last.month}月{last.day}日")
+
+    # ---------- 交互 ----------
+
+    def _prev_step(self):
+        step = 1 if self._view_mode == "day" else 7
+        self._center_date -= datetime_module.timedelta(days=step)
+        self._refresh_view()
+
+    def _next_step(self):
+        step = 1 if self._view_mode == "day" else 7
+        self._center_date += datetime_module.timedelta(days=step)
+        self._refresh_view()
+
+    def _go_today(self):
+        self._center_date = datetime_module.date.today()
+        self._refresh_view()
+
+    def _switch_view(self, mode):
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        self._refresh_view()
+
+    def _toggle_done(self, ev, date):
+        """左键单击事件块：切换完成状态（置灰，无删除线），对齐新番"看过"交互。
+
+        锁定态下保留标记能力（对齐新番便签：条目标记不受锁定影响）。
+        重复事件按日期独立记录完成状态（done_dates），单次事件用 done 布尔。
+        """
+        date_str = date.strftime("%Y-%m-%d")
+        if ev.get("repeat") and ev.get("repeat") != "none":
+            done_dates = ev.setdefault("done_dates", {})
+            done_dates[date_str] = not done_dates.get(date_str, False)
+        else:
+            ev["done"] = not ev.get("done", False)
+        self._refresh_view()
+        self._mark_dirty()
+        self.save_data()
+
+    def _show_block_menu(self, ev, global_pos):
+        """事件右键菜单：编辑 / 标记完成 / 删除（样式对齐便签右键菜单）。
+
+        锁定态下隐藏编辑与删除入口（标记切换保留，与左键一致）。
+        """
+        menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)
+        menu.setStyleSheet(
+            "QMenu { background-color: #FAFAFA; border: 1px solid #E0E0E0;"
+            " border-radius: 10px; padding: 6px; }"
+            " QMenu::item { padding: 7px 24px; border-radius: 6px; margin: 1px 3px;"
+            " color: #333333; font-size: 13px; }"
+            " QMenu::item:selected { background-color: #E8F0FE; color: #1A73E8; }"
+            " QMenu::separator { height: 1px; background: #E8E8E8; margin: 4px 12px; }"
+        )
+        # 找到对应日期的 block（右键事件的完成状态按日期判断）
+        date = None
+        for blk, *_ in self._grid_area._blocks:
+            if blk.event_data is ev:
+                date = blk.date
+                break
+        done_now = False
+        if date is not None:
+            if ev.get("repeat") and ev.get("repeat") != "none":
+                done_now = bool((ev.get("done_dates") or {}).get(
+                    date.strftime("%Y-%m-%d"), False))
+            else:
+                done_now = bool(ev.get("done", False))
+        act_toggle = menu.addAction("取消完成" if done_now else "标记完成")
+        act_toggle.triggered.connect(lambda: self._toggle_done(ev, date or self._center_date))
+        if not self.is_locked:
+            menu.addSeparator()
+            act_edit = menu.addAction("编辑事件…")
+            act_edit.triggered.connect(lambda: self._show_event_dialog(ev))
+            # 物化实体（有 batch_id）→ 提供"删除整个重复系列"入口
+            batch_id = ev.get("batch_id")
+            if batch_id:
+                n = sum(1 for e in self._events if e.get("batch_id") == batch_id)
+                act_del_batch = menu.addAction(f"删除整个重复系列（{n} 条）")
+                # ⚠️ triggered 信号会传 bool checked 参数，默认值 b=batch_id 会被覆盖！
+                # 必须显式接收 checked 并默认 False，batch_id 用默认参数捕获。
+                act_del_batch.triggered.connect(
+                    lambda checked=False, b=batch_id: self._delete_event_batch(b))
+            act_del = menu.addAction("删除事件")
+            act_del.triggered.connect(lambda: self._delete_event(ev))
+        menu.exec(global_pos)
+
+    def _delete_event(self, ev):
+        if self.is_locked:
+            return
+        self._events = [e for e in self._events if e.get("id") != ev.get("id")]
+        self._refresh_view()
+        self._mark_dirty()
+        self.save_data()
+
+    def _delete_event_batch(self, batch_id):
+        """删除整个重复系列（batch_id 相同的所有实体）。"""
+        if self.is_locked:
+            return
+        self._events = [e for e in self._events if e.get("batch_id") != batch_id]
+        self._refresh_view()
+        self._mark_dirty()
+        self.save_data()
+
+    # ---------- 新建 / 编辑事件弹窗（对齐事务追踪器新建事务风格）----------
+
+    def _show_event_dialog(self, ev=None):
+        """新建（ev=None）或编辑（ev 为现有事件）事件弹窗。"""
+        if self.is_locked:
+            return
+        editing = ev is not None
+
+        dialog = QDialog(self)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.setAttribute(Qt.WA_TranslucentBackground)
+        # 高度留足：备注栏与底部按钮之间避免重叠（含重复选择 + 提醒两行控件）
+        dialog.setFixedSize(440, 700)
+        dialog.setStyleSheet(
+            "QFrame#sched_dlg_bg { background: #FAFAFA; border-radius: 12px;"
+            " border: 1px solid #EAEAEA; }"
+        )
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(12, 12, 12, 12)
+        dlg_bg = QFrame()
+        dlg_bg.setObjectName("sched_dlg_bg")
+        shadow = QGraphicsDropShadowEffect(dialog)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 6)
+        dlg_bg.setGraphicsEffect(shadow)
+        outer.addWidget(dlg_bg)
+
+        layout = QVBoxLayout(dlg_bg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 自定义标题栏（可拖拽）
+        dlg_bar = QFrame()
+        dlg_bar.setStyleSheet("background: transparent;")
+        dlg_bar.setFixedHeight(45)
+        bar_layout = QHBoxLayout(dlg_bar)
+        bar_layout.setContentsMargins(20, 0, 10, 0)
+        dlg_title = QLabel("编辑事件" if editing else "新建事件")
+        dlg_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #333;"
+            " font-family: 'Microsoft YaHei';"
+        )
+        bar_layout.addWidget(dlg_title)
+        bar_layout.addStretch()
+        dlg_close = QPushButton(icon("close"))
+        set_icon_font(dlg_close, 16)
+        dlg_close.setFixedSize(36, 30)
+        dlg_close.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: #E81123; color: white; }"
+        )
+        dlg_close.clicked.connect(dialog.reject)
+        bar_layout.addWidget(dlg_close)
+        layout.addWidget(dlg_bar)
+
+        dlg_bar._drag_pos = None
+        def _bar_press(e):
+            if e.button() == Qt.LeftButton:
+                dlg_bar._drag_pos = e.globalPosition().toPoint() - dialog.pos()
+                e.accept()
+        def _bar_move(e):
+            if dlg_bar._drag_pos is not None:
+                dialog.move(e.globalPosition().toPoint() - dlg_bar._drag_pos)
+                e.accept()
+        def _bar_release(e):
+            dlg_bar._drag_pos = None
+        dlg_bar.mousePressEvent = _bar_press
+        dlg_bar.mouseMoveEvent = _bar_move
+        dlg_bar.mouseReleaseEvent = _bar_release
+
+        content = QVBoxLayout()
+        content.setContentsMargins(24, 6, 24, 18)
+        content.setSpacing(12)
+        layout.addLayout(content, 1)
+
+        lbl_style = "font-size: 13px; color: #555; font-weight: 600;"
+        input_style = (
+            "QLineEdit, QDateEdit, QTimeEdit { padding: 8px 12px;"
+            " border: 1px solid #D0D0D0; border-radius: 8px; font-size: 14px;"
+            " background: #FFFFFF; }"
+            " QLineEdit:focus, QDateEdit:focus, QTimeEdit:focus { border-color: #1A73E8; }"
+        )
+
+        # 标题
+        title_lbl = QLabel("事件标题")
+        title_lbl.setStyleSheet(lbl_style)
+        title_input = QLineEdit()
+        title_input.setPlaceholderText("例如：团队晨会")
+        title_input.setStyleSheet(input_style)
+        if editing:
+            title_input.setText(ev.get("title", ""))
+        content.addWidget(title_lbl)
+        content.addWidget(title_input)
+
+        # 日期 + 重复（放在同一行，重复在日期栏旁边）
+        date_lbl = QLabel("日期")
+        date_lbl.setStyleSheet(lbl_style)
+        date_edit = QDateEdit()
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        date_edit.setStyleSheet(input_style)
+        if editing:
+            try:
+                date_edit.setDate(QDate.fromString(ev.get("date", ""), "yyyy-MM-dd"))
+            except Exception:
+                date_edit.setDate(QDate.currentDate())
+        else:
+            date_edit.setDate(QDate(self._center_date.year, self._center_date.month, self._center_date.day))
+        repeat_edit = QComboBox()
+        repeat_edit.addItems(["不重复", "每天重复", "每周重复", "每月重复", "每年重复"])
+        repeat_edit.setStyleSheet(
+            "QComboBox { padding: 8px 10px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 13px; background: #FFFFFF; }"
+            " QComboBox:focus { border-color: #1A73E8; }"
+            " QComboBox::drop-down { border: none; width: 22px; }"
+        )
+        if editing:
+            rep = ev.get("repeat", "none")
+            idx = {"none": 0, "daily": 1, "weekly": 2, "monthly": 3, "yearly": 4}.get(rep, 0)
+            repeat_edit.setCurrentIndex(idx)
+        date_row = QHBoxLayout()
+        date_row.setSpacing(8)
+        date_row.addWidget(date_edit, 1)
+        date_row.addWidget(repeat_edit, 1)
+        content.addWidget(date_lbl)
+        content.addLayout(date_row)
+
+        # 时间
+        time_lbl = QLabel("时间")
+        time_lbl.setStyleSheet(lbl_style)
+        time_row = QHBoxLayout()
+        time_row.setSpacing(8)
+        start_edit = QTimeEdit()
+        end_edit = QTimeEdit()
+        for te in (start_edit, end_edit):
+            te.setDisplayFormat("HH:mm")
+            te.setStyleSheet(input_style)
+        if editing:
+            start_edit.setTime(QTime.fromString(ev.get("start", "09:00"), "HH:mm"))
+            end_edit.setTime(QTime.fromString(ev.get("end", "10:00"), "HH:mm"))
+        else:
+            start_edit.setTime(QTime(9, 0))
+            end_edit.setTime(QTime(10, 0))
+        dash = QLabel("至")
+        dash.setStyleSheet("font-size: 13px; color: #888; background: transparent;")
+        time_row.addWidget(start_edit)
+        time_row.addWidget(dash)
+        time_row.addWidget(end_edit)
+        time_row.addStretch()
+        content.addWidget(time_lbl)
+        content.addLayout(time_row)
+
+        # 提醒：提前 X 分钟/小时/天，触发系统通知
+        remind_lbl = QLabel("提醒")
+        remind_lbl.setStyleSheet(lbl_style)
+        remind_row = QHBoxLayout()
+        remind_row.setSpacing(8)
+        remind_enable = QCheckBox("提前")
+        remind_enable.setStyleSheet("font-size: 13px; color: #333;")
+        remind_value = QSpinBox()
+        remind_value.setRange(1, 999)
+        remind_value.setValue(10)
+        remind_value.setStyleSheet(
+            "QSpinBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; }"
+            " QSpinBox:focus { border-color: #1A73E8; }"
+        )
+        remind_unit = QComboBox()
+        remind_unit.addItems(["分钟", "小时", "天"])
+        remind_unit.setStyleSheet(
+            "QComboBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 13px; background: #FFFFFF; }"
+            " QComboBox:focus { border-color: #1A73E8; }"
+            " QComboBox::drop-down { border: none; width: 22px; }"
+        )
+        # 恢复已有提醒设置
+        if editing:
+            rm = ev.get("remind")
+            if rm:
+                remind_enable.setChecked(True)
+                remind_value.setValue(int(rm.get("value", 10)))
+                unit_idx = {"minute": 0, "hour": 1, "day": 2}.get(rm.get("unit", "minute"), 0)
+                remind_unit.setCurrentIndex(unit_idx)
+        else:
+            remind_enable.setChecked(False)
+        remind_hint = QLabel("系统通知")
+        remind_hint.setStyleSheet("font-size: 11px; color: #999; background: transparent;")
+        remind_row.addWidget(remind_enable)
+        remind_row.addWidget(remind_value)
+        remind_row.addWidget(remind_unit)
+        remind_row.addWidget(remind_hint)
+        remind_row.addStretch()
+        content.addWidget(remind_lbl)
+        content.addLayout(remind_row)
+
+        # 颜色
+        color_lbl = QLabel("标记颜色")
+        color_lbl.setStyleSheet(lbl_style)
+        preset_colors = ["#E81123", "#FF8C00", "#107C10", "#0078D7", "#881798", "#333333"]
+        color_btns = []
+        selected_color = [ev.get("color", preset_colors[3]) if editing else preset_colors[3]]
+
+        def on_color_click(c):
+            selected_color[0] = c
+            for b, oc in zip(color_btns, preset_colors):
+                if oc == c:
+                    b.setStyleSheet(
+                        f"QPushButton {{ background-color: {oc}; border-radius: 14px;"
+                        f" border: 3px solid #FFFFFF; outline: 2px solid {oc}; }}"
+                    )
+                else:
+                    b.setStyleSheet(
+                        f"QPushButton {{ background-color: {oc}; border-radius: 14px;"
+                        f" border: 2px solid rgba(0,0,0,0.08); }}"
+                        " QPushButton:hover { border: 2px solid rgba(0,0,0,0.25); }"
+                    )
+
+        color_layout = QHBoxLayout()
+        color_layout.setSpacing(10)
+        for c in preset_colors:
+            btn = QPushButton()
+            btn.setFixedSize(28, 28)
+            btn.setCursor(Qt.PointingHandCursor)
+            if c == selected_color[0]:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {c}; border-radius: 14px;"
+                    f" border: 3px solid #FFFFFF; outline: 2px solid {c}; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {c}; border-radius: 14px;"
+                    f" border: 2px solid rgba(0,0,0,0.08); }}"
+                    " QPushButton:hover { border: 2px solid rgba(0,0,0,0.25); }"
+                )
+            btn.clicked.connect(lambda checked, clr=c: on_color_click(clr))
+            color_layout.addWidget(btn)
+            color_btns.append(btn)
+        color_layout.addStretch()
+        content.addWidget(color_lbl)
+        content.addLayout(color_layout)
+
+        # 备注
+        note_lbl = QLabel("备注（日视图展开显示）")
+        note_lbl.setStyleSheet(lbl_style)
+        note_input = QTextEdit()
+        note_input.setPlaceholderText("可留空")
+        note_input.setFixedHeight(110)
+        note_input.setStyleSheet(
+            "QTextEdit { padding: 8px 12px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 14px; background: #FFFFFF; }"
+            " QTextEdit:focus { border-color: #1A73E8; }"
+        )
+        if editing:
+            note_input.setPlainText(ev.get("note", ""))
+        content.addWidget(note_lbl)
+        content.addWidget(note_input)
+
+        # 弹性空间：把按钮行推到底部，避免与备注栏重叠
+        content.addStretch(1)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet(
+            "QPushButton { padding: 8px 22px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
+        )
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn = QPushButton("保存" if editing else "添加")
+        ok_btn.setStyleSheet(
+            "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+            " QPushButton:pressed { background: #1557B0; }"
+        )
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(ok_btn)
+        content.addLayout(btn_layout)
+
+        if dialog.exec() == QDialog.Accepted:
+            title = title_input.text().strip()
+            if not title:
+                return
+            s_time = start_edit.time().toString("HH:mm")
+            e_time = end_edit.time().toString("HH:mm")
+            if _time_to_min(e_time) <= _time_to_min(s_time):
+                QMessageBox.warning(self, "时间无效", "结束时间必须晚于开始时间。")
+                return
+            date_str = date_edit.date().toString("yyyy-MM-dd")
+            rep = {0: "none", 1: "daily", 2: "weekly", 3: "monthly", 4: "yearly"}[
+                repeat_edit.currentIndex()]
+            # 提醒设置（未启用则为 None）
+            remind = None
+            if remind_enable.isChecked():
+                unit = {0: "minute", 1: "hour", 2: "day"}[remind_unit.currentIndex()]
+                remind = {"value": remind_value.value(), "unit": unit}
+            if editing:
+                ev["title"] = title
+                ev["date"] = date_str
+                ev["start"] = s_time
+                ev["end"] = e_time
+                ev["note"] = note_input.toPlainText().strip()
+                ev["color"] = selected_color[0]
+                ev["repeat"] = rep
+                ev["remind"] = remind
+                if rep != "none":
+                    # 编辑成重复：删除该批次旧实体 + 编辑中的实体本身，重新物化
+                    bid = ev.get("batch_id") or ev["id"]
+                    self._events = [e for e in self._events
+                                    if e.get("batch_id") != bid
+                                    and e.get("id") != ev["id"]]
+                    template = dict(ev)
+                    self._events.extend(self._materialize_repeat(template, bid))
+                else:
+                    ev.pop("batch_id", None)   # 转回单次
+                    ev.pop("done_dates", None)
+            else:
+                new_ev = {
+                    "id": uuid.uuid4().hex[:8],
+                    "title": title,
+                    "date": date_str,
+                    "start": s_time,
+                    "end": e_time,
+                    "note": note_input.toPlainText().strip(),
+                    "color": selected_color[0],
+                    "repeat": rep,
+                    "remind": remind,
+                    "done": False,
+                }
+                if rep != "none":
+                    # 重复事件：自动物化为未来各期实体条目（模板不保留）
+                    batch_id = new_ev["id"]
+                    self._events.extend(self._materialize_repeat(new_ev, batch_id))
+                else:
+                    self._events.append(new_ev)
+            self._refresh_view()
+            self._mark_dirty()
+            self.save_data()
+
+    # ---------- 持久化 ----------
+
+    def _load_schedule(self):
+        """从便签 JSON 的 schedule_data 字段恢复数据。"""
+        if self.save_file and os.path.exists(self.save_file):
+            try:
+                with open(self.save_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                sd = data.get("schedule_data", {})
+                self._view_mode = sd.get("view_mode", "week")
+                self._center_date = datetime_module.date.today()
+                cd = sd.get("center_date", "")
+                if cd:
+                    try:
+                        self._center_date = datetime_module.date.fromisoformat(cd)
+                    except ValueError:
+                        pass
+                self._events = sd.get("events", [])
+            except Exception:
+                pass
+        self._refresh_view()
+
+    def save_data(self):
+        """保存时附加 schedule_data。"""
+        if getattr(self, '_is_loading', False):
+            return
+        if self.width() < 250:
+            return
+        super().save_data()
+        if self.save_file and os.path.exists(self.save_file):
+            try:
+                with open(self.save_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["schedule_data"] = {
+                    "view_mode": self._view_mode,
+                    "center_date": self._center_date.strftime("%Y-%m-%d"),
+                    "events": self._events,
+                }
+                with open(self.save_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+            except Exception:
+                pass
+
+    # ---------- 系统提醒 ----------
+
+    def _next_occurrence(self, ev, today):
+        """计算事件的下一次发生日期（考虑重复规则，>= today）。
+
+        返回 datetime.date 或 None（单次事件已过期）。
+        """
+        try:
+            base = datetime_module.date.fromisoformat(ev.get("date", ""))
+        except ValueError:
+            return None
+        rep = ev.get("repeat", "none")
+        if rep == "none":
+            return base if base >= today else None
+        # 从 base 开始按周期推进到 >= today
+        cur = base
+        guard = 0
+        while cur < today and guard < 4000:
+            if rep == "daily":
+                cur += datetime_module.timedelta(days=1)
+            elif rep == "weekly":
+                cur += datetime_module.timedelta(days=7)
+            elif rep == "monthly":
+                # 平移到下月同日（若下月无此日则取月末）
+                y, m = cur.year, cur.month
+                if m == 12:
+                    y, m = y + 1, 1
+                else:
+                    m += 1
+                import calendar
+                day = min(base.day, calendar.monthrange(y, m)[1])
+                cur = datetime_module.date(y, m, day)
+            elif rep == "yearly":
+                y = cur.year + 1
+                import calendar
+                day = min(base.day, calendar.monthrange(y, base.month)[1])
+                cur = datetime_module.date(y, base.month, day)
+            else:
+                return None
+            guard += 1
+        return cur
+
+    def _check_reminders(self):
+        """定时扫描：到达提醒时间点的事件触发系统通知（避免重复提醒）。
+
+        提醒时间 = 事件开始时间 - 提前量；只提醒"未发生"的事件。
+        """
+        if not self._events:
+            return
+        now = datetime_module.datetime.now()
+        today = now.date()
+        fired_keys = set()
+        for ev in self._events:
+            rm = ev.get("remind")
+            if not rm:
+                continue
+            occur = self._next_occurrence(ev, today)
+            if occur is None:
+                continue
+            try:
+                h, m = (ev.get("start", "09:00")).split(":")
+                start_dt = datetime_module.datetime(
+                    occur.year, occur.month, occur.day, int(h), int(m))
+            except (ValueError, AttributeError):
+                continue
+            # 只提醒未开始的事件
+            if now >= start_dt:
+                continue
+            value = int(rm.get("value", 10))
+            unit = rm.get("unit", "minute")
+            if unit == "minute":
+                remind_dt = start_dt - datetime_module.timedelta(minutes=value)
+            elif unit == "hour":
+                remind_dt = start_dt - datetime_module.timedelta(hours=value)
+            elif unit == "day":
+                remind_dt = start_dt - datetime_module.timedelta(days=value)
+            else:
+                continue
+            if remind_dt <= now:
+                key = (ev.get("id"), occur.strftime("%Y-%m-%d"))
+                if key not in self._remind_fired:
+                    self._remind_fired.add(key)
+                    unit_cn = {"minute": "分钟", "hour": "小时", "day": "天"}.get(unit, "")
+                    global_signaler.schedule_remind_signal.emit(
+                        ev.get("title", "日程提醒"),
+                        f"{occur.strftime('%m月%d日')} {ev.get('start', '')} · "
+                        f"提前{value}{unit_cn}提醒"
+                    )
+            fired_keys.add((ev.get("id"), occur.strftime("%Y-%m-%d")))
+        # 清理已过期（事件已开始/过期）的触发记录，避免内存增长
+        stale = [k for k in self._remind_fired if k not in fired_keys]
+        for k in stale:
+            self._remind_fired.discard(k)
+
+
 class BangumiScheduleWindow(AniNoteWindow):
     """新番便签窗口：原生网格展示追番日历。
 
@@ -3101,6 +4456,7 @@ class BangumiScheduleWindow(AniNoteWindow):
         # 首次创建 / 旧数据：浅蓝主题（替代父类 _init_bangumi_mode 的外观职责）
         if not (self.save_file and os.path.exists(self.save_file)):
             self.is_always_on_top = False
+            self.apply_window_states()   # 属性改了必须同步窗口 flag，否则置顶状态错乱
             self.bg_color = [235, 245, 255, 242]
             self._apply_bg_color()
         self._apply_lock_ui()
@@ -4013,6 +5369,21 @@ def create_global_new_habit():
     tracker.activateWindow()
     tracker.setFocus()
     tracker.save_data()
+    global_signaler.note_updated_signal.emit()
+
+
+def create_global_new_schedule():
+    """全局新建日程表（由控制面板按钮触发）。"""
+    sched = ScheduleWindow()
+    if ACTIVE_NOTES and len(ACTIVE_NOTES) > 1:
+        ref_note = ACTIVE_NOTES[-2]
+        sched.move(ref_note.x() + 40, ref_note.y() + 40)
+    sched.header.title_edit.setText("日程表")
+    sched.resize(760, 520)
+    sched.show()
+    sched.activateWindow()
+    sched.setFocus()
+    sched.save_data()
     global_signaler.note_updated_signal.emit()
 
 
