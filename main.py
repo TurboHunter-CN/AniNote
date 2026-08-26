@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.3.0"
+VERSION = "4.3.1"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -461,6 +461,9 @@ class MarkdownSplitEdit(QWidget):
         self.src.verticalScrollBar().valueChanged.connect(self._on_src_scroll)
         self.preview.verticalScrollBar().valueChanged.connect(self._on_preview_scroll)
 
+        # 预览区双击图片 → 打开文件夹内原图（对齐普通便签"双击查看原图"）
+        self.preview.viewport().installEventFilter(self)
+
     # ---------- 对外 API ----------
 
     def set_base_dir(self, d):
@@ -546,6 +549,20 @@ class MarkdownSplitEdit(QWidget):
         cur.insertText(f"![{os.path.basename(rel_path)}]({rel_path.replace(os.sep, '/')})")
         self.src.setFocus()
 
+    def eventFilter(self, obj, event):
+        """预览区双击图片：用系统默认看图程序打开文件夹内存储的原图。"""
+        if obj is self.preview.viewport() and event.type() == QEvent.MouseButtonDblClick:
+            cursor = self.preview.cursorForPosition(event.pos())
+            fmt = cursor.charFormat()
+            if fmt.isImageFormat():
+                name = fmt.toImageFormat().name()
+                if name:
+                    win = self.parent_window
+                    if win and hasattr(win, "_open_image_external"):
+                        win._open_image_external(name)
+                    return True
+        return super().eventFilter(obj, event)
+
     # ---------- 内部 ----------
 
     def _on_src_changed(self):
@@ -555,8 +572,15 @@ class MarkdownSplitEdit(QWidget):
 
     def _do_render(self):
         from markdown_conv import md_to_html
+        base = self._base_dir
+        # 兜底：base_dir 未设置（如新建 MD 便签尚未保存）时从父窗口 save_file 推断
+        if not base:
+            win = self.parent_window
+            if win and getattr(win, "save_file", ""):
+                base = os.path.dirname(win.save_file).replace("\\", "/")
+                self._base_dir = base
         md = self.src.toPlainText()
-        html = md_to_html(md, self._base_dir)
+        html = md_to_html(md, base)
         self._rendering = True
         self.preview.setHtml(html)
         self._rendering = False
@@ -1020,6 +1044,8 @@ class AniNoteWindow(QWidget):
     
     # --- 字体与颜色控制接口 ---
     def change_font_family(self, font):
+        if not hasattr(self, "text_edit"):
+            return  # 初始化早期信号（font_combo 默认字体）触发时 text_edit 尚未创建
         fmt = self.text_edit.currentCharFormat()
         fmt.setFontFamily(font.family())
         self.text_edit.mergeCurrentCharFormat(fmt)
@@ -1422,6 +1448,8 @@ class AniNoteWindow(QWidget):
         if getattr(self, 'editor_host', None) and self.editor_host.is_md:
             # MD 模式：插入 Markdown 图片语法，右侧实时渲染
             rel = os.path.basename(dest).replace(os.sep, '/')
+            # 同步 base_dir 到实际图片目录（新建便签未保存时 save_file 为空，渲染会缺 base_dir）
+            self.editor_host.md_view.set_base_dir(img_dir.replace(os.sep, '/'))
             self.editor_host.md_view.insert_image_syntax(rel)
             self._mark_dirty()
             return
@@ -1610,6 +1638,25 @@ class AniNoteWindow(QWidget):
         dlg.adjustSize()
         dlg.exec()
 
+    def _open_image_external(self, src):
+        """用系统默认看图程序打开文件夹内存储的原图（MD 预览双击）。
+
+        MD 渲染的缩略图不够清晰，直接打开磁盘上的原图文件供查看。
+        """
+        if src.startswith("file:///"):
+            full_path = urllib.parse.unquote(src[len("file:///"):])
+            full_path = full_path.replace('/', os.sep)
+        elif src.startswith("file://"):
+            full_path = urllib.parse.unquote(src[len("file://"):])
+            full_path = full_path.replace('/', os.sep)
+        else:
+            full_path = os.path.join(self._note_image_dir(), src)
+        if os.path.exists(full_path):
+            try:
+                os.startfile(full_path)
+            except OSError:
+                pass
+
     def show_context_menu(self, pos):
         """构建并显示右键上下文菜单。"""
         # 坐标基准：信号来自哪个控件就用哪个控件映射（MD 源码区/预览区相对窗口有偏移）
@@ -1749,7 +1796,8 @@ class AniNoteWindow(QWidget):
     def _set_markdown_mode(self, enable):
         """核心切换逻辑：双格式双写缓存，切换瞬间零转换。
 
-        普通 → MD：富文本转 MD 源码装载（图片转相对路径）。
+        普通 → MD：优先复用 md_view 内存中保留的 Markdown 源码（零丢失）；
+                  仅当 MD 源码为空、或普通模式被编辑过（指纹变化）时才重新转换。
         MD → 普通：源码未改 → 直接用缓存 HTML（零损失）；改过 → 才用新渲染。
         """
         if enable == self.editor_host.is_md:
@@ -1758,9 +1806,18 @@ class AniNoteWindow(QWidget):
         if self.save_file:
             note_dir = os.path.dirname(self.save_file).replace('\\', '/')
         if enable:
-            from markdown_conv import doc_to_markdown
-            md_src = doc_to_markdown(self.text_edit.document(), note_dir)
-            self.editor_host.md_view.set_markdown(md_src, note_dir)
+            md_existing = self.editor_host.md_view.markdown_text().strip()
+            use_existing = bool(md_existing)
+            if use_existing and hasattr(self, '_rich_fp_at_leave'):
+                # 普通模式被编辑过 → 重新转换同步新内容；否则复用 MD 源码保留语法细节
+                if self._rich_fingerprint() != self._rich_fp_at_leave:
+                    use_existing = False
+            if use_existing:
+                self.editor_host.md_view.set_markdown(md_existing, note_dir)
+            else:
+                from markdown_conv import doc_to_markdown
+                md_src = doc_to_markdown(self.text_edit.document(), note_dir)
+                self.editor_host.md_view.set_markdown(md_src, note_dir)
             self.editor_host.rich_view.hide()
             self.editor_host.md_view.show()
             if hasattr(self, 'src_vis_btn'):
@@ -1784,6 +1841,8 @@ class AniNoteWindow(QWidget):
                 self.text_edit.setHtml(html)
             self.editor_host.md_view.hide()
             self.editor_host.rich_view.show()
+            # 记录离开 MD 时的富文本指纹，供切回时判断普通模式是否被编辑
+            self._rich_fp_at_leave = self._rich_fingerprint()
         self.editor_host.is_md = enable
         self._apply_md_toolbar(enable)
         if hasattr(self, 'md_btn'):
@@ -1791,6 +1850,13 @@ class AniNoteWindow(QWidget):
         if not enable and hasattr(self, 'src_vis_btn'):
             self.src_vis_btn.hide()
         self._mark_dirty()
+
+    def _rich_fingerprint(self):
+        """当前富文本内容的指纹（切换 MD 时判断普通模式是否被编辑过）。"""
+        try:
+            return self.text_edit.document().toHtml()
+        except Exception:
+            return ""
     
     def _apply_bg_color(self):
         """将当前的背景色和透明度动态渲染到便签底板上。"""
