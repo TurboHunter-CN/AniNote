@@ -26,7 +26,7 @@ AUTH_URL = "https://bgm.tv/oauth/authorize"
 TOKEN_URL = "https://bgm.tv/oauth/access_token"
 REDIRECT_PORT = 18521
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
-UA = "HunterHasCome/AniNote/4.1.2 (https://github.com/TurboHunter-CN/AniNote)"
+UA = "HunterHasCome/AniNote/4.3.0 (https://github.com/TurboHunter-CN/AniNote)"
 
 # Bangumi 剧集收藏类型（EpisodeCollectionType，实测确认）
 # 注意：对已「看过」(2) 的集，只有降回 0（未收藏）才会真正撤销；1（想看）会被忽略
@@ -39,6 +39,23 @@ EP_COLLECT_TYPE_DISCARDED = 3       # 抛弃
 # 说明：OAuth 授权码模式下 access_token 归各用户授权后存于本机，secret 仅作应用身份标识，
 DEFAULT_CLIENT_ID = "bgm69226a8530a0beef3"
 DEFAULT_CLIENT_SECRET = "ff1e62344f711fba6809d088c7a598c8"
+
+# 配置持久化回调（由 main.py 注入 save_config，token 续期成功后落盘）
+_config_saver = None
+
+
+def set_config_saver(fn):
+    """注入配置保存回调（main.py 传入 save_config）。"""
+    global _config_saver
+    _config_saver = fn
+
+
+def _persist_cfg(cfg):
+    if _config_saver is not None:
+        try:
+            _config_saver(cfg)
+        except Exception:
+            pass
 
 
 def _creds(oauth):
@@ -172,16 +189,20 @@ def refresh_access_token(refresh_token, client_id, client_secret, proxy_str=""):
 # ---------- Token 生命周期 ----------
 
 def get_valid_token(cfg, proxy_str=""):
-    """返回可用 access_token（必要时自动刷新）；未授权/失败返回 None。
+    """返回可用 access_token（必要时自动刷新）；未授权/刷新失败返回 None。
 
-    cfg: 配置字典（含 bangumi_oauth）。
+    - expires_at 缺失的旧授权数据也会尝试刷新（过期是常态，不依赖字段存在）
+    - 刷新成功后写回 cfg（save_oauth）并落盘（set_config_saver 注入的回调）
+    - 刷新失败打印原因并返回 None，调用方应提示用户重新授权
     """
     oauth = load_oauth(cfg)
     token = oauth.get("access_token", "")
     if not token:
         return None
     exp = oauth.get("expires_at", 0)
-    if exp and time.time() > exp - 300:  # 提前 5 分钟刷新
+    now = time.time()
+    # 缺失 expires_at 或已临期/过期（提前 5 分钟）→ 尝试用 refresh_token 续期
+    if (not exp) or (now > exp - 300):
         cid, sec = _creds(oauth)
         rf = oauth.get("refresh_token", "")
         if cid and sec and rf:
@@ -190,8 +211,16 @@ def get_valid_token(cfg, proxy_str=""):
                 oauth["access_token"] = data.get("access_token", token)
                 oauth["refresh_token"] = data.get("refresh_token", rf)
                 oauth["expires_at"] = int(time.time()) + int(data.get("expires_in", 604800))
-            except Exception:
-                pass
+                # 写回 cfg 并落盘，避免重启后仍用旧 token
+                save_oauth(cfg, oauth)
+                _persist_cfg(cfg)
+            except Exception as e:
+                print(f"[AniNote] Bangumi token 刷新失败: {e}")
+                return None
+        elif exp and now > exp:
+            # 已过期且缺少 refresh_token/凭证 → 无法自动续期，明确失败提示重新授权
+            return None
+        # exp 缺失且无法续期：无法判断是否过期，交给 API 决定（兼容令牌登录等场景）
     return oauth.get("access_token")
 
 

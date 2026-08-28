@@ -396,8 +396,17 @@ def main():
     else:
         BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
     icon_path = os.path.join(BASE_DIR, 'Newicon.ico')
+    # 应用级窗口图标：任务栏/标题栏默认使用 Newicon（源码运行时覆盖 python.exe 默认图标）
+    app.setWindowIcon(QIcon(icon_path))
     tray_icon = QSystemTrayIcon(QIcon(icon_path), app)
     tray_icon.setToolTip(f"AniNote v{note_app.VERSION}")
+
+    def _set_win_icon(win):
+        """无边框窗口在 Windows 上不继承应用级图标，需每个窗口显式设置。"""
+        try:
+            win.setWindowIcon(QIcon(icon_path))
+        except Exception:
+            pass
 
     cfg = note_app.load_config()
     set_autostart(cfg["autostart"])
@@ -557,6 +566,7 @@ def main():
                 note = note_app.ScheduleWindow(note_id=note_id)
             else:
                 note = note_app.AniNoteWindow(note_id=note_id)
+            _set_win_icon(note)
             if getattr(note, 'is_hidden', False):
                 note.hide()
             else:
@@ -566,6 +576,7 @@ def main():
 
     # 控制面板
     panel = cp_app.ControlPanel()
+    _set_win_icon(panel)
     
     def show_and_focus_panel():
         panel.refresh_notes_wall()

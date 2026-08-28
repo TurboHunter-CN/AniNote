@@ -17,12 +17,12 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.3.1"
+VERSION = "4.3.2"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFrame, QMenu, QGraphicsDropShadowEffect, QPushButton,
-    QColorDialog, QMessageBox, QSizePolicy,
+    QColorDialog, QMessageBox, QSizePolicy, QToolTip,
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
     QFileDialog, QDialogButtonBox, QCheckBox, QPlainTextEdit, QSplitter,
@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint
 from PySide6.QtGui import (
     QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage,
-    QPainter, QPen, QBrush, QSyntaxHighlighter, QTextCharFormat,
+    QPainter, QPen, QBrush, QSyntaxHighlighter, QTextCharFormat, QPolygon,
+    QIcon,
 )
 from PySide6.QtSvg import QSvgRenderer
 
@@ -46,6 +47,23 @@ else:
 
 SAVE_DIR = os.path.join(BASE_DIR, "notes_data")
 CONFIG_FILE = os.path.join(BASE_DIR, "aninote_config.json")
+
+
+def app_window_icon():
+    """返回应用窗口图标（Newicon）。
+
+    兼容源码运行与 PyInstaller 打包：frozen 时 ico 被打进 _MEIPASS（--add-data），
+    exe 同目录反而不一定有；源码运行时在项目根目录。
+    """
+    if getattr(sys, 'frozen', False):
+        p = os.path.join(sys._MEIPASS, 'Newicon.ico')
+    else:
+        p = os.path.join(BASE_DIR, 'Newicon.ico')
+    if os.path.exists(p):
+        return QIcon(p)
+    return QIcon()
+
+
 ACTIVE_NOTES = []
 _TOGGLE_HIDDEN_NOTES = set()   # 记录被「全局隐藏」操作隐藏的便签 ID，用于恢复时只显示这些
 
@@ -85,6 +103,11 @@ def save_config(cfg):
     """将配置字典写入 JSON 文件。"""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=4)
+
+
+# 注入配置持久化回调：bangumi_oauth 刷新 token 成功后自动落盘
+import bangumi_oauth as _bangumi_oauth
+_bangumi_oauth.set_config_saver(save_config)
 
 
 # 启动时立即解析存储目录：若为 "default"，则固定解析为 BASE_DIR 下的 notes_data。
@@ -1318,61 +1341,130 @@ class AniNoteWindow(QWidget):
         global_signaler.note_updated_signal.emit()
 
     def _open_note_hotkey_dialog(self):
-        """打开便签独立快捷键设置对话框。"""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("便签快捷键设置")
-        dlg.setFixedSize(400, 200)
-        dlg.setStyleSheet("QDialog { background: #FAFAFA; }")
+        """打开便签设置对话框（无边框圆角 + 阴影 + 可拖拽标题栏，对齐便签弹窗风格）。
 
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(12)
+        通用内容：便签专属快捷键；子类可通过 _append_extra_settings / _save_extra_settings
+        扩展附加设置（如日程表的起始周）。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dlg.setAttribute(Qt.WA_TranslucentBackground)
+        dlg.setFixedSize(430, 370)
+        dlg.setStyleSheet(
+            "QFrame#note_dlg_bg { background: #FAFAFA; border-radius: 12px;"
+            " border: 1px solid #EAEAEA; }"
+        )
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(12, 12, 12, 12)
+        dlg_bg = QFrame()
+        dlg_bg.setObjectName("note_dlg_bg")
+        shadow = QGraphicsDropShadowEffect(dlg)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 6)
+        dlg_bg.setGraphicsEffect(shadow)
+        outer.addWidget(dlg_bg)
+
+        layout = QVBoxLayout(dlg_bg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 自定义标题栏（可拖拽）
+        dlg_bar = QFrame()
+        dlg_bar.setStyleSheet("background: transparent;")
+        dlg_bar.setFixedHeight(45)
+        bar_layout = QHBoxLayout(dlg_bar)
+        bar_layout.setContentsMargins(20, 0, 10, 0)
+        dlg_title = QLabel("便签设置")
+        dlg_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #333;"
+            " font-family: 'Microsoft YaHei';"
+        )
+        bar_layout.addWidget(dlg_title)
+        bar_layout.addStretch()
+        dlg_close = QPushButton(icon("close"))
+        set_icon_font(dlg_close, 16)
+        dlg_close.setFixedSize(36, 30)
+        dlg_close.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; background-color: transparent;"
+            " font-size: 14px; color: #555; }"
+            " QPushButton:hover { background-color: #E81123; color: white; }"
+        )
+        dlg_close.clicked.connect(dlg.reject)
+        bar_layout.addWidget(dlg_close)
+        layout.addWidget(dlg_bar)
+
+        dlg_bar._drag_pos = None
+
+        def _bar_press(e):
+            if e.button() == Qt.LeftButton:
+                dlg_bar._drag_pos = e.globalPosition().toPoint() - dlg.pos()
+                e.accept()
+        def _bar_move(e):
+            if dlg_bar._drag_pos is not None:
+                dlg.move(e.globalPosition().toPoint() - dlg_bar._drag_pos)
+                e.accept()
+        def _bar_release(e):
+            dlg_bar._drag_pos = None
+        dlg_bar.mousePressEvent = _bar_press
+        dlg_bar.mouseMoveEvent = _bar_move
+        dlg_bar.mouseReleaseEvent = _bar_release
+
+        content = QVBoxLayout()
+        content.setContentsMargins(24, 6, 24, 18)
+        content.setSpacing(12)
+        layout.addLayout(content, 1)
+
+        input_style = (
+            "QLineEdit, QDateEdit { padding: 8px 12px;"
+            " border: 1px solid #D0D0D0; border-radius: 8px; font-size: 14px;"
+            " background: #FFFFFF; }"
+            " QLineEdit:focus, QDateEdit:focus { border-color: #1A73E8; }"
+        )
+        btn_style = (
+            "QPushButton { padding: 8px 22px; border: 1px solid #D0D0D0;"
+            " border-radius: 8px; background: #FFFFFF; font-size: 13px; color: #555; }"
+            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
+        )
+        ok_style = (
+            "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
+            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
+            " QPushButton:hover { background: #1765CC; }"
+            " QPushButton:pressed { background: #1557B0; }"
+        )
 
         info = QLabel(f"便签「{self.header.title_edit.text()}」专属快捷键")
         info.setStyleSheet("font-size: 13px; color: #555; font-weight: 600;")
-        layout.addWidget(info)
+        content.addWidget(info)
 
         current = getattr(self, '_note_hotkey', '')
         input_field = QLineEdit(current)
         input_field.setPlaceholderText("例：alt+1")
-        input_field.setStyleSheet(
-            "QLineEdit {"
-            " padding: 8px 12px;"
-            " border: 1px solid #D0D0D0;"
-            " border-radius: 8px;"
-            " font-size: 14px;"
-            " background: #FFFFFF;"
-            " }"
-            " QLineEdit:focus { border-color: #1A73E8; }"
-        )
-        layout.addWidget(input_field)
+        input_field.setStyleSheet(input_style)
+        content.addWidget(input_field)
 
         hint = QLabel("留空则不设置快捷键")
         hint.setStyleSheet("font-size: 12px; color: #999;")
-        layout.addWidget(hint)
-        layout.addStretch()
+        content.addWidget(hint)
+
+        # 子类附加设置（日程表：起始周）
+        self._append_extra_settings(content)
+
+        content.addStretch(1)
 
         # 按钮行
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         btn_row.addStretch()
         cancel_btn = QPushButton("取消")
-        cancel_btn.setStyleSheet(
-            "QPushButton { padding: 8px 22px; border: 1px solid #D0D0D0;"
-            " border-radius: 8px; background: #FFFFFF; font-size: 13px; color: #555; }"
-            " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
-        )
+        cancel_btn.setStyleSheet(btn_style)
         cancel_btn.clicked.connect(dlg.reject)
         btn_row.addWidget(cancel_btn)
         ok_btn = QPushButton("确定")
-        ok_btn.setStyleSheet(
-            "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
-            " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
-            " QPushButton:hover { background: #1765CC; }"
-            " QPushButton:pressed { background: #1557B0; }"
-        )
+        ok_btn.setStyleSheet(ok_style)
         btn_row.addWidget(ok_btn)
-        layout.addLayout(btn_row)
+        content.addLayout(btn_row)
 
         def do_register():
             text = input_field.text().strip()
@@ -1391,17 +1483,25 @@ class AniNoteWindow(QWidget):
                             self._mark_dirty()
                             dlg.reject()
                             return
+                    self._save_extra_settings()
                     global_signaler.register_note_hotkey.emit(self.note_id, text)
                     self._mark_dirty()
                     dlg.accept()
                 global_signaler.check_hotkey_conflict.emit(text, on_conflict_result)
             else:
+                self._save_extra_settings()
                 self._mark_dirty()
                 dlg.accept()
 
         ok_btn.clicked.connect(do_register)
         cancel_btn.clicked.connect(dlg.reject)
         dlg.exec()
+
+    def _append_extra_settings(self, content):
+        """子类扩展设置行（默认无）。"""
+
+    def _save_extra_settings(self):
+        """子类保存扩展设置（默认无操作）。"""
 
     # ---------- 图片管理 ----------
 
@@ -1997,6 +2097,15 @@ class AniNoteWindow(QWidget):
         # 清理未被引用的图片文件
         _cleanup_orphan_images(note_dir, html)
 
+        # MD 切半状态下的原始全宽/最小宽（仅源码隐藏时记录，供重启后还原）
+        md_full_w = 0
+        md_min_w = 0
+        if getattr(self, 'editor_host', None) and self.editor_host.is_md:
+            mdv = self.editor_host.md_view
+            if mdv._saved_full_width:
+                md_full_w = mdv._saved_full_width
+                md_min_w = mdv._orig_min_width
+
         data = {
             "note_id": self.note_id,
             "title": title,
@@ -2010,6 +2119,9 @@ class AniNoteWindow(QWidget):
             "is_hidden": getattr(self, 'is_hidden', False),
             "bg_color": self.bg_color,
             "note_hotkey": getattr(self, '_note_hotkey', ''),
+            # 持久化 MD 切半前的原始全宽（重启后避免二次切半，解除锁定可还原全宽）
+            "md_full_width": md_full_w,
+            "md_orig_min_width": md_min_w,
         }
         with open(self.save_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -2083,6 +2195,13 @@ class AniNoteWindow(QWidget):
                         note_dir = os.path.dirname(self.save_file).replace('\\', '/')
                         self.editor_host.md_view.set_markdown(
                             data.get("content_md", ""), note_dir
+                        )
+                        # 恢复切半前的原始全宽（重启后避免二次切半，解锁可还原全宽）
+                        self.editor_host.md_view._saved_full_width = (
+                            data.get("md_full_width", 0) or 0
+                        )
+                        self.editor_host.md_view._orig_min_width = (
+                            data.get("md_orig_min_width", 0) or 320
                         )
                         self.editor_host.md_view.show()
                         self.editor_host.rich_view.hide()
@@ -3143,11 +3262,16 @@ class ScheduleDayHeader(QWidget):
         super().__init__(parent)
         self.dates = []
         self.time_col_w = 44
+        self.week_no = None        # 当前周数（锚点周=第1周；None=不显示）
         self.setFixedHeight(self.HEADER_H)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def set_dates(self, dates):
         self.dates = dates
+        self.update()
+
+    def set_week_no(self, week_no):
+        self.week_no = week_no
         self.update()
 
     def paintEvent(self, event):
@@ -3158,6 +3282,16 @@ class ScheduleDayHeader(QWidget):
             return
         col_w = (self.width() - self.time_col_w) / n
         today = datetime_module.date.today()
+        # 左侧时间刻度列：周视图且有锚点周时显示「第 N 周」
+        if n > 1 and self.week_no is not None:
+            painter.save()
+            painter.setPen(QColor(150, 150, 150))
+            f = painter.font()
+            f.setPixelSize(10)
+            painter.setFont(f)
+            painter.drawText(QRect(0, 0, self.time_col_w, self.HEADER_H),
+                             Qt.AlignCenter, f"第{self.week_no}周")
+            painter.restore()
         for c, d in enumerate(self.dates):
             x0 = int(self.time_col_w + c * col_w)
             x1 = int(self.time_col_w + (c + 1) * col_w)
@@ -3216,6 +3350,8 @@ class ScheduleGridArea(QWidget):
         self.MIN_HOUR_H = 18          # 每小时最小像素（防止过度压缩）
         self.MAX_HOUR_H = 80          # 每小时最大像素（拉长时行距更宽，清晰度更高）
         self._updating_scale = False  # 防 setMinimumHeight 触发递归 resize
+        self.show_now_line = False    # 当前视图包含今天时绘制"现在"时间指示线
+        self.setMouseTracking(True)   # hover 左侧时间指针时浮出当前时间
         self.setMinimumHeight(120)
 
     # ---------- 几何 ----------
@@ -3331,7 +3467,40 @@ class ScheduleGridArea(QWidget):
             x = self.time_col_w + int(c * col_w)
             painter.setPen(QPen(QColor(240, 240, 240), 1))
             painter.drawLine(x, self.pad_top, x, self.height() - self.pad_bottom)
+        # 当前时间指示线（浅灰细线横跨 + 左侧小箭头指针），仅当前视图包含今天时绘制
+        if self.show_now_line:
+            import datetime as _dt
+            _now = _dt.datetime.now()
+            _mins = _now.hour * 60 + _now.minute
+            if self.axis_start <= _mins <= self.axis_end:
+                _y = self.pad_top + int((_mins - self.axis_start) / 60 * self.hour_h)
+                painter.setPen(QPen(QColor(192, 192, 192), 0.8))
+                painter.drawLine(self.time_col_w, _y, self.width(), _y)
+                # 左侧小箭头指针（实心三角，尖端指向时间线起点；仅约两个数字宽，不横跨整个刻度列）
+                _aw = 15
+                _tri = QPolygon()
+                _tri << QPoint(self.time_col_w - _aw, _y - 4) \
+                     << QPoint(self.time_col_w - _aw, _y + 4) \
+                     << QPoint(self.time_col_w - 3, _y)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(192, 192, 192))
+                painter.drawPolygon(_tri)
         super().paintEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """悬停在左侧时间指针附近时，浮出当前时间（精确到分钟）。"""
+        if self.show_now_line:
+            pos = event.pos()
+            if pos.x() < self.time_col_w + 6:
+                import datetime as _dt
+                _now = _dt.datetime.now()
+                _mins = _now.hour * 60 + _now.minute
+                if self.axis_start <= _mins <= self.axis_end:
+                    _y = self.pad_top + int((_mins - self.axis_start) / 60 * self.hour_h)
+                    if abs(pos.y() - _y) < 10:
+                        QToolTip.showText(event.globalPos(), _now.strftime("%H:%M"))
+                        return
+        super().mouseMoveEvent(event)
 
 
 class ScheduleBlock(QFrame):
@@ -3473,6 +3642,7 @@ class ScheduleWindow(AniNoteWindow):
         self._center_date = datetime_module.date.today()
         self._events = []             # [{id, title, date, start, end, note, color, done}]
         self._rebuilding = False      # 防 resizeEvent 递归
+        self._anchor_week = None      # 起始周锚点（该周周一，date 或 None；None=未设置）
 
         # 网格（插入到 text_edit 原位置）
         self._build_schedule_grid()
@@ -3500,6 +3670,17 @@ class ScheduleWindow(AniNoteWindow):
         self._remind_timer.timeout.connect(self._check_reminders)
         self._remind_timer.start()
 
+        # 当前时间指示线：每 30 秒重绘一次（分钟级平滑移动）
+        self._now_timer = QTimer(self)
+        self._now_timer.setInterval(30000)
+        self._now_timer.timeout.connect(self._refresh_now_line)
+        self._now_timer.start()
+
+    def _refresh_now_line(self):
+        """重绘当前时间指示线（30 秒定时触发，随真实时间前进）。"""
+        if hasattr(self, '_grid_area'):
+            self._grid_area.update()
+
     def _init_bangumi_mode(self):
         pass
 
@@ -3517,6 +3698,56 @@ class ScheduleWindow(AniNoteWindow):
     # 网格模式无文本编辑区：字体格式操作一律忽略
     def change_font_family(self, font):
         pass
+
+    # ---------- 便签设置（起始周/锚点周） ----------
+
+    def _append_extra_settings(self, content):
+        """日程表附加设置行：起始周（锚点周）。"""
+        lbl = QLabel("起始周（锚点周）")
+        lbl.setStyleSheet("font-size: 13px; color: #555; font-weight: 600;")
+        content.addWidget(lbl)
+
+        self._anchor_enable = QCheckBox("启用：该周视为第 1 周")
+        self._anchor_enable.setStyleSheet("font-size: 12px; color: #333;")
+        self._anchor_enable.setChecked(self._anchor_week is not None)
+        content.addWidget(self._anchor_enable)
+
+        self._anchor_edit = QDateEdit()
+        self._anchor_edit.setCalendarPopup(True)
+        self._anchor_edit.setDisplayFormat("yyyy-MM-dd")
+        if self._anchor_week:
+            d = self._anchor_week
+            self._anchor_edit.setDate(QDate(d.year, d.month, d.day))
+        else:
+            self._anchor_edit.setDate(QDate.currentDate())
+        self._anchor_edit.setStyleSheet(
+            "QDateEdit { padding: 8px 12px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 14px; background: #FFFFFF; }"
+            " QDateEdit:focus { border-color: #1A73E8; }"
+        )
+        self._anchor_edit.setEnabled(self._anchor_week is not None)
+        self._anchor_enable.toggled.connect(self._anchor_edit.setEnabled)
+        content.addWidget(self._anchor_edit)
+
+        hint = QLabel("选择该周任意一天即可（自动取周一为锚点）；"
+                      "周视图表头与每周重复的起始/结束周按它计算第 N 周")
+        hint.setStyleSheet("font-size: 11px; color: #999;")
+        hint.setWordWrap(True)
+        content.addWidget(hint)
+
+    def _save_extra_settings(self):
+        """保存起始周设置：勾选则取所选日期所在周的周一为锚点，否则清除。"""
+        if not hasattr(self, '_anchor_enable'):
+            return
+        if self._anchor_enable.isChecked():
+            qd = self._anchor_edit.date()
+            d = datetime_module.date(qd.year(), qd.month(), qd.day())
+            self._anchor_week = d - datetime_module.timedelta(days=d.weekday())
+        else:
+            self._anchor_week = None
+        self._mark_dirty()
+        self.save_data()
+        self._refresh_view()
 
     def change_font_size(self, size):
         pass
@@ -3730,6 +3961,9 @@ class ScheduleWindow(AniNoteWindow):
             repeat = ev.get("repeat", "none")
             if date < base:
                 continue
+            # 兼容旧数据（repeat 未物化的周期事件）也应用重复边界
+            if repeat != "none" and not self._in_repeat_bounds(date, ev):
+                continue
             if repeat == "daily":
                 out.append(ev)
             elif repeat == "weekly":
@@ -3799,22 +4033,86 @@ class ScheduleWindow(AniNoteWindow):
             return date.month == base.month and date.day == base.day
         return False
 
+    def _week_number(self, d):
+        """返回 d 所在周的周数（锚点周 = 第 1 周）。
+
+        未设置锚点 / d 早于锚点周 → 返回 None（无特别显示）。
+        """
+        aw = self._anchor_week
+        if not aw:
+            return None
+        monday = d - datetime_module.timedelta(days=d.weekday())
+        if monday < aw:
+            return None
+        return (monday - aw).days // 7 + 1
+
+    def _in_repeat_bounds(self, cur, ev):
+        """判断 cur 是否在事件的重复边界内（终止日期 / 周数 / 年份）。
+
+        边界字段均可选（缺失 = 不限）：
+          repeat_until : 终止日期（每天/每月/每周）
+          week_start/end : 起始/结束周数（每周，需设置锚点周才生效）
+          year_start/end : 起始/终止年（每年）
+        """
+        until = ev.get("repeat_until") or ""
+        if until:
+            try:
+                if cur > datetime_module.date.fromisoformat(until):
+                    return False
+            except ValueError:
+                pass
+        if self._anchor_week:
+            ws = int(ev.get("week_start") or 0)
+            we = int(ev.get("week_end") or 0)
+            if ws or we:
+                n = self._week_number(cur)
+                if n is None:
+                    return False  # 锚点周之前
+                if ws and n < ws:
+                    return False
+                if we and n > we:
+                    return False
+        ys = int(ev.get("year_start") or 0)
+        ye = int(ev.get("year_end") or 0)
+        if ys and cur.year < ys:
+            return False
+        if ye and cur.year > ye:
+            return False
+        return True
+
     def _materialize_repeat(self, ev, batch_id):
-        """将重复事件物化为实体条目（起始日 → 起始日 + 400 天）。
+        """将重复事件物化为实体条目（起始日 → 起始日 + 400 天，受重复边界限制）。
 
         每个匹配日期生成一条独立实体（repeat 置 none、独立 id、共享 batch_id），
         让每个日子都有真实条目，可单独编辑 / 删除 / 标记完成。
         done_dates 按日期映射到对应实体的 done。
+        重复边界（repeat_until / week_start/end / year_start/end）在此过滤。
         """
         base = datetime_module.date.fromisoformat(ev["date"])
         end = base + datetime_module.timedelta(days=400)
+        # 物化窗口按重复边界延伸：终止日期 / 每年终止年（默认 400 天不够覆盖）
+        until = ev.get("repeat_until") or ""
+        if until:
+            try:
+                u = datetime_module.date.fromisoformat(until)
+                if u > end:
+                    end = u
+            except ValueError:
+                pass
+        if ev.get("repeat") == "yearly":
+            ye = int(ev.get("year_end") or 0)
+            if ye:
+                ye_end = datetime_module.date(ye, 12, 31)
+                if ye_end > end:
+                    end = ye_end
         done_dates = ev.get("done_dates") or {}
         rep = ev.get("repeat", "none")
         items = []
         cur = base
         guard = 0
-        while cur <= end and guard < 500:
-            if self._repeat_matches(cur, base, rep):
+        while cur <= end and guard < 4000:
+            if (self._repeat_matches(cur, base, rep)
+                    and self._in_repeat_bounds(cur, ev)):
                 item = dict(ev)
                 item["id"] = uuid.uuid4().hex[:8]
                 item["date"] = cur.strftime("%Y-%m-%d")
@@ -3843,6 +4141,17 @@ class ScheduleWindow(AniNoteWindow):
             self._grid_area.set_axis(axis_start, axis_end)
             self._grid_area.set_day_cols(len(dates))
             self._day_header.set_dates(dates)
+            # 周视图：表头左侧显示「第 N 周」（锚点周起的周数，早于锚点或未设置则不显示）
+            if self._view_mode == "week" and len(dates) > 1:
+                self._day_header.set_week_no(self._week_number(dates[0]))
+            else:
+                self._day_header.set_week_no(None)
+            # 当前视图包含今天 → 显示"现在"时间指示线（日视图=今天，周视图=本周）
+            _today = datetime_module.date.today()
+            self._grid_area.show_now_line = (
+                (self._view_mode == "day" and dates and dates[0] == _today)
+                or (self._view_mode == "week" and _today in dates)
+            )
             # 首次构建后同步表头宽度（viewport 宽度此时已确定）
             self._sync_day_header_width()
 
@@ -4135,6 +4444,186 @@ class ScheduleWindow(AniNoteWindow):
         content.addWidget(time_lbl)
         content.addLayout(time_row)
 
+        # ---- 重复边界（按重复类型动态显示）----
+        # 每天：终止日期
+        bound_daily = QWidget()
+        bd_row = QHBoxLayout(bound_daily)
+        bd_row.setContentsMargins(0, 0, 0, 0)
+        bd_row.setSpacing(8)
+        bd_label = QLabel("终止日期")
+        bd_label.setStyleSheet(lbl_style)
+        bd_infinite = QCheckBox("无限")
+        bd_infinite.setStyleSheet("font-size: 13px; color: #333;")
+        bd_infinite.setChecked(True)
+        bd_date = QDateEdit()
+        bd_date.setCalendarPopup(True)
+        bd_date.setDisplayFormat("yyyy-MM-dd")
+        bd_date.setStyleSheet(input_style)
+        bd_date.setDate(date_edit.date())
+        bd_date.setEnabled(False)
+        # 勾选"无限"→ 日期禁用；取消 → 可选终止日期
+        bd_infinite.toggled.connect(lambda checked: bd_date.setEnabled(not checked))
+        if editing and ev.get("repeat_until"):
+            try:
+                bd_date.setDate(QDate.fromString(ev["repeat_until"], "yyyy-MM-dd"))
+                bd_infinite.setChecked(False)
+            except Exception:
+                pass
+        bd_row.addWidget(bd_label)
+        bd_row.addWidget(bd_infinite)
+        bd_row.addWidget(bd_date, 1)
+        content.addWidget(bound_daily)
+
+        # 每月：终止月
+        bound_month = QWidget()
+        bm_row = QHBoxLayout(bound_month)
+        bm_row.setContentsMargins(0, 0, 0, 0)
+        bm_row.setSpacing(8)
+        bm_label = QLabel("终止月")
+        bm_label.setStyleSheet(lbl_style)
+        bm_infinite = QCheckBox("无限")
+        bm_infinite.setStyleSheet("font-size: 13px; color: #333;")
+        bm_infinite.setChecked(True)
+        bm_date = QDateEdit()
+        bm_date.setCalendarPopup(True)
+        bm_date.setDisplayFormat("yyyy-MM")
+        bm_date.setStyleSheet(input_style)
+        bm_date.setDate(date_edit.date())
+        bm_date.setEnabled(False)
+        bm_infinite.toggled.connect(lambda checked: bm_date.setEnabled(not checked))
+        if editing and ev.get("repeat") == "monthly" and ev.get("repeat_until"):
+            try:
+                u = datetime_module.date.fromisoformat(ev["repeat_until"])
+                bm_date.setDate(QDate(u.year, u.month, 1))
+                bm_infinite.setChecked(False)
+            except Exception:
+                pass
+        bm_row.addWidget(bm_label)
+        bm_row.addWidget(bm_infinite)
+        bm_row.addWidget(bm_date, 1)
+        content.addWidget(bound_month)
+
+        # 每周：有锚点周 → 起始/结束周下拉（第 N 周 + 日期范围）；无锚点 → 直接结束日期
+        bound_week = QWidget()
+        bw_row = QHBoxLayout(bound_week)
+        bw_row.setContentsMargins(0, 0, 0, 0)
+        bw_row.setSpacing(8)
+        combo_style = (
+            "QComboBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 12px; background: #FFFFFF; }"
+            " QComboBox:focus { border-color: #1A73E8; }"
+            " QComboBox::drop-down { border: none; width: 22px; }"
+        )
+
+        # 模式 A：有锚点 → 第 N 周下拉
+        week_anchor_box = QWidget()
+        wa_row = QHBoxLayout(week_anchor_box)
+        wa_row.setContentsMargins(0, 0, 0, 0)
+        wa_row.setSpacing(8)
+        ws_label = QLabel("起始周")
+        ws_label.setStyleSheet(lbl_style)
+        ws_combo = QComboBox()
+        ws_combo.setStyleSheet(combo_style)
+        we_label = QLabel("结束周")
+        we_label.setStyleSheet(lbl_style)
+        we_combo = QComboBox()
+        we_combo.setStyleSheet(combo_style)
+
+        def _fill_week_combo(cb, cur_val):
+            cb.clear()
+            cb.addItem("不限", 0)
+            aw = self._anchor_week
+            for n in range(1, 54):
+                start = aw + datetime_module.timedelta(days=(n - 1) * 7)
+                end = start + datetime_module.timedelta(days=6)
+                cb.addItem(f"第{n}周 ({start.month}/{start.day}–{end.month}/{end.day})", n)
+            if cur_val:
+                idx = cb.findData(int(cur_val))
+                if idx >= 0:
+                    cb.setCurrentIndex(idx)
+
+        # 模式 B：无锚点 → 结束日期（起始 = 事件日期）
+        week_date_box = QWidget()
+        wd_row = QHBoxLayout(week_date_box)
+        wd_row.setContentsMargins(0, 0, 0, 0)
+        wd_row.setSpacing(8)
+        wu_label = QLabel("结束日期")
+        wu_label.setStyleSheet(lbl_style)
+        wu_infinite = QCheckBox("无限")
+        wu_infinite.setStyleSheet("font-size: 13px; color: #333;")
+        wu_infinite.setChecked(True)
+        wu_date = QDateEdit()
+        wu_date.setCalendarPopup(True)
+        wu_date.setDisplayFormat("yyyy-MM-dd")
+        wu_date.setStyleSheet(input_style)
+        wu_date.setDate(date_edit.date())
+        wu_date.setEnabled(False)
+        wu_infinite.toggled.connect(lambda checked: wu_date.setEnabled(not checked))
+        if editing and ev.get("repeat_until"):
+            try:
+                wu_date.setDate(QDate.fromString(ev["repeat_until"], "yyyy-MM-dd"))
+                wu_infinite.setChecked(False)
+            except Exception:
+                pass
+        wd_row.addWidget(wu_label)
+        wd_row.addWidget(wu_infinite)
+        wd_row.addWidget(wu_date, 1)
+
+        if self._anchor_week:
+            _fill_week_combo(ws_combo, ev.get("week_start", 0) if editing else 0)
+            _fill_week_combo(we_combo, ev.get("week_end", 0) if editing else 0)
+            wa_row.addWidget(ws_label)
+            wa_row.addWidget(ws_combo, 1)
+            wa_row.addWidget(we_label)
+            wa_row.addWidget(we_combo, 1)
+            bw_row.addWidget(week_anchor_box)
+        else:
+            bw_row.addWidget(week_date_box)
+        content.addWidget(bound_week)
+
+        # 每年：起始年 / 终止年
+        bound_year = QWidget()
+        by_row = QHBoxLayout(bound_year)
+        by_row.setContentsMargins(0, 0, 0, 0)
+        by_row.setSpacing(8)
+        ys_label = QLabel("起始年")
+        ys_label.setStyleSheet(lbl_style)
+        ys_combo = QComboBox()
+        ys_combo.setStyleSheet(ws_combo.styleSheet())
+        ye_label = QLabel("终止年")
+        ye_label.setStyleSheet(lbl_style)
+        ye_combo = QComboBox()
+        ye_combo.setStyleSheet(ws_combo.styleSheet())
+        base_year = date_edit.date().year()
+
+        def _fill_year_combo(cb, cur_val):
+            cb.clear()
+            cb.addItem("不限", 0)
+            for y in range(base_year - 5, base_year + 12):
+                cb.addItem(str(y), y)
+            if cur_val:
+                idx = cb.findData(int(cur_val))
+                if idx >= 0:
+                    cb.setCurrentIndex(idx)
+
+        _fill_year_combo(ys_combo, ev.get("year_start", 0) if editing else 0)
+        _fill_year_combo(ye_combo, ev.get("year_end", 0) if editing else 0)
+        by_row.addWidget(ys_label)
+        by_row.addWidget(ys_combo, 1)
+        by_row.addWidget(ye_label)
+        by_row.addWidget(ye_combo, 1)
+        content.addWidget(bound_year)
+
+        # 按重复类型切换边界行显示
+        def update_bounds(idx):
+            bound_daily.setVisible(idx == 1)      # 每天
+            bound_month.setVisible(idx == 3)      # 每月
+            bound_week.setVisible(idx == 2)       # 每周
+            bound_year.setVisible(idx == 4)       # 每年
+
+        repeat_edit.currentIndexChanged.connect(update_bounds)
+        update_bounds(repeat_edit.currentIndex())
+
         # 提醒：提前 X 分钟/小时/天，触发系统通知
         remind_lbl = QLabel("提醒")
         remind_lbl.setStyleSheet(lbl_style)
@@ -4278,6 +4767,32 @@ class ScheduleWindow(AniNoteWindow):
             date_str = date_edit.date().toString("yyyy-MM-dd")
             rep = {0: "none", 1: "daily", 2: "weekly", 3: "monthly", 4: "yearly"}[
                 repeat_edit.currentIndex()]
+            # 重复边界（按类型读取对应控件）
+            repeat_until = ""
+            week_start = 0
+            week_end = 0
+            year_start = 0
+            year_end = 0
+            if rep == "daily" and not bd_infinite.isChecked():
+                repeat_until = bd_date.date().toString("yyyy-MM-dd")
+            if rep == "monthly" and not bm_infinite.isChecked():
+                import calendar
+                qm = bm_date.date()
+                _last = calendar.monthrange(qm.year(), qm.month())[1]
+                repeat_until = "%04d-%02d-%02d" % (qm.year(), qm.month(), _last)
+            if rep == "weekly":
+                if self._anchor_week:
+                    week_start = int(ws_combo.currentData() or 0)
+                    week_end = int(we_combo.currentData() or 0)
+                else:
+                    # 无锚点：直接结束日期（起始 = 事件日期），存 repeat_until
+                    week_start = 0
+                    week_end = 0
+                    if not wu_infinite.isChecked():
+                        repeat_until = wu_date.date().toString("yyyy-MM-dd")
+            if rep == "yearly":
+                year_start = int(ys_combo.currentData() or 0)
+                year_end = int(ye_combo.currentData() or 0)
             # 提醒设置（未启用则为 None）
             remind = None
             if remind_enable.isChecked():
@@ -4292,6 +4807,11 @@ class ScheduleWindow(AniNoteWindow):
                 ev["color"] = selected_color[0]
                 ev["repeat"] = rep
                 ev["remind"] = remind
+                ev["repeat_until"] = repeat_until
+                ev["week_start"] = week_start
+                ev["week_end"] = week_end
+                ev["year_start"] = year_start
+                ev["year_end"] = year_end
                 if rep != "none":
                     # 编辑成重复：删除该批次旧实体 + 编辑中的实体本身，重新物化
                     bid = ev.get("batch_id") or ev["id"]
@@ -4314,6 +4834,11 @@ class ScheduleWindow(AniNoteWindow):
                     "color": selected_color[0],
                     "repeat": rep,
                     "remind": remind,
+                    "repeat_until": repeat_until,
+                    "week_start": week_start,
+                    "week_end": week_end,
+                    "year_start": year_start,
+                    "year_end": year_end,
                     "done": False,
                 }
                 if rep != "none":
@@ -4344,6 +4869,15 @@ class ScheduleWindow(AniNoteWindow):
                     except ValueError:
                         pass
                 self._events = sd.get("events", [])
+                # 起始周锚点（周一日期；空 = 未设置）
+                aw = sd.get("anchor_week", "")
+                if aw:
+                    try:
+                        self._anchor_week = datetime_module.date.fromisoformat(aw)
+                    except ValueError:
+                        self._anchor_week = None
+                else:
+                    self._anchor_week = None
             except Exception:
                 pass
         self._refresh_view()
@@ -4362,6 +4896,8 @@ class ScheduleWindow(AniNoteWindow):
                 data["schedule_data"] = {
                     "view_mode": self._view_mode,
                     "center_date": self._center_date.strftime("%Y-%m-%d"),
+                    "anchor_week": (self._anchor_week.strftime("%Y-%m-%d")
+                                    if self._anchor_week else ""),
                     "events": self._events,
                 }
                 with open(self.save_file, "w", encoding="utf-8") as f:
@@ -4372,9 +4908,9 @@ class ScheduleWindow(AniNoteWindow):
     # ---------- 系统提醒 ----------
 
     def _next_occurrence(self, ev, today):
-        """计算事件的下一次发生日期（考虑重复规则，>= today）。
+        """计算事件的下一次发生日期（考虑重复规则与边界，>= today）。
 
-        返回 datetime.date 或 None（单次事件已过期）。
+        返回 datetime.date 或 None（单次事件已过期 / 超出重复边界）。
         """
         try:
             base = datetime_module.date.fromisoformat(ev.get("date", ""))
@@ -4383,10 +4919,12 @@ class ScheduleWindow(AniNoteWindow):
         rep = ev.get("repeat", "none")
         if rep == "none":
             return base if base >= today else None
-        # 从 base 开始按周期推进到 >= today
+        # 从 base 逐期推进，找 >= today 且仍在重复边界内的下一期
         cur = base
         guard = 0
-        while cur < today and guard < 4000:
+        while guard < 4000:
+            if cur >= today and self._in_repeat_bounds(cur, ev):
+                return cur
             if rep == "daily":
                 cur += datetime_module.timedelta(days=1)
             elif rep == "weekly":
@@ -4409,7 +4947,10 @@ class ScheduleWindow(AniNoteWindow):
             else:
                 return None
             guard += 1
-        return cur
+            # 边界外推进防失控：超过 today 一年仍未命中（如每周的结束周已过）→ 视为无下次
+            if cur > today + datetime_module.timedelta(days=370):
+                return None
+        return None
 
     def _check_reminders(self):
         """定时扫描：到达提醒时间点的事件触发系统通知（避免重复提醒）。
@@ -5413,6 +5954,7 @@ class EpisodeDialog(QDialog):
 def create_global_new_note():
     """全局新建便签（由快捷键触发），放在上一个便签的右下方。"""
     note = AniNoteWindow()
+    note.setWindowIcon(app_window_icon())
     if ACTIVE_NOTES and len(ACTIVE_NOTES) > 1:
         ref_note = ACTIVE_NOTES[-2]
         note.move(ref_note.x() + 40, ref_note.y() + 40)
@@ -5426,6 +5968,7 @@ def create_global_new_note():
 def create_global_new_habit():
     """全局新建事务追踪器（由控制面板按钮触发）。"""
     tracker = HabitTrackerWindow()
+    tracker.setWindowIcon(app_window_icon())
     if ACTIVE_NOTES and len(ACTIVE_NOTES) > 1:
         ref_note = ACTIVE_NOTES[-2]
         tracker.move(ref_note.x() + 40, ref_note.y() + 40)
@@ -5441,6 +5984,7 @@ def create_global_new_habit():
 def create_global_new_schedule():
     """全局新建日程表（由控制面板按钮触发）。"""
     sched = ScheduleWindow()
+    sched.setWindowIcon(app_window_icon())
     if ACTIVE_NOTES and len(ACTIVE_NOTES) > 1:
         ref_note = ACTIVE_NOTES[-2]
         sched.move(ref_note.x() + 40, ref_note.y() + 40)
