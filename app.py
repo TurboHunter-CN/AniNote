@@ -466,6 +466,10 @@ def main():
                     for note in note_app.ACTIVE_NOTES:
                         if note.note_id == nid:
                             if note.isHidden():
+                                # 呼出即视为"显示"：同步 is_hidden 并落盘，
+                                # 否则后续任意自动保存都会把 True 写回磁盘，重启后仍隐藏
+                                note.is_hidden = False
+                                note.save_data()
                                 note.show()
                             note.raise_()
                             note.activateWindow()
@@ -717,6 +721,7 @@ def main():
         new_note.is_hidden = False
         new_note.show()
         new_note.activateWindow()
+        new_note.save_data()   # 未实例化分支：显示状态落盘，避免重启后仍隐藏
 
     def delete_note_by_id(nid):
         """按 ID 删除便签（含磁盘文件）。"""
