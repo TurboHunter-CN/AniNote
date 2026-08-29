@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.3.2"
+VERSION = "4.3.3"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -403,6 +403,34 @@ class MdSourceEdit(QPlainTextEdit):
         super().mouseReleaseEvent(event)
 
 
+def setup_auto_hide_scrollbar(sb, visible_qss, hidden_qss, timeout_ms=1200):
+    """滚动条自动隐藏：未滚动时应用 hidden_qss（透明），滚动时切 visible_qss，
+    停止滚动 timeout 后切回隐藏。通过切换 QSS 实现（滚动条仍占位，内容不跳动）。
+
+    sb: QScrollBar；timer 挂在 sb 上（测试可用 sb._auto_hide_timer 模拟超时）。
+    """
+    state = {"show": False}
+
+    def _hide():
+        if state["show"]:
+            state["show"] = False
+            sb.setStyleSheet(hidden_qss)
+
+    def _show():
+        state["show"] = True
+        sb.setStyleSheet(visible_qss)
+        timer.start()
+
+    timer = QTimer(sb)
+    timer.setSingleShot(True)
+    timer.setInterval(timeout_ms)
+    timer.timeout.connect(_hide)
+    sb._auto_hide_timer = timer  # 测试钩子
+
+    sb.valueChanged.connect(_show)
+    sb.setStyleSheet(hidden_qss)
+
+
 class MarkdownSplitEdit(QWidget):
     """Markdown 分栏编辑器：左源码（语法高亮）+ 右实时渲染（QTextBrowser）。
 
@@ -410,6 +438,7 @@ class MarkdownSplitEdit(QWidget):
     - 左右滚动条按比例互绑（guard 防循环）
     - set_markdown 装载时通过 _rendering 抑制误渲染
     - 隐藏源码 = 窗口宽度切半（视觉上像直接砍掉左半边源码），仅 MD 模式生效
+    - 滚动条自动隐藏：未滚动时透明，滚动时显示，停止 1.2s 后隐藏
     """
 
     src_visibility_changed = Signal(bool)  # True=源码可见（供父窗口同步眼睛按钮）
@@ -454,7 +483,7 @@ class MarkdownSplitEdit(QWidget):
             " font-family: 'Microsoft YaHei'; font-size: 13px; color: #333333; }"
         )
 
-        # 细滚动条（对齐便签风格）
+        # 细滚动条（对齐便签风格）；未滚动时透明隐藏，滚动时显示
         bar_qss = (
             "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
             " QScrollBar::handle:vertical { background: #C0C0C0; border-radius: 3px; min-height: 20px; }"
@@ -465,8 +494,18 @@ class MarkdownSplitEdit(QWidget):
             " QScrollBar::handle:horizontal { background: #C0C0C0; border-radius: 3px; min-width: 20px; }"
             " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
         )
-        self.src.verticalScrollBar().setStyleSheet(bar_qss)
-        self.preview.verticalScrollBar().setStyleSheet(bar_qss)
+        bar_qss_hidden = (
+            "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: transparent; border-radius: 3px; min-height: 20px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+            " QScrollBar:horizontal { background: transparent; height: 6px; margin: 0; }"
+            " QScrollBar::handle:horizontal { background: transparent; border-radius: 3px; min-width: 20px; }"
+            " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
+        )
+        for _sb in (self.src.verticalScrollBar(), self.src.horizontalScrollBar(),
+                    self.preview.verticalScrollBar(), self.preview.horizontalScrollBar()):
+            setup_auto_hide_scrollbar(_sb, bar_qss, bar_qss_hidden)
 
         self.splitter.addWidget(self.src)
         self.splitter.addWidget(self.preview)
@@ -1207,6 +1246,8 @@ class AniNoteWindow(QWidget):
         """工具栏眼睛按钮：切换源码显示/隐藏（窗口宽度同步切半/恢复）。"""
         md = self.editor_host.md_view
         md.set_user_hidden_src(md.src_visible_state())
+        self._mark_dirty()
+        self.save_data()
 
     def _is_special_note(self):
         """事务追踪器、新番便签与日程表：无 Markdown 切换能力。"""
@@ -2100,11 +2141,14 @@ class AniNoteWindow(QWidget):
         # MD 切半状态下的原始全宽/最小宽（仅源码隐藏时记录，供重启后还原）
         md_full_w = 0
         md_min_w = 0
+        md_user_hidden = False
         if getattr(self, 'editor_host', None) and self.editor_host.is_md:
             mdv = self.editor_host.md_view
             if mdv._saved_full_width:
                 md_full_w = mdv._saved_full_width
                 md_min_w = mdv._orig_min_width
+            # 用户手动隐藏源码状态（重启后保持切半/全宽一致）
+            md_user_hidden = mdv._user_hidden_src
 
         data = {
             "note_id": self.note_id,
@@ -2122,6 +2166,7 @@ class AniNoteWindow(QWidget):
             # 持久化 MD 切半前的原始全宽（重启后避免二次切半，解除锁定可还原全宽）
             "md_full_width": md_full_w,
             "md_orig_min_width": md_min_w,
+            "md_user_hidden_src": md_user_hidden,
         }
         with open(self.save_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -2203,6 +2248,12 @@ class AniNoteWindow(QWidget):
                         self.editor_host.md_view._orig_min_width = (
                             data.get("md_orig_min_width", 0) or 320
                         )
+                        # 恢复用户手动隐藏源码状态（旧数据无该字段时，
+                        # 用"存在全宽记录"推断上次为隐藏态，保持切半不跳动）
+                        self.editor_host.md_view._user_hidden_src = data.get(
+                            "md_user_hidden_src",
+                            bool(data.get("md_full_width")),
+                        )
                         self.editor_host.md_view.show()
                         self.editor_host.rich_view.hide()
                         self.editor_host.is_md = True
@@ -2219,6 +2270,9 @@ class AniNoteWindow(QWidget):
                     w = max(data.get("width", 320), 300)
                     h = max(data.get("height", 320), 280)
                     self.setGeometry(x, y, w, h)
+                    if data.get("markdown") and hasattr(self, 'editor_host'):
+                        # 按恢复的隐藏源码状态同步窗口宽度（切半保持，或还原全宽）
+                        self.editor_host.md_view._apply_src_visible()
                     self.is_locked = data.get("is_locked", False)
                     self.is_hidden = data.get("is_hidden", False)
                     self.is_always_on_top = data.get("is_always_on_top", True)
@@ -2431,6 +2485,14 @@ class HabitTrackerWindow(AniNoteWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
+        # 滚动条自动隐藏：未滚动时透明，滚动时显示，停 1.2s 后隐藏（对齐 MD 便签）
+        setup_auto_hide_scrollbar(
+            scroll.verticalScrollBar(), scroll.styleSheet(),
+            "QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: transparent; border-radius: 2px; min-height: 20px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }",
+        )
 
         container = QWidget()
         container.setStyleSheet("background: transparent;")
@@ -3790,6 +3852,14 @@ class ScheduleWindow(AniNoteWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
+        # 滚动条自动隐藏：未滚动时透明，滚动时显示，停 1.2s 后隐藏（对齐 MD 便签）
+        setup_auto_hide_scrollbar(
+            scroll.verticalScrollBar(), scroll.styleSheet(),
+            "QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: transparent; border-radius: 2px; min-height: 20px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }",
+        )
 
         inner = QWidget()
         inner.setStyleSheet("background: transparent;")
@@ -5132,6 +5202,14 @@ class BangumiScheduleWindow(AniNoteWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
+        # 滚动条自动隐藏：未滚动时透明，滚动时显示，停 1.2s 后隐藏（对齐 MD 便签）
+        setup_auto_hide_scrollbar(
+            scroll.verticalScrollBar(), scroll.styleSheet(),
+            "QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: transparent; border-radius: 2px; min-height: 20px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }",
+        )
 
         container = QWidget()
         container.setStyleSheet("background: transparent;")
@@ -5808,6 +5886,14 @@ class EpisodeDialog(QDialog):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
+        # 滚动条自动隐藏：未滚动时透明，滚动时显示（对齐 MD 便签）
+        setup_auto_hide_scrollbar(
+            self._scroll.verticalScrollBar(), self._QSS,
+            "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+            " QScrollBar::handle:vertical { background: transparent; border-radius: 3px; min-height: 20px; }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }",
+        )
         card_layout.addWidget(self._scroll)
         self._card.hide()
         content.addWidget(self._card, 1)
