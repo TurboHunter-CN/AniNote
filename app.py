@@ -24,23 +24,37 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon, QAction
 
 
-# 模块级：在 import 任何业务模块之前尽早静默 libpng iCCP 色彩配置警告
-# （外部 PNG 常见，无害但噪音大）。libpng 警告经 Qt 消息系统，可被拦截；
-# 另加 stderr 重定向兜底，覆盖 C 层直接写 fd2 的路径。
-def _install_iccp_filter():
+# 模块级：在 import 任何业务模块之前尽早静默无害的底层警告
+# （外部 PNG 的 iCCP 色彩配置、半透明窗口刷新的 UpdateLayeredWindowIndirect 等）。
+# Qt 消息系统可拦截经 qWarning 输出的部分；另加 stderr 重定向兜底，
+# 覆盖 C 层直接写 fd2 的路径。
+_NOISE_MARKERS = (
+    "libpng",                          # PNG 色彩配置
+    "iCCP",
+    "UpdateLayeredWindowIndirect",     # 半透明（分层）窗口刷新被系统拒绝
+    "SetLayeredWindowAttributes",
+)
+
+
+def _is_noise(message):
+    """判断是否为已知无害的底层噪音，无需打印给用户。"""
+    m = str(message)
+    return any(k in m for k in _NOISE_MARKERS)
+
+
+def _install_noise_filter():
     from PySide6.QtCore import qInstallMessageHandler
 
     def _msg_handler(mode, context, message):
-        m = str(message)
-        if "libpng" in m or "iCCP" in m:
+        if _is_noise(message):
             return
-        print(m, file=sys.stderr)
+        print(message, file=sys.stderr)
 
     qInstallMessageHandler(_msg_handler)
 
 
-def _install_stderr_iccp_filter():
-    """终极兜底：重定向 stderr（fd2），过滤含 libpng/iCCP 的行后透传其余输出。"""
+def _install_stderr_noise_filter():
+    """终极兜底：重定向 stderr（fd2），过滤已知无害行后透传其余输出。"""
     try:
         real_fd = os.dup(2)
         r_fd, w_fd = os.pipe()
@@ -51,7 +65,7 @@ def _install_stderr_iccp_filter():
             try:
                 with os.fdopen(r_fd, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
-                        if "iCCP" in line or "libpng" in line:
+                        if _is_noise(line):
                             continue
                         try:
                             os.write(real_fd, line.encode("utf-8", errors="replace"))
@@ -65,8 +79,8 @@ def _install_stderr_iccp_filter():
         pass
 
 
-_install_iccp_filter()
-_install_stderr_iccp_filter()
+_install_noise_filter()
+_install_stderr_noise_filter()
 
 import main as note_app
 import control_panel as cp_app
@@ -470,7 +484,7 @@ def main():
                                 # 否则后续任意自动保存都会把 True 写回磁盘，重启后仍隐藏
                                 note.is_hidden = False
                                 note.save_data()
-                                note.show()
+                                note.animated_show()
                             note.raise_()
                             note.activateWindow()
                             break
@@ -547,10 +561,12 @@ def main():
         <p><b>10. 控制面板</b>: 系统托盘右键或便签右键可打开控制台，集中管理便签墙、设置个性化选项（含「默认 Markdown 模式」开关，开启后新建便签默认进入 Markdown 模式）。</p>
         <p><b>11. 新番信息</b>: 控制面板一键授权 Bangumi，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）。点击番剧名可标记看过/取消（双向同步 Bangumi）；右键番剧可「在 Bangumi 打开」或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目（大陆网络环境需自备代理）。</p>
         <p><b>12. 事务追踪器</b>: 控制面板中新建事务追踪，支持自由打卡/周期循环/倒计时三种模式，可拖拽排序。</p>
-        <p><b>13. 日程表</b>: 控制面板中新建日程表，日/周双视图时间轴（周视图为课程表效果），可自定义编辑事件（标题、日期、起止时间、颜色、备注），支持每天/周/月/年重复与提前提醒，左键单击事件标记完成。</p>
+        <p><b>13. 日程表</b>: 控制面板中新建日程表，日/周双视图时间轴（周视图为课程表效果），可自定义编辑事件（标题、日期、起止时间、颜色、备注），支持每天/周/月/年重复与提前提醒，左键单击事件标记完成；在事件上右键可以「编辑事件」（重复系列还能选「编辑整个系列」）。</p>
+        <p><b>14. 便签折叠</b>: 点标题栏右上角的减号按钮（或右键「折叠便签」），便签会收成一条，只留标题和底色，可以像普通便签一样在屏幕上任意拖动。鼠标悬停在折叠条上会临时「抽出」一行，显示这条便签的内容预览。</p>
+        <p><b>15. 便签夹</b>: 把多条折叠便签上下拖到一起，就会自动吸附成一个「便签夹」——夹子头部可以拖动整叠便签，双击可以改名，右侧显示条数，右键可以「全部折叠 / 重命名 / 解散便签集」。在夹子里上下拖动可以调整顺序，把某条拖远就会拆出去，只剩一条时会自动解散。</p>
         """)
         note.save_data()
-        note.show()
+        note.animated_show()
         cfg["is_first_run"] = False
         note_app.save_config(cfg)
     else:
@@ -574,7 +590,7 @@ def main():
             if getattr(note, 'is_hidden', False):
                 note.hide()
             else:
-                note.show()
+                note.animated_show()
                 note.raise_()
                 note.activateWindow()
 
@@ -621,7 +637,7 @@ def main():
             # 网格/工具栏/格式面板隐藏由 BangumiScheduleWindow 自身管理
             target_note = note_app.BangumiScheduleWindow()
             target_note.resize(550, 300)
-            target_note.show()
+            target_note.animated_show()
 
         if isinstance(payload, dict):
             target_note._apply_schedule(payload)
@@ -710,7 +726,7 @@ def main():
             if note.note_id == note_id:
                 note.is_hidden = False
                 note.save_data()
-                note.show()
+                note.animated_show()
                 note.activateWindow()
                 return
         new_note = (note_app.HabitTrackerWindow(note_id=note_id)
@@ -719,7 +735,7 @@ def main():
                     if note_id.startswith("schedule_")
                     else note_app.AniNoteWindow(note_id=note_id))
         new_note.is_hidden = False
-        new_note.show()
+        new_note.animated_show()
         new_note.activateWindow()
         new_note.save_data()   # 未实例化分支：显示状态落盘，避免重启后仍隐藏
 
@@ -744,7 +760,7 @@ def main():
                 note.save_data()
                 note.hide()
                 note.apply_window_states()
-                note.show()
+                note.animated_show()   # 刷新窗口标志后淡入，避免生硬弹出
                 panel.refresh_notes_wall()
                 return
 
@@ -769,7 +785,7 @@ def main():
                 return
         # 便签未实例化，先创建再打开
         new_note = note_app.AniNoteWindow(note_id=note_id)
-        new_note.show()
+        new_note.animated_show()
         new_note._open_note_hotkey_dialog()
 
     def export_note_by_id(nid):

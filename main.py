@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "4.3.3"
+VERSION = "5.0.0"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,17 +26,21 @@ from PySide6.QtWidgets import (
     QLineEdit, QTextEdit, QTextBrowser, QLabel, QDialog, QSlider, QStackedWidget,
     QFontComboBox, QSpinBox, QScrollArea, QGridLayout, QRadioButton, QDateEdit,
     QFileDialog, QDialogButtonBox, QCheckBox, QPlainTextEdit, QSplitter,
-    QTimeEdit, QComboBox,
+    QTimeEdit, QComboBox, QAbstractSpinBox,
 )
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint
+from PySide6.QtCore import (
+    Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint,
+    QPropertyAnimation, QEasingCurve, QVariantAnimation,
+)
 from PySide6.QtGui import (
-    QColor, QFont, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage,
+    QColor, QFont, QFontMetrics, QCursor, QTextCursor, QDesktopServices, QPixmap, QImage,
     QPainter, QPen, QBrush, QSyntaxHighlighter, QTextCharFormat, QPolygon,
     QIcon,
 )
 from PySide6.QtSvg import QSvgRenderer
 
 from icons import icon, set_icon_font
+import note_stacks as stacks   # 便签集（便签夹）：折叠便签吸附成一条
 
 # ---------- 路径初始化 ----------
 
@@ -67,6 +71,16 @@ def app_window_icon():
 ACTIVE_NOTES = []
 _TOGGLE_HIDDEN_NOTES = set()   # 记录被「全局隐藏」操作隐藏的便签 ID，用于恢复时只显示这些
 
+# ---------- 便签动画参数（便签显示/隐藏淡入淡出 + 折叠展开收起）----------
+ANIM_FADE_IN_MS = 150      # 显示时的淡入时长
+ANIM_FADE_OUT_MS = 130     # 隐藏时的淡出时长
+ANIM_COLLAPSE_MS = 170     # 折叠 / 展开的窗口高度动画时长
+_COLLAPSED_MIN_HEIGHT = 40  # 折叠条的最小高度兜底
+_COLLAPSED_V_MARGIN = 3     # 折叠条窗口 / 卡片的上下留白（越小，夹内相邻两条贴得越紧）
+_PEEK_H = stacks.PEEK_H      # 悬停"抽出"时多露出的高度（含一行预览）
+_PEEK_LBL_H = 16             # 悬停预览行高度
+_QWIDGETSIZE_MAX = 16777215  # Qt 默认最大尺寸（展开时恢复最大高度限制用）
+
 DEFAULT_CONFIG = {
     "toggle_hotkey": "alt+n",
     "new_hotkey": "alt+m",
@@ -85,6 +99,7 @@ DEFAULT_CONFIG = {
     "export_dir": "default",        # "default" 表示使用程序同级目录下的「导出的便签文本」文件夹
     "auto_update": True,            # 启动时自动检查 GitHub 新版本
     "ignored_version": "",          # 用户选择"忽略此版本"时记录，不再提示
+    "stack_names": {},              # 便签夹自定义名称：{stack_id: 名称}
 }
 
 
@@ -692,7 +707,23 @@ class EditorHost(QWidget):
 # ---------- 标题栏 ----------
 
 class HeaderBar(QWidget):
-    """便签标题栏，支持拖动窗口和格式化工具栏。"""
+    """便签标题栏：标题输入框 + 拖拽点心 + 工具栏容器。"""
+
+    # 标题样式。字号 / 字重交给 QFont（不写进 QSS），便于长标题自动缩小
+    TITLE_QSS = (
+        "QLineEdit { border: none; background: transparent; color: #222;"
+        " font-family: 'Microsoft YaHei'; padding: 2px; }"
+        " QLineEdit:focus { background: rgba(255, 255, 255, 0.5); border-radius: 4px; }"
+    )
+    TITLE_QSS_COMPACT = (
+        "QLineEdit { border: none; background: transparent; color: #333333;"
+        " font-family: 'Microsoft YaHei'; padding: 1px 2px; }"
+    )
+    TITLE_PX = 18          # 常规标题字号
+    TITLE_PX_MIN = 12      # 长标题自动缩小的下限（再小就影响阅读了）
+    TITLE_PX_COMPACT = 14  # 折叠条标题字号
+    TITLE_W_RATIO = 2 / 3  # 展开态：标题最多占「可伸缩宽度」的 2/3，其余留给拖动空白区
+                           # （折叠态不受此限，标题吃满整条）
 
     def __init__(self, parent_window):
         super().__init__(parent_window)
@@ -708,23 +739,22 @@ class HeaderBar(QWidget):
         self.title_layout.setSpacing(5)
 
         self.title_edit = QLineEdit(self)
-        self.title_edit.setStyleSheet("""
-            QLineEdit { border: none; background: transparent; font-size: 18px;
-                        font-weight: bold; color: #222; font-family: 'Microsoft YaHei'; padding: 2px; }
-            QLineEdit:focus { background: rgba(255, 255, 255, 0.5); border-radius: 4px; }
-        """)
+        self.title_edit.setStyleSheet(self.TITLE_QSS)
+        self._apply_title_font(self.TITLE_PX, bold=True)
         self.title_edit.setPlaceholderText("请输入便签标题...")
         self.title_edit.textChanged.connect(lambda: self.parent_window._mark_dirty())
+        self.title_edit.textChanged.connect(self._update_title_tooltip)
+        self.title_edit.textChanged.connect(self.refresh_title_font)
         self.title_edit.editingFinished.connect(lambda: global_signaler.note_updated_signal.emit())
+        self.title_edit.editingFinished.connect(self.refresh_title_font)
         self.title_layout.addWidget(self.title_edit)
 
-        self.drag_handle = QLabel("⋮⋮")
-        self.drag_handle.setToolTip("按住此处或空白处拖动便签")
-        self.drag_handle.setStyleSheet("color: #aaa; font-weight: bold; font-size: 16px; padding: 0 5px;")
+        self.drag_handle = QLabel("⋮")   # 单个点列：窄（原来两个点占 58px，挤掉标题宽度）
+        self.drag_handle.setToolTip("按住此处或标题右侧空白处拖动便签")
+        self.drag_handle.setStyleSheet("color: #aaa; font-weight: bold; font-size: 13px; padding: 0 1px;")
         self.drag_handle.setCursor(Qt.OpenHandCursor)
+        self.title_layout.addStretch()   # 标题右侧这一截空白本身就是可拖动区
         self.title_layout.addWidget(self.drag_handle)
-
-        self.title_layout.addStretch()
         layout.addLayout(self.title_layout)
 
         self.toolbar_container = QWidget()
@@ -733,20 +763,143 @@ class HeaderBar(QWidget):
         self.toolbar_layout.setSpacing(5)
         layout.addWidget(self.toolbar_container)
 
+    # ---------- 标题字号自适应 ----------
+
+    def _title_font(self, px, bold=True):
+        f = QFont("Microsoft YaHei")
+        f.setPixelSize(int(px))
+        f.setBold(bool(bold))
+        return f
+
+    def _apply_title_font(self, px, bold=True):
+        self._title_px = int(px)
+        self.title_edit.setFont(self._title_font(px, bold))
+
+    # ---------- 折叠 / 展开之间的标题字号过渡 ----------
+
+    def animate_title_font(self, from_px, to_px, ms):
+        """展开时把标题字号从折叠态值平滑过渡到展开态值（字重即时生效）。
+
+        直接一次性切到终值，会在动画刚开始时"字体突然变大变粗"；
+        这里补一段与高度动画同长的短过渡。动画期间 `refresh_title_font` 让位，
+        否则 resizeEvent 每帧都会把它按回终值，过渡就没了。
+        """
+        anim = getattr(self, '_title_font_anim', None)
+        if anim is None:
+            anim = QVariantAnimation(self)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.valueChanged.connect(self._on_title_font_step)
+            anim.finished.connect(self._on_title_font_done)
+            self._title_font_anim = anim
+        anim.stop()
+        self._title_anim_active = True
+        self._apply_title_font(from_px, bold=True)   # 先回到起点，避免闪一帧大字号
+        anim.setDuration(max(int(ms), 1))
+        anim.setStartValue(float(from_px))
+        anim.setEndValue(float(to_px))
+        anim.start()
+
+    def _on_title_font_step(self, value):
+        self._apply_title_font(int(round(float(value))), bold=True)
+
+    def _on_title_font_done(self):
+        self._title_anim_active = False
+        self.refresh_title_font()
+
+    def stop_title_font_anim(self):
+        """折叠 / 重排时立刻停掉字号过渡，别让它继续改样式。"""
+        anim = getattr(self, '_title_font_anim', None)
+        self._title_anim_active = False
+        if anim is not None:
+            try:
+                anim.stop()
+            except RuntimeError:
+                self._title_font_anim = None
+
+    def refresh_title_font(self):
+        """按行宽给标题定宽，并在放不下时逐级缩小字号。
+
+        宽度策略：标题只占「可伸缩宽度」的 TITLE_W_RATIO（约 2/3），剩下的一截
+        连同点心一起留给拖动（否则标题铺满整行，标题区域点下去是进入编辑态，
+        就没有地方能按住拖便签了）。用 setFixedWidth 钉死宽度——既保证了留给
+        拖动的空白，也避免 QLineEdit 的 sizeHint 随字号变化造成"越缩越窄"的死循环。
+        折叠态不干预（那里标题要占满整条）。
+        """
+        if getattr(self.parent_window, 'is_collapsed', False):
+            return
+        if getattr(self, '_title_anim_active', False):
+            return          # 展开时的字号过渡动画期间由它接管
+        try:
+            row_w = self.width()
+            if row_w < 80:
+                return
+            lay = self.title_layout
+            reserve = 0
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                w = item.widget() if item is not None else None
+                if w is None or w is self.title_edit or not w.isVisible():
+                    continue
+                reserve += w.sizeHint().width() + lay.spacing()
+            m = self.layout().contentsMargins()
+            flex = max(row_w - m.left() - m.right() - reserve, 60)
+            cap = max(int(flex * self.TITLE_W_RATIO), 60)
+            if self.title_edit.width() != cap or self.title_edit.minimumWidth() != cap:
+                self.title_edit.setFixedWidth(cap)
+            text = self.title_edit.text().strip()
+            fit_w = max(cap - 12, 30)   # 减去输入框左右内边距
+            px = self.TITLE_PX
+            while px > self.TITLE_PX_MIN:
+                if QFontMetrics(self._title_font(px)).horizontalAdvance(text) <= fit_w:
+                    break
+                px -= 1
+            self._apply_title_font(px, bold=True)
+        except RuntimeError:
+            pass
+
+    def resizeEvent(self, event):
+        """宽度一变就重新适配标题字号（标题在布局就绪前被设置也不会漏掉）。"""
+        super().resizeEvent(event)
+        self.refresh_title_font()
+
+    def set_title_compact(self, compact):
+        """折叠条标题样式：字号放小、取消粗体（展开时还原常规样式与自适应字号）。"""
+        if compact:
+            self.stop_title_font_anim()
+            self.title_edit.setStyleSheet(self.TITLE_QSS_COMPACT)
+            self._apply_title_font(self.TITLE_PX_COMPACT, bold=False)
+        else:
+            self.title_edit.setStyleSheet(self.TITLE_QSS)
+            self.refresh_title_font()
+
+    def _update_title_tooltip(self):
+        """标题框放不下时，悬停即可看到完整标题。"""
+        self.title_edit.setToolTip(self.title_edit.text().strip())
+
+    def _draggable(self):
+        """可拖动条件：未锁定，或处于折叠态（折叠条本就靠拖动移动）。"""
+        return (not self.parent_window.is_locked
+                or getattr(self.parent_window, 'is_collapsed', False))
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.parent_window.is_locked:
+        if event.button() == Qt.LeftButton and self._draggable():
             self._is_dragging = True
             self._drag_pos = event.globalPosition().toPoint() - self.parent_window.pos()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self._is_dragging and not self.parent_window.is_locked:
+        if self._is_dragging and self._draggable():
             self.parent_window.move(event.globalPosition().toPoint() - self._drag_pos)
+            stacks.STACKS.on_drag_moved(self.parent_window)   # 叠内实时让位
             event.accept()
 
     def mouseReleaseEvent(self, event):
         self._is_dragging = False
         self.parent_window.save_data()
+        stacks.STACKS.on_drag_released(self.parent_window)    # 吸附 / 排序 / 拆出
+        st = stacks.STACKS.stack_of(self.parent_window)
+        if st is not None:
+            stacks.STACKS.clamp_header(st)     # 夹子被拖出屏幕时拉回来
 
 
 # ---------- 现代风格通用对话框 ----------
@@ -993,6 +1146,26 @@ class AniNoteWindow(QWidget):
         self.is_always_on_top = True
         self._deleted = False   # 标记为已删除，防止 closeEvent 重新写盘
 
+        # 便签折叠（收到一条，仅显示标题/底色/透明度）
+        self.is_collapsed = False
+        self._expanded_size = None           # 折叠前的窗口尺寸，展开时还原
+        self._collapsed_prev_visible = {}    # 折叠前各内容控件的可见性快照
+        self._saved_win_margins = None       # 折叠时临时收紧的窗口外边距
+        self._saved_frame_margins = None     # 折叠时临时收紧的卡片内边距
+        self._saved_min_size = None          # 折叠前的最小窗口尺寸（各类便签不同）
+        self._saved_frame_min = None         # 折叠前卡片最小尺寸
+        self._collapsed_toolbar_prev = None  # 折叠前工具栏可见性
+        self._strip_drag_pos = None          # 折叠条整条拖动的位置基准
+        self._pending_collapse = False       # 待落位的折叠状态（首次显示时应用）
+        self._strip_h = 0                    # 折叠条基准高度缓存（不含悬停预览行）
+        self._peeking = False                # 悬停"抽出"状态
+        self._peek_lbl = None                # 悬停预览行标签
+        self._hover_timer = None             # 悬停判定防抖
+        self.stack_id = ""                   # 所属便签集（空串 = 未成集）
+        self.stack_pos = 0                   # 在便签集内的顺序
+        self._opacity_anim = None            # 显示/隐藏淡入淡出动画
+        self._collapse_anim = None           # 折叠/展开高度动画
+
         # 防抖保存：500ms 无操作后才真正写盘
         self._dirty = False
         self._save_timer = QTimer(self)
@@ -1016,13 +1189,16 @@ class AniNoteWindow(QWidget):
         shadow.setColor(QColor(0, 0, 0, 50))
         shadow.setOffset(0, 4)
         self.bg_frame.setGraphicsEffect(shadow)
+        self._bg_shadow = shadow
 
         frame_layout = QVBoxLayout(self.bg_frame)
         frame_layout.setContentsMargins(12, 12, 12, 12)
         frame_layout.setSpacing(5)
 
         self.header = HeaderBar(self)
-        frame_layout.addWidget(self.header)
+        # 顶部对齐：折叠条里其余控件全被隐藏，若交给 QVBoxLayout 分配，它会把
+        # 多出来的高度居中给标题行 —— 折叠 / 展开动画时标题就会漂到窗口中间
+        frame_layout.addWidget(self.header, 0, Qt.AlignTop)
 
         self.format_panel = FormatPanel(self)
         frame_layout.addWidget(self.format_panel)
@@ -1051,6 +1227,23 @@ class AniNoteWindow(QWidget):
             lambda: self.delete_note(confirm=True), "color: #555; font-weight: normal;"
         )
         set_icon_font(del_btn, 14)
+
+        # 右上角折叠按钮（减号）：把便签收成一条；锁定态也可点击，故放进标题行
+        self.collapse_btn = QPushButton(icon("remove"))
+        set_icon_font(self.collapse_btn, 14)
+        self.collapse_btn.setToolTip("折叠便签（收成一条）")
+        self.collapse_btn.setFixedSize(24, 24)
+        self.collapse_btn.setCursor(Qt.PointingHandCursor)
+        self.collapse_btn.setStyleSheet(
+            "QPushButton { border: none; border-radius: 6px; color: #555;"
+            " background: transparent; }"
+            " QPushButton:hover { background-color: rgba(0,0,0,0.12); }"
+            " QPushButton:pressed { background-color: rgba(0,0,0,0.2); }"
+        )
+        self.collapse_btn.clicked.connect(self.toggle_collapse)
+        self.header.title_layout.addWidget(self.collapse_btn)
+        # 展开态也让标题占大头（默认 QLineEdit 只按 sizeHint 那么宽，长标题显示不下）
+        self._set_title_stretch(False)
 
         self.text_edit = NoteTextEdit(self)
         self.text_edit.viewport().installEventFilter(self)
@@ -1349,7 +1542,7 @@ class AniNoteWindow(QWidget):
         """从当前便签创建新的同级便签。"""
         new_note = AniNoteWindow()
         new_note.move(self.x() + 40, self.y() + 40)
-        new_note.show()
+        new_note.animated_show()
         new_note.activateWindow()
         new_note.save_data()
         global_signaler.note_updated_signal.emit()
@@ -1368,6 +1561,7 @@ class AniNoteWindow(QWidget):
         if self in ACTIVE_NOTES:
             ACTIVE_NOTES.remove(self)
         self._deleted = True
+        stacks.STACKS.unregister(self)   # 从便签集里摘掉（剩余不足两条则解散）
         global_signaler.unregister_note_hotkey.emit(self.note_id)
         if self.save_file and os.path.exists(self.save_file):
             # 删除保存文件
@@ -1835,11 +2029,17 @@ class AniNoteWindow(QWidget):
             " }"
         )
 
-        lock_action = menu.addAction(
-            "解除锁定" if self.is_locked else "锁定便签 (防误触)"
-        )
+        lock_action = None
+        if not getattr(self, 'is_collapsed', False):
+            # 折叠态不提供锁定入口：那一条里没有工具栏，锁定/解锁只会造成显示错乱
+            lock_action = menu.addAction(
+                "解除锁定" if self.is_locked else "锁定便签 (防误触)"
+            )
         top_action = menu.addAction(
             "取消置顶" if self.is_always_on_top else "置顶"
+        )
+        collapse_action = menu.addAction(
+            "展开便签" if getattr(self, 'is_collapsed', False) else "折叠便签（收成一条）"
         )
         open_panel_action = menu.addAction("打开控制台")
         menu.addSeparator()
@@ -1871,16 +2071,18 @@ class AniNoteWindow(QWidget):
         action = menu.exec(global_pos)
 
         # 注意：菜单外左键关闭时 exec 返回 None。
-        # 特殊便签的 md_action / hide_src_action 为 None，直接用
-        # `action == md_action` 会因 None == None 误判触发 MD 切换 → 必须判空。
-        if action == lock_action:
+        # 特殊便签的 md_action / hide_src_action / 折叠态的 lock_action 为 None，
+        # 直接用 `action == xxx` 会因 None == None 误判触发 → 必须判空。
+        if lock_action is not None and action == lock_action:
             self._toggle_lock()
         elif action == top_action:
             self._toggle_always_on_top()
+        elif action == collapse_action:
+            self.toggle_collapse()
         elif action == hide_single_action:
             self.is_hidden = True
             self.save_data()
-            self.hide()
+            self.animated_hide()
         elif action == open_panel_action:
             global_signaler.open_panel_signal.emit()
         elif action == del_action:
@@ -1916,6 +2118,567 @@ class AniNoteWindow(QWidget):
         else:
             self.text_edit.setTextInteractionFlags(Qt.TextEditorInteraction)
             self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # 折叠态：窗口只有"一条"，工具栏与内容一律不显示（无论锁定与否），
+        # 标题设为只读且不响应鼠标，避免误进编辑态（整条拖动由窗口级鼠标事件负责）
+        if getattr(self, 'is_collapsed', False):
+            self._enforce_collapsed_ui()
+            # 子类重写的 _apply_lock_ui 会在 super() 之后再把内容显出来 → 延后一拍再收敛
+            QTimer.singleShot(0, self._enforce_collapsed_ui)
+
+    # ---------- 便签显示 / 隐藏淡入淡出动画 ----------
+
+    def _ensure_opacity_anim(self):
+        """惰性创建并复用同一个透明度动画对象（避免动画对象堆积）。"""
+        if getattr(self, '_opacity_anim', None) is None:
+            anim = QPropertyAnimation(self, b"windowOpacity", self)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.finished.connect(self._on_opacity_anim_done)
+            self._opacity_anim = anim
+        return self._opacity_anim
+
+    def _on_opacity_anim_done(self):
+        """淡出结束才真正 hide；任何情况都把不透明度复位，避免残留半透明。"""
+        try:
+            if getattr(self, '_fade_out_pending', False):
+                self._fade_out_pending = False
+                self.hide()
+            self.setWindowOpacity(1.0)
+        except RuntimeError:
+            pass
+
+    def animated_show(self):
+        """带淡入的显示。已可见且未在淡出时只前置，不重复淡入。"""
+        pending_out = getattr(self, '_fade_out_pending', False)
+        if self.isVisible() and not pending_out:
+            self.setWindowOpacity(1.0)
+            self.raise_()
+            return
+        self._fade_out_pending = False
+        anim = self._ensure_opacity_anim()
+        anim.stop()
+        if self.isVisible():
+            # 正在淡出中被打断 → 直接淡回，避免动画结束后又被 hide
+            anim.setDuration(ANIM_FADE_IN_MS)
+            anim.setStartValue(float(self.windowOpacity()))
+            anim.setEndValue(1.0)
+            anim.start()
+            self.raise_()
+            return
+        self.setWindowOpacity(0.0)   # 先透明再 show，避免闪一帧全亮
+        self.show()
+        anim.setDuration(ANIM_FADE_IN_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.start()
+
+    def animated_hide(self):
+        """带淡出的隐藏（动画结束才真正 hide）。"""
+        if not self.isVisible():
+            self.setWindowOpacity(1.0)
+            return
+        anim = self._ensure_opacity_anim()
+        anim.stop()
+        self._fade_out_pending = True
+        anim.setDuration(ANIM_FADE_OUT_MS)
+        anim.setStartValue(float(self.windowOpacity()))
+        anim.setEndValue(0.0)
+        anim.start()
+
+    # ---------- 便签折叠（收成一条，仅显示标题 / 底色 / 透明度）----------
+
+    def _collapsed_height(self):
+        """折叠条的基准高度（不含悬停预览行）：标题行 + 各级边距。
+
+        结果缓存到 `_strip_h`（样式变化时由 set_collapsed 置 0 失效），
+        计算时临时隐藏悬停预览行，避免它把基准高度算大。
+        """
+        cached = getattr(self, '_strip_h', 0)
+        if cached > 0:
+            return cached
+        peek = getattr(self, '_peek_lbl', None)
+        peek_was_visible = bool(peek is not None and peek.isVisible())
+        try:
+            if peek_was_visible:
+                peek.hide()
+            lay = self.bg_frame.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            h = self.bg_frame.sizeHint().height()
+            win_lay = self.layout()
+            if win_lay is not None:
+                m = win_lay.contentsMargins()
+                h += m.top() + m.bottom()
+        finally:
+            if peek_was_visible:
+                peek.show()
+        self._strip_h = max(int(h), _COLLAPSED_MIN_HEIGHT)
+        return self._strip_h
+
+    def _set_collapse_margins(self, collapsed):
+        """折叠时收紧窗口与卡片上下边距，让那一条更薄、可点面积更大；展开时还原。"""
+        win_lay = self.layout()
+        frame_lay = self.bg_frame.layout()
+        if collapsed:
+            if win_lay is not None:
+                m = win_lay.contentsMargins()
+                self._saved_win_margins = (m.left(), m.top(), m.right(), m.bottom())
+                win_lay.setContentsMargins(m.left(), _COLLAPSED_V_MARGIN,
+                                           m.right(), _COLLAPSED_V_MARGIN)
+            if frame_lay is not None:
+                m = frame_lay.contentsMargins()
+                self._saved_frame_margins = (m.left(), m.top(), m.right(), m.bottom())
+                frame_lay.setContentsMargins(m.left(), _COLLAPSED_V_MARGIN,
+                                             m.right(), _COLLAPSED_V_MARGIN)
+        else:
+            saved = getattr(self, '_saved_win_margins', None)
+            if saved and win_lay is not None:
+                win_lay.setContentsMargins(*saved)
+                self._saved_win_margins = None
+            saved = getattr(self, '_saved_frame_margins', None)
+            if saved and frame_lay is not None:
+                frame_lay.setContentsMargins(*saved)
+                self._saved_frame_margins = None
+
+    def _hide_content_for_collapse(self):
+        """折叠：先记录各内容控件可见性快照，再隐藏 header 之外的一切。
+
+        统一按 bg_frame 布局遍历，四类便签（普通 / MD / 事务追踪器 / 日程表 / 新番）通用。
+        """
+        snap = {}
+        lay = self.bg_frame.layout()
+        if lay is not None:
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                w = item.widget() if item is not None else None
+                if w is None or w is self.header:
+                    continue
+                snap[w] = not w.isHidden()
+        self._enforce_collapsed_ui()
+        return snap
+
+    def _enforce_collapsed_ui(self):
+        """折叠态的显示不变量：除标题行外一律不显示（幂等，可重复调用）。
+
+        特殊便签的内容容器是在父类 __init__ 之后才插进布局的，子类重写的
+        `_apply_lock_ui`（在 super() 之后执行）也可能把内容再显出来，
+        所以收敛动作必须能被重复触发。
+        """
+        if not getattr(self, 'is_collapsed', False):
+            return
+        try:
+            peek_lbl = getattr(self, '_peek_lbl', None)
+            lay = self.bg_frame.layout()
+            if lay is not None:
+                for i in range(lay.count()):
+                    item = lay.itemAt(i)
+                    w = item.widget() if item is not None else None
+                    if w is None or w is self.header or w is peek_lbl:
+                        continue    # 悬停预览行由 _peeking 控制，不在这里压掉
+                    w.hide()
+            self.header.toolbar_container.hide()
+            self.header.drag_handle.hide()
+            for g in self._grips:
+                g.hide()
+            self.header.title_edit.setReadOnly(True)
+            self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        except RuntimeError:
+            pass
+
+    def showEvent(self, event):
+        """首次显示时落位待恢复的折叠状态（load_data 只打标记，原因见那里）。
+
+        特殊便签的内容容器与最小尺寸要等子类 __init__ 走完才成立；若在
+        load_data 里就收成一条，随后子类的 setMinimumSize(500/520/420, …)
+        会把最小高度顶回去，出现"标题变小、+ 号在、内容照旧显示"的错乱。
+        """
+        super().showEvent(event)
+        if getattr(self, '_pending_collapse', False):
+            self._pending_collapse = False
+            self.set_collapsed(True, animate=False, save=False)
+        # 显示后交给便签集管理器归组（批量加载时它自己防抖，只重建一次）
+        stacks.STACKS.on_note_shown(self)
+
+    def _set_title_stretch(self, collapsed):
+        """调整标题行拉伸因子，决定标题能显示多宽。
+
+        标题行右侧有个 stretch（把折叠按钮顶到最右）。
+        - 展开态：标题 0 / 空白 1。实测标题给 stretch 反而会被 Qt 压缩
+          （标题=3/空白=1 时标题只有 206px，标题=0/空白=1 时有 274px），
+          所以这里保持标题不吃 stretch，靠缩小拖拽点心把宽度让给标题。
+        - 折叠态：手柄已隐藏，标题直接吃满整条（STRETCH 1 / 空白 0）。
+        """
+        if collapsed:
+            # 折叠条：标题吃满整条，解除展开态的定宽限制
+            self.header.title_edit.setMinimumWidth(0)
+            self.header.title_edit.setMaximumWidth(_QWIDGETSIZE_MAX)
+        lay = self.header.title_layout
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item is None:
+                continue
+            if item.spacerItem() is not None:
+                lay.setStretch(i, 0 if collapsed else 1)
+            elif item.widget() is self.header.title_edit:
+                lay.setStretch(i, 1 if collapsed else 0)
+
+    def toggle_collapse(self):
+        """右上角按钮：折叠 / 展开便签。"""
+        self.set_collapsed(not self.is_collapsed)
+
+    def set_collapsed(self, collapsed, animate=True, save=True):
+        """折叠（收成一条）或展开，带高度动画。
+
+        Args:
+            collapsed: True=折叠，False=展开。
+            animate: False 时直接落位（启动恢复折叠状态用，避免闪动）。
+            save: 是否立即落盘。
+        """
+        collapsed = bool(collapsed)
+        if collapsed == getattr(self, 'is_collapsed', False):
+            return
+        self.is_collapsed = collapsed
+        self._strip_h = 0          # 折叠条基准高度重新计算（紧凑样式会改变标题行高）
+        self._peeking = False
+        if getattr(self, '_peek_lbl', None) is not None:
+            self._peek_lbl.hide()
+        anim = getattr(self, '_collapse_anim', None)
+        if anim is not None:
+            try:
+                anim.stop()
+            except RuntimeError:
+                self._collapse_anim = None
+        self._unlock_header_height()   # 上一次动画被打断，也别留下固定的标题行高度
+
+        if collapsed:
+            self._expanded_size = (self.width(), self.height())
+            # 各便签最小尺寸不同（普通 320×280 / 事务 500×320 / 日程 520×360 / 新番 420×320），
+            # MD 切半时最小宽还会变 → 折叠前快照，展开时原样还原
+            self._saved_min_size = (self.minimumWidth(), self.minimumHeight())
+            self._saved_frame_min = (self.bg_frame.minimumWidth(),
+                                     self.bg_frame.minimumHeight())
+            # 工具栏快照要抢在 _hide_content_for_collapse 之前取：那个收敛动作会顺手
+            # 把工具栏也藏起来，之后再读 isHidden() 就恒为 True —— 展开后工具栏再也回不来
+            self._collapsed_toolbar_prev = not self.header.toolbar_container.isHidden()
+            self._collapsed_prev_visible = self._hide_content_for_collapse()
+            self.header.toolbar_container.hide()
+            self._set_collapse_margins(True)
+            self.bg_frame.setMinimumSize(0, 0)
+            self.setMinimumSize(120, _COLLAPSED_MIN_HEIGHT)
+            # 折叠态整条可拖动：标题占满整条、隐藏拖拽手柄，标题不响应鼠标避免误进编辑态
+            self.header.set_title_compact(True)
+            self._set_title_stretch(True)
+            self.header.title_edit.setReadOnly(True)
+            self.header.title_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.header.title_edit.clearFocus()   # 去掉标题框的聚焦白底，让那一条更干净
+            self.header.drag_handle.hide()
+            for g in self._grips:
+                g.hide()
+            # 锁住标题行高度：折叠 / 展开动画期间 bg_frame 里只剩标题行可见，多出来的
+            # 高度会被整个灌给标题行 → 标题跟着窗口漂到中间。锁死后它稳稳待在顶部。
+            self._lock_header_height()
+            target_h = self._collapsed_height()
+            self.setMinimumHeight(target_h)   # 先抬最小高度，动画终点即新下限
+            self.collapse_btn.setText(icon("add"))
+            self.collapse_btn.setToolTip("展开便签")
+            self._animate_collapse_height(target_h, animate)
+        else:
+            expanded_h = (self._expanded_size[1] if self._expanded_size
+                          else max(self.height(), 320))
+            self.setMaximumHeight(_QWIDGETSIZE_MAX)   # 先解开上限，否则动画长不高
+            # 标题先切到展开态样式（顺带算出目标字号），再让字号从折叠态值平滑过渡过去。
+            # 否则动画期间每帧 resizeEvent 都会把它顶成"大号粗体"，看着就是"突然变粗"。
+            self.header.set_title_compact(False)
+            target_px = int(getattr(self.header, '_title_px', self.header.TITLE_PX))
+            self.header.animate_title_font(self.header.TITLE_PX_COMPACT, target_px,
+                                           ANIM_COLLAPSE_MS if animate else 1)
+            self._lock_header_height()
+            self.collapse_btn.setText(icon("remove"))
+            self.collapse_btn.setToolTip("折叠便签（收成一条）")
+            self._animate_collapse_height(int(expanded_h), animate)
+
+        if save and not getattr(self, '_is_loading', False):
+            self._mark_dirty()
+            self.save_data()
+
+    def _lock_header_height(self):
+        """把标题行钉在当前高度，折叠 / 展开动画期间不许它被布局拉伸。
+
+        折叠条里除标题行外的控件全被隐藏，bg_frame 的剩余高度会整个灌给标题行，
+        于是标题跟着"长高"的窗口一路漂到中间，动画结束才跳回顶部。
+        """
+        try:
+            h = max(int(self.header.sizeHint().height()), 24)
+            self.header.setFixedHeight(h)
+            self._header_height_locked = True
+        except RuntimeError:
+            pass
+
+    def _unlock_header_height(self):
+        """解除标题行高度锁定，交回布局自然分配。"""
+        if not getattr(self, '_header_height_locked', False):
+            return
+        self._header_height_locked = False
+        try:
+            self.header.setMinimumHeight(0)
+            self.header.setMaximumHeight(_QWIDGETSIZE_MAX)
+        except RuntimeError:
+            pass
+
+    def _ensure_collapse_anim(self):
+        """惰性创建并复用同一个几何动画对象。"""
+        if getattr(self, '_collapse_anim', None) is None:
+            anim = QPropertyAnimation(self, b"geometry", self)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.finished.connect(self._on_collapse_anim_done)
+            anim.valueChanged.connect(self._on_collapse_anim_step)
+            self._collapse_anim = anim
+        return self._collapse_anim
+
+    def _on_collapse_anim_step(self, _value):
+        """动画每一帧都重排整叠 —— 下方成员实时让位，不再等动画结束才"啪"地跳过去。"""
+        try:
+            stacks.STACKS.on_geometry_changed(self)
+        except RuntimeError:
+            pass
+
+    def _on_collapse_anim_done(self):
+        self._finish_collapse(self.is_collapsed)
+
+    def _install_bg_shadow(self, enabled=True):
+        """给便签底板装上 / 卸下投影特效。
+
+        半透明无边框窗口在 Windows 上是"分层窗口"，几何动画期间阴影会把绘制
+        区域扩到窗口矩形之外，导致 UpdateLayeredWindowIndirect 失败并刷报错，
+        所以折叠 / 展开动画期间先卸下投影，动画结束再装回。
+        """
+        if not enabled:
+            self.bg_frame.setGraphicsEffect(None)   # Qt 会接管并删除旧特效
+            self._bg_shadow = None
+            return
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 50))
+        shadow.setOffset(0, 4)
+        self.bg_frame.setGraphicsEffect(shadow)
+        self._bg_shadow = shadow
+
+    def _animate_collapse_height(self, target_h, animate):
+        """把窗口高度动画到目标值（保持左上角不动、宽度不变）。"""
+        start = self.geometry()
+        end = QRect(start.x(), start.y(), start.width(), int(target_h))
+        if not animate:
+            self.setGeometry(end)
+            self._finish_collapse(self.is_collapsed)
+            return
+        # 动画期间卸下底板投影：避免分层窗口的绘制区域超出窗口（见 _install_bg_shadow）
+        self._install_bg_shadow(False)
+        anim = self._ensure_collapse_anim()
+        anim.stop()
+        anim.setDuration(ANIM_COLLAPSE_MS)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        anim.start()
+
+    # ---------- 便签集：悬停"抽出"预览 ----------
+
+    def _build_peek_lbl(self):
+        """建立折叠条的悬停预览行（正常状态下隐藏）。"""
+        lbl = QLabel("")
+        lbl.setObjectName("peek_lbl")
+        lbl.setStyleSheet(
+            "background: transparent; color: #666666; font-size: 11px;"
+            " padding: 0 2px; border: none;"
+        )
+        lbl.setFixedHeight(_PEEK_LBL_H)
+        lbl.hide()
+        lay = self.bg_frame.layout()
+        if lay is not None:
+            lay.addWidget(lbl)
+        self._peek_lbl = lbl
+
+    def _grid_summary(self):
+        """网格类便签（事务 / 日程 / 新番）的摘要文案，供悬停预览使用。"""
+        try:
+            if hasattr(self, '_events'):
+                today = datetime_module.date.today().strftime("%Y-%m-%d")
+                today_n = sum(1 for e in self._events if e.get("date") == today)
+                return f"{len(self._events)} 个事件 · 今日 {today_n} 个"
+            if hasattr(self, '_habits'):
+                return f"{len(self._habits)} 个事务"
+            if hasattr(self, '_schedule'):
+                total = sum(len(v) for v in self._schedule.values())
+                return f"追番 {total} 部"
+        except Exception:
+            pass
+        return ""
+
+    def peek_text(self, max_len=42):
+        """悬停预览文字：网格便签给摘要，普通便签给正文首行，都没有则退回标题。"""
+        line = ""
+        if self._is_special_note():
+            line = self._grid_summary()
+        if not line:
+            try:
+                txt = self.text_edit.toPlainText().strip()
+                for ln in txt.splitlines():
+                    ln = ln.strip()
+                    if ln:
+                        line = ln
+                        break
+            except Exception:
+                line = ""
+        if not line:
+            line = self._grid_summary()
+        if len(line) > max_len:
+            line = line[:max_len - 1] + "…"
+        if not line:
+            line = self.header.title_edit.text().strip()
+        return line
+
+    def set_peek(self, on):
+        """折叠条"抽出一点"：临时增高一行，显示缩略预览（仅便签集成员）。"""
+        if not getattr(self, 'is_collapsed', False):
+            return
+        on = bool(on)
+        if bool(getattr(self, '_peeking', False)) == on:
+            return
+        self._peeking = on
+        if self._peek_lbl is None:
+            self._build_peek_lbl()
+        target = self._collapsed_height() + (_PEEK_H if on else 0)
+        try:
+            if on:
+                self._peek_lbl.setText(self.peek_text())
+            self._peek_lbl.setVisible(on)
+            if abs(self.height() - target) <= 1:
+                self._finish_collapse(True)     # 高度已到位，仅同步 min/max
+            else:
+                # 折叠态被 _finish_collapse 锁成 min = max = 原高度，
+                # 不先把约束放到能容纳目标高度，动画会被 Qt 夹回原值（抽出永远不生效）
+                lo, hi = sorted((target, self.height()))
+                self.setMinimumHeight(lo)
+                self.setMaximumHeight(hi)
+                self._animate_collapse_height(target, True)
+        except RuntimeError:
+            pass
+
+    def _refresh_hover_peek(self):
+        """防抖后的悬停判定：鼠标是否真的还在便签上（含子控件之间移动）。"""
+        try:
+            if not getattr(self, 'is_collapsed', False):
+                return
+            inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+            stacks.STACKS.peek(self, inside)
+        except RuntimeError:
+            pass
+
+    def _schedule_hover_peek(self):
+        if self._hover_timer is None:
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.setInterval(60)
+            self._hover_timer.timeout.connect(self._refresh_hover_peek)
+        self._hover_timer.start()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._schedule_hover_peek()   # 悬停预览行按需惰性创建
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._schedule_hover_peek()
+
+    def hideEvent(self, event):
+        """隐藏 / 显示都会影响便签集的排布（成员不占位、夹子跟着收）。"""
+        super().hideEvent(event)
+        stacks.STACKS.on_geometry_changed(self)
+
+    def _finish_collapse(self, collapsed):
+        """折叠 / 展开动画结束后的收尾：尺寸约束与内容可见性。"""
+        try:
+            if getattr(self, '_bg_shadow', None) is None and hasattr(self, 'bg_frame'):
+                self._install_bg_shadow(True)   # 动画结束把投影装回
+            if collapsed:
+                # 锁成一条，避免被误拉高
+                self.setMinimumHeight(self.height())
+                self.setMaximumHeight(self.height())
+            else:
+                self._set_collapse_margins(False)
+                self.header.set_title_compact(False)   # 还原标题字号与粗体
+                self._set_title_stretch(False)
+                fw, fh = getattr(self, '_saved_frame_min', None) or (300, 260)
+                self.bg_frame.setMinimumSize(fw, fh)
+                mw, mh = getattr(self, '_saved_min_size', None) or (320, 280)
+                self.setMaximumHeight(_QWIDGETSIZE_MAX)
+                self.setMinimumSize(mw, mh)
+                for w, vis in (self._collapsed_prev_visible or {}).items():
+                    try:
+                        w.setVisible(vis)
+                    except RuntimeError:
+                        continue
+                self._collapsed_prev_visible = {}
+                self._apply_lock_ui()   # 恢复工具栏 / 缩放手柄 / 标题只读态
+                self._peeking = False
+                if getattr(self, '_peek_lbl', None) is not None:
+                    self._peek_lbl.hide()
+                # 工具栏可见性按折叠前的状态还原（新番便签常态下不显示工具栏）
+                prev = getattr(self, '_collapsed_toolbar_prev', None)
+                if prev is not None:
+                    self.header.toolbar_container.setVisible(
+                        bool(prev) and not self.is_locked)
+                    self._collapsed_toolbar_prev = None
+                # 展开收尾：标题行恢复由布局自由分配（工具栏回来后它会自然变高）
+                self._unlock_header_height()
+            # 高度变了 → 让便签集里的上下成员跟着让位
+            stacks.STACKS.on_geometry_changed(self)
+        except RuntimeError:
+            pass
+
+    def _is_collapsed_for_save(self):
+        """写盘用的折叠状态：待落位的折叠也算折叠。
+
+        折叠状态在首次显示时才真正落位（特殊便签的内容要等子类建完），
+        这期间若因退出等原因触发保存，不能把状态写成未折叠。
+        """
+        return bool(getattr(self, 'is_collapsed', False)
+                    or getattr(self, '_pending_collapse', False))
+
+    def _persist_height(self):
+        """写盘用的高度：折叠态返回展开高度，避免用一条的高度覆盖存档。"""
+        if self._is_collapsed_for_save() and self._expanded_size:
+            return self._expanded_size[1]
+        return self.height()
+
+    # ---------- 折叠条整条拖动 ----------
+    # 标题行内的拖动由 HeaderBar 负责；卡片边距与窗口留白处的拖动落到窗口自身事件上，
+    # 这样"整条任意位置都能拖"，无需再保留那三个点的手柄。
+
+    def mousePressEvent(self, event):
+        if getattr(self, 'is_collapsed', False) and event.button() == Qt.LeftButton:
+            self._strip_drag_pos = event.globalPosition().toPoint() - self.pos()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = getattr(self, '_strip_drag_pos', None)
+        if (getattr(self, 'is_collapsed', False) and pos is not None
+                and (event.buttons() & Qt.LeftButton)):
+            self.move(event.globalPosition().toPoint() - pos)
+            stacks.STACKS.on_drag_moved(self)        # 叠内实时让位
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if getattr(self, '_strip_drag_pos', None) is not None:
+            self._strip_drag_pos = None
+            self.save_data()   # 拖完落盘新位置
+            stacks.STACKS.on_drag_released(self)     # 吸附 / 排序 / 拆出
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     # --- Markdown 模式切换 ---
 
@@ -2040,6 +2803,8 @@ class AniNoteWindow(QWidget):
         if self.is_always_on_top:
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
+        # 便签夹的标题条也要跟着置顶 / 取消置顶，否则整叠沉下去了只剩它还浮在最上层
+        stacks.STACKS.on_window_state_changed(self)
 
     # --- 持久化 ---
 
@@ -2157,10 +2922,13 @@ class AniNoteWindow(QWidget):
             "markdown": bool(getattr(self, 'editor_host', None) and self.editor_host.is_md),
             "content_md": md_src,
             "x": self.x(), "y": self.y(),
-            "width": self.width(), "height": self.height(),
+            "width": self.width(), "height": self._persist_height(),
             "is_locked": self.is_locked,
             "is_always_on_top": getattr(self, 'is_always_on_top', True),
             "is_hidden": getattr(self, 'is_hidden', False),
+            "is_collapsed": self._is_collapsed_for_save(),
+            "stack_id": getattr(self, 'stack_id', ''),
+            "stack_pos": int(getattr(self, 'stack_pos', 0) or 0),
             "bg_color": self.bg_color,
             "note_hotkey": getattr(self, '_note_hotkey', ''),
             # 持久化 MD 切半前的原始全宽（重启后避免二次切半，解除锁定可还原全宽）
@@ -2182,7 +2950,7 @@ class AniNoteWindow(QWidget):
         super().closeEvent(event)
 
     def resizeEvent(self, event):
-        """重新定位四角缩放手柄。"""
+        """重新定位四角缩放手柄，并让过长标题重新自适应字号。"""
         super().resizeEvent(event)
         bw = self.bg_frame.width()
         bh = self.bg_frame.height()
@@ -2191,6 +2959,7 @@ class AniNoteWindow(QWidget):
         self._grips[1].move(bw - gs, 0)      # 右上
         self._grips[2].move(0, bh - gs)      # 左下
         self._grips[3].move(bw - gs, bh - gs) # 右下
+        self.header.refresh_title_font()
 
     def load_data(self):
         """从 JSON 文件恢复便签状态。"""
@@ -2275,6 +3044,8 @@ class AniNoteWindow(QWidget):
                         self.editor_host.md_view._apply_src_visible()
                     self.is_locked = data.get("is_locked", False)
                     self.is_hidden = data.get("is_hidden", False)
+                    self.stack_id = data.get("stack_id", "") or ""
+                    self.stack_pos = int(data.get("stack_pos", 0) or 0)
                     self.is_always_on_top = data.get("is_always_on_top", True)
                     self.bg_color = data.get("bg_color", [255, 249, 196, 242])
                     self._note_hotkey = data.get("note_hotkey", "")
@@ -2283,12 +3054,19 @@ class AniNoteWindow(QWidget):
                         QTimer.singleShot(0, lambda nid=self.note_id, hk=self._note_hotkey: global_signaler.register_note_hotkey.emit(nid, hk))
                     self.format_panel.opacity_slider.setValue(int(round(self.bg_color[3] / 2.55)))
                     self._apply_lock_ui()
+                    # 折叠状态不在此刻落位：特殊便签（事务/日程/新番）的内容与最小尺寸
+                    # 是在父类 __init__ 返回之后才建立的，这里收成一条会被随后设置的
+                    # 最小高度顶开（标题变小但内容照样显示）。改为首次显示时统一收（showEvent）
+                    if data.get("is_collapsed"):
+                        self._pending_collapse = True
             except Exception as e:
                 print(f"[AniNote] 加载便签 {self.note_id} 失败: {e}")
         else:
             self.header.title_edit.setText(get_new_note_title())
 
         self._is_loading = False
+        # 装载完标题后再自适应字号（此时字段宽度才算得准）
+        QTimer.singleShot(0, self.header.refresh_title_font)
 
     def update_button_hints(self):
         """配置变更后更新工具栏按钮的快捷键提示。"""
@@ -2466,7 +3244,8 @@ class HabitTrackerWindow(AniNoteWindow):
 
     def _show_if_not_hidden(self):
         if not getattr(self, 'is_hidden', False):
-            self.show()
+            # 淡入显示（不再直入直出）
+            self.animated_show()
             self.raise_()
             self.activateWindow()
 
@@ -3067,6 +3846,8 @@ class HabitTrackerWindow(AniNoteWindow):
         date_lbl.setStyleSheet("font-size: 13px; color: #333;")
         date_edit = QDateEdit()
         date_edit.setCalendarPopup(True)
+        # 去掉上下步进按钮：那个"隐身"小按钮会误改年份（保留日历下拉箭头）
+        date_edit.setButtonSymbols(QAbstractSpinBox.NoButtons)
         date_edit.setDate(QDate.currentDate())
         date_edit.setDisplayFormat("yyyy-MM-dd")
         date_edit.setStyleSheet(
@@ -3249,10 +4030,13 @@ class HabitTrackerWindow(AniNoteWindow):
             "title": title,
             "html_content": html,
             "x": self.x(), "y": self.y(),
-            "width": self.width(), "height": self.height(),
+            "width": self.width(), "height": self._persist_height(),
             "is_locked": self.is_locked,
             "is_always_on_top": getattr(self, 'is_always_on_top', True),
             "is_hidden": getattr(self, 'is_hidden', False),
+            "is_collapsed": self._is_collapsed_for_save(),
+            "stack_id": getattr(self, 'stack_id', ''),
+            "stack_pos": int(getattr(self, 'stack_pos', 0) or 0),
             "bg_color": self.bg_color,
             "note_hotkey": getattr(self, '_note_hotkey', ''),
             "habits_data": {
@@ -3312,6 +4096,50 @@ def _time_to_min(hhmm):
 def _min_to_hhmm(mins):
     """当日分钟数 → "HH:MM"。"""
     return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def _make_time_selectors(style=""):
+    """生成「时 + 分」两个下拉框（点开直接选，不用按步进箭头试探）。"""
+    hour_cb = QComboBox()
+    hour_cb.addItems([f"{h:02d}" for h in range(24)])
+    minute_cb = QComboBox()
+    minute_cb.addItems([f"{m:02d}" for m in range(60)])   # 00 ~ 59 全量
+    for cb in (hour_cb, minute_cb):
+        cb.setStyleSheet(style)
+        cb.setFixedWidth(64)
+        cb.setMaxVisibleItems(12)
+        cb.setCursor(Qt.PointingHandCursor)
+    return hour_cb, minute_cb
+
+
+def _set_time_selectors(hour_cb, minute_cb, hhmm, default="09:00"):
+    """把 "HH:MM" 回填到「时 / 分」下拉框（非 5 分钟整的旧数据临时补进分列表）。"""
+    text = hhmm if isinstance(hhmm, str) and ":" in hhmm else default
+    try:
+        h_str, m_str = text.split(":")[:2]
+        h, m = int(h_str), int(m_str)
+    except (ValueError, AttributeError):
+        h, m = int(default.split(":")[0]), int(default.split(":")[1])
+    h, m = max(0, min(23, h)), max(0, min(59, m))
+    hour_cb.setCurrentText(f"{h:02d}")
+    m_text = f"{m:02d}"
+    if minute_cb.findText(m_text) < 0:
+        minute_cb.addItem(m_text)
+        try:
+            minute_cb.model().sort(0)   # 补进来的非整值也按序显示
+        except Exception:
+            pass
+    minute_cb.setCurrentText(m_text)
+
+
+def _read_time_selectors(hour_cb, minute_cb, default="09:00"):
+    """「时 / 分」下拉框 → "HH:MM"（越界值钳制，文本异常回退默认）。"""
+    try:
+        h = max(0, min(23, int(hour_cb.currentText())))
+        m = max(0, min(59, int(minute_cb.currentText())))
+        return f"{h:02d}:{m:02d}"
+    except (ValueError, TypeError):
+        return default
 
 
 class ScheduleDayHeader(QWidget):
@@ -3565,11 +4393,62 @@ class ScheduleGridArea(QWidget):
         super().mouseMoveEvent(event)
 
 
+def _wrap_text_lines(fm, text, width, max_lines):
+    """按像素宽度把文本折行，返回行列表。
+
+    - 中英文混排逐字符累加，超出宽度即换行（英文单词会被按字符切开，
+      但事件名普遍较短，视觉上比整词换行更省空间）。
+    - 超过 max_lines 时截断，返回的最后一行末尾带省略号（"…"）。
+    """
+    lines = []
+    if not text or width <= 0 or max_lines < 1:
+        return lines
+    cur = ""
+    i = 0
+    n = len(text)
+    truncated = False
+    while i < n:
+        ch = text[i]
+        if ch == "\n":                      # 显式换行
+            lines.append(cur)
+            cur = ""
+            i += 1
+            if len(lines) >= max_lines:
+                truncated = i < n
+                break
+            continue
+        if cur and fm.horizontalAdvance(cur + ch) > width:
+            lines.append(cur)
+            cur = ""
+            if len(lines) >= max_lines:
+                truncated = True
+                break
+            continue                        # 当前字符留到下一行重新判断
+        cur += ch
+        i += 1
+    if not truncated:
+        if cur or not lines:
+            lines.append(cur)
+        return lines
+    # 已截断：把最后一行按宽度补省略号
+    ell = "…"
+    ell_w = fm.horizontalAdvance(ell)
+    last = lines[-1] if lines else ""
+    while last and fm.horizontalAdvance(last) + ell_w > width:
+        last = last[:-1]
+    if lines:
+        lines[-1] = last + ell
+    else:
+        lines.append(ell)
+    return lines
+
+
 class ScheduleBlock(QFrame):
     """日程表事件块：彩色圆角色块，左键标记完成，右键弹出编辑菜单。
 
     hover 时在事件条上下显示具体开始/结束时间（默认隐藏）。
     date 参数：该块对应的事件日期（重复事件按日期判断完成状态）。
+    事件名按块尺寸自动折行/收缩字号，尽量在同一块内完整显示。
     """
 
     clicked = Signal()
@@ -3580,6 +4459,7 @@ class ScheduleBlock(QFrame):
         self.expanded = expanded      # 日视图 True（展开备注）/ 周视图 False（缩略）
         self.date = date              # 该块对应的事件日期（datetime.date）
         self._window = None
+        self._last_fit_size = None    # 上次自适应时的块尺寸（避免重复计算）
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
         self._hover = False
@@ -3604,19 +4484,29 @@ class ScheduleBlock(QFrame):
         self._start_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._start_lbl.setVisible(False)
         layout.addWidget(self._start_lbl)
-        # 标题
+        # 标题：字号自适应 + 自动折行（由 _fit_content 按块尺寸计算）
+        # ⚠️ 尺寸策略不能用 Ignored —— QWidgetItem::isEmpty() 对水平 Ignored 的子件返回 True，
+        # 布局会直接跳过它（分到 0 尺寸）。这里用 垂直 Expanding（吃掉剩余高度）+
+        # 最小尺寸 0（允许被压到很小），宽度由块几何决定，不会反向撑大块。
         self._title_lbl = QLabel(ev.get("title", ""))
-        self._title_lbl.setStyleSheet("background: transparent; border: none; font-weight: bold;")
-        layout.addWidget(self._title_lbl)
+        self._title_lbl.setWordWrap(False)
+        self._title_lbl.setTextFormat(Qt.PlainText)   # 标题按纯文本渲染，避免被当作富文本
+        self._title_lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._title_lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self._title_lbl.setMinimumSize(0, 0)
+        layout.addWidget(self._title_lbl, 1)     # 拉伸因子 1：占满时间/备注之外的全部空间
         # 展开模式：时间范围 + 备注
         if self.expanded:
             self._time_lbl = QLabel(f"{ev.get('start', '09:00')} - {ev.get('end', '10:00')}")
             self._time_lbl.setStyleSheet("background: transparent; border: none; font-size: 11px;")
+            self._time_lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             layout.addWidget(self._time_lbl)
             note = ev.get("note", "")
             if note:
                 self._note_lbl = QLabel(note)
                 self._note_lbl.setWordWrap(True)
+                # 高度策略 Maximum：备注按需占高、不抢伸展空间，剩余高度全部留给标题
+                self._note_lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
                 self._note_lbl.setStyleSheet("background: transparent; border: none; font-size: 12px;")
                 layout.addWidget(self._note_lbl)
         # 底部时间标签（hover 显示具体结束时间，左下角、无底色）
@@ -3648,9 +4538,10 @@ class ScheduleBlock(QFrame):
             f" border-left: 3px solid {border}; }}"
         )
         self._title_lbl.setStyleSheet(
-            f"background: transparent; border: none; font-weight: bold; color: {text};"
-            f" font-size: {'13px' if self.expanded else '12px'};"
+            f"background: transparent; border: none; color: {text};"
         )
+        # 字号不写进 QSS（避免覆盖自适应字号），统一由 _title_font 设置
+        self._title_lbl.setFont(self._title_font(13 if self.expanded else 12))
         # 时间标签：无底色、小字、左上/左下角
         time_style = (
             f"background: transparent; border: none; color: {time_text};"
@@ -3658,6 +4549,133 @@ class ScheduleBlock(QFrame):
         )
         self._start_lbl.setStyleSheet(time_style)
         self._end_lbl.setStyleSheet(time_style)
+
+    def _title_font(self, px):
+        """构造标题字体：字号按块尺寸自适应（像素级，避免 QSS 覆盖）。"""
+        f = QFont(self._title_lbl.font())
+        f.setPixelSize(px)
+        f.setBold(True)
+        return f
+
+    def _sync_layout(self):
+        """立即让布局按当前可见性重排（同步拿到子件真实几何）。
+
+        注意：单独调用 QLayout.activate() 不会重排——布局未被标记失效时直接返回，
+        读到的仍是旧几何。必须先 invalidate() 再 activate()。
+        """
+        layout = self.layout()
+        if layout is None:
+            return
+        layout.invalidate()
+        layout.activate()
+
+    def _fit_content(self):
+        """按块的实际尺寸排布内容：优先让事件名在同一块内完整显示。
+
+        依次尝试（越靠前信息越全）：
+          1. 保留时间行 + 备注，标题自动折行，字号 13→9 逐级收缩；
+          2. 名字仍放不下 → 收起备注，把空间让给标题；
+          3. 还放不下 → 连时间行一起收起，只留名字；
+          4. 极限兜底：最小字号 + 末行省略号（尽量多显示字符、不硬切）。
+
+        可用宽高直接取标题标签的真实几何（已扣除布局边距与 QSS 左边框），
+        避免按块宽估算导致末字被裁。
+        """
+        layout = self.layout()
+        size = (self.width(), self.height())
+        if size == self._last_fit_size:
+            return
+        self._last_fit_size = size
+
+        # hover 时间标签只在鼠标悬停时出现，会临时挤占高度。
+        # 自适应一律按"非 hover 稳态"计算，否则悬停时改窗口大小会把标题字号误缩一档。
+        hover_was = (not self._start_lbl.isHidden(), not self._end_lbl.isHidden())
+        if hover_was[0]:
+            self._start_lbl.setVisible(False)
+        if hover_was[1]:
+            self._end_lbl.setVisible(False)
+        try:
+            self._fit_content_inner(layout)
+        finally:
+            if hover_was[0]:
+                self._start_lbl.setVisible(True)
+            if hover_was[1]:
+                self._end_lbl.setVisible(True)
+
+    def _fit_content_inner(self, layout):
+        """_fit_content 的实际计算部分（已排除 hover 标签干扰）。"""
+
+        # 矮块收紧内边距/间距，腾出足够的行高（否则 18px 的块放不下一行字）
+        h = self.height()
+        m_v, sp = (1, 1) if h < 26 else ((3, 2) if h < 40 else (4, 2))
+        if layout is not None and layout.contentsMargins().top() != m_v:
+            layout.setContentsMargins(6, m_v, 6, m_v)
+            layout.setSpacing(sp)
+
+        title = (self.event_data.get("title") or "").strip()
+        has_time = hasattr(self, "_time_lbl")
+        has_note = hasattr(self, "_note_lbl")
+        sizes = (13, 12, 11, 10) if self.expanded else (12, 11, 10, 9)
+
+        if has_time and has_note:
+            combos = [(True, True), (True, False), (False, False)]
+        elif has_time:
+            combos = [(True, False), (False, False)]
+        elif has_note:
+            combos = [(False, True), (False, False)]
+        else:
+            combos = [(False, False)]
+
+        chosen = None
+        for keep_time, keep_note in combos:
+            if has_time:
+                self._time_lbl.setVisible(keep_time)
+            if has_note:
+                self._note_lbl.setVisible(keep_note)
+            self._sync_layout()                 # 立即按新可见性重排（见 _sync_layout 说明）
+            w = max(self._title_lbl.width(), 10)
+            avail = self._title_lbl.height()
+            if avail < 8:
+                continue
+            for px in sizes:
+                fm = QFontMetrics(self._title_font(px))
+                if fm.lineSpacing() > avail + 1:    # 该字号一行都塞不进 → 换更小字号
+                    continue
+                max_lines = max(1, int(avail // max(fm.lineSpacing(), 1)))
+                lines = _wrap_text_lines(fm, title, w, 10 ** 6)
+                if len(lines) <= max_lines:         # 完整放得下（无省略号）
+                    chosen = (keep_time, keep_note, px, lines)
+                    break
+            if chosen:
+                break
+
+        if chosen is None:                  # 兜底：只留名字 + 最小字号 + 省略号
+            if has_time:
+                self._time_lbl.setVisible(False)
+            if has_note:
+                self._note_lbl.setVisible(False)
+            self._sync_layout()
+            px = sizes[-1]
+            fm = QFontMetrics(self._title_font(px))
+            w = max(self._title_lbl.width(), 10)
+            avail = max(self._title_lbl.height(), fm.lineSpacing())
+            max_lines = max(1, int(avail // max(fm.lineSpacing(), 1)))
+            chosen = (False, False, px,
+                      _wrap_text_lines(fm, title, w, max_lines))
+
+        keep_time, keep_note, px, lines = chosen
+        if has_time:
+            self._time_lbl.setVisible(keep_time)
+        if has_note:
+            self._note_lbl.setVisible(keep_note)
+        self._title_lbl.setFont(self._title_font(px))
+        self._title_lbl.setText("\n".join(lines))
+        # 名字被省略号截断时，悬停可看全名
+        self._title_lbl.setToolTip(title if "…" in "".join(lines) else "")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_content()
 
     def enterEvent(self, event):
         self._hover = True
@@ -3737,11 +4755,22 @@ class ScheduleWindow(AniNoteWindow):
         self._now_timer.setInterval(30000)
         self._now_timer.timeout.connect(self._refresh_now_line)
         self._now_timer.start()
+        self._last_seen_day = datetime_module.date.today()   # 跨天检测基准
 
     def _refresh_now_line(self):
-        """重绘当前时间指示线（30 秒定时触发，随真实时间前进）。"""
+        """重绘当前时间指示线（30 秒定时触发，随真实时间前进）。
+
+        同时做跨天检测：程序长时间开着时，日视图若停留在旧日期，
+        自动跳到当天（周视图不动——本来就含今天）。
+        """
         if hasattr(self, '_grid_area'):
             self._grid_area.update()
+        today = datetime_module.date.today()
+        if getattr(self, '_last_seen_day', None) != today:
+            self._last_seen_day = today
+            if self._view_mode == "day" and self._center_date != today:
+                self._center_date = today
+                self._refresh_view()
 
     def _init_bangumi_mode(self):
         pass
@@ -3776,6 +4805,7 @@ class ScheduleWindow(AniNoteWindow):
 
         self._anchor_edit = QDateEdit()
         self._anchor_edit.setCalendarPopup(True)
+        self._anchor_edit.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self._anchor_edit.setDisplayFormat("yyyy-MM-dd")
         if self._anchor_week:
             d = self._anchor_week
@@ -3819,7 +4849,8 @@ class ScheduleWindow(AniNoteWindow):
 
     def _show_if_not_hidden(self):
         if not getattr(self, 'is_hidden', False):
-            self.show()
+            # 淡入显示（不再直入直出）
+            self.animated_show()
             self.raise_()
             self.activateWindow()
 
@@ -4188,6 +5219,9 @@ class ScheduleWindow(AniNoteWindow):
                 item["date"] = cur.strftime("%Y-%m-%d")
                 item["repeat"] = "none"        # 实体不再按周期展开
                 item["batch_id"] = batch_id    # 批次标识（用于整体替换/删除）
+                # 记录所属系列的重复规则：实体自身 repeat 为 none，
+                # 编辑单条时据此回显原规则（否则下拉只能显示"不重复"，需重设）
+                item["series_repeat"] = rep
                 dk = cur.strftime("%Y-%m-%d")
                 item["done"] = bool(done_dates.get(dk, False))
                 item.pop("done_dates", None)
@@ -4195,6 +5229,46 @@ class ScheduleWindow(AniNoteWindow):
             cur += datetime_module.timedelta(days=1)
             guard += 1
         return items
+
+    @staticmethod
+    def _infer_series_repeat(members):
+        """从批次成员的日期间隔推断重复规则（旧数据兼容，推断不出返回空串）。"""
+        try:
+            ds = sorted(datetime_module.date.fromisoformat(m.get("date", ""))
+                        for m in members if m.get("date"))
+        except ValueError:
+            return ""
+        if len(ds) < 2:
+            return ""
+        deltas = [(ds[i + 1] - ds[i]).days for i in range(len(ds) - 1)]
+        if all(d == 1 for d in deltas):
+            return "daily"
+        if all(d == 7 for d in deltas):
+            return "weekly"
+        if all(a.day == b.day for a, b in zip(ds, ds[1:])):
+            months = [d.year * 12 + d.month for d in ds]
+            md = [months[i + 1] - months[i] for i in range(len(months) - 1)]
+            if all(m == 1 for m in md):
+                return "monthly"
+            if all(m == 12 for m in md):
+                return "yearly"
+        return ""
+
+    def _migrate_series_repeat(self):
+        """旧数据补写：为缺 series_repeat 的重复系列实体推断原规则，
+        使单条编辑时能回显（否则只能显示"不重复"）。"""
+        batches = {}
+        for e in self._events:
+            bid = e.get("batch_id")
+            if bid:
+                batches.setdefault(bid, []).append(e)
+        for _bid, members in batches.items():
+            if any(m.get("series_repeat") for m in members):
+                continue
+            rep = self._infer_series_repeat(members)
+            if rep:
+                for m in members:
+                    m["series_repeat"] = rep
 
     # ---------- 渲染 ----------
 
@@ -4329,10 +5403,14 @@ class ScheduleWindow(AniNoteWindow):
             menu.addSeparator()
             act_edit = menu.addAction("编辑事件…")
             act_edit.triggered.connect(lambda: self._show_event_dialog(ev))
-            # 物化实体（有 batch_id）→ 提供"删除整个重复系列"入口
+            # 物化实体（有 batch_id）→ 提供"编辑整个系列 / 删除整个系列"入口
             batch_id = ev.get("batch_id")
             if batch_id:
                 n = sum(1 for e in self._events if e.get("batch_id") == batch_id)
+                act_edit_series = menu.addAction(f"编辑整个系列（{n} 条）…")
+                # ⚠️ triggered 传 bool checked，必须显式接收，否则默认参数被覆盖
+                act_edit_series.triggered.connect(
+                    lambda checked=False, e=ev: self._show_event_dialog(e, series=True))
                 act_del_batch = menu.addAction(f"删除整个重复系列（{n} 条）")
                 # ⚠️ triggered 信号会传 bool checked 参数，默认值 b=batch_id 会被覆盖！
                 # 必须显式接收 checked 并默认 False，batch_id 用默认参数捕获。
@@ -4361,11 +5439,28 @@ class ScheduleWindow(AniNoteWindow):
 
     # ---------- 新建 / 编辑事件弹窗（对齐事务追踪器新建事务风格）----------
 
-    def _show_event_dialog(self, ev=None):
-        """新建（ev=None）或编辑（ev 为现有事件）事件弹窗。"""
+    def _show_event_dialog(self, ev=None, series=False):
+        """新建（ev=None）/ 编辑单条 / 编辑整个重复系列（series=True）事件弹窗。
+
+        - 单条编辑系列成员：重复下拉禁用并回显系列规则（保留最近状态，不必重设），
+          边界行隐藏（规则归系列管理），仅标题/日期/时间/提醒/颜色/备注可改。
+        - 系列编辑：以批次全量为基准预填（起始日期取最早一条），保存后重建整个系列，
+          已完成标记按日期保留。
+        """
         if self.is_locked:
             return
         editing = ev is not None
+        # 系列成员的单条编辑（下拉只读，避免误改规则导致整批重建）
+        is_series_member = bool(editing and not series and ev.get("batch_id"))
+        # 系列编辑：批次成员集合（用于取最早起始日与保留完成状态）
+        series_members = []
+        if series and ev:
+            _bid = ev.get("batch_id")
+            series_members = [e for e in self._events if e.get("batch_id") == _bid]
+        # 回显用的重复规则：系列成员记在 series_repeat 上（实体自身 repeat 恒为 none）
+        base_rep = "none"
+        if editing:
+            base_rep = ev.get("series_repeat") or ev.get("repeat", "none")
 
         dialog = QDialog(self)
         dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -4398,7 +5493,7 @@ class ScheduleWindow(AniNoteWindow):
         dlg_bar.setFixedHeight(45)
         bar_layout = QHBoxLayout(dlg_bar)
         bar_layout.setContentsMargins(20, 0, 10, 0)
-        dlg_title = QLabel("编辑事件" if editing else "新建事件")
+        dlg_title = QLabel("编辑整个系列" if series else ("编辑事件" if editing else "新建事件"))
         dlg_title.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #333;"
             " font-family: 'Microsoft YaHei';"
@@ -4457,19 +5552,29 @@ class ScheduleWindow(AniNoteWindow):
         content.addWidget(title_input)
 
         # 日期 + 重复（放在同一行，重复在日期栏旁边）
-        date_lbl = QLabel("日期")
+        date_lbl = QLabel("起始日期" if series else "日期")
         date_lbl.setStyleSheet(lbl_style)
         date_edit = QDateEdit()
         date_edit.setCalendarPopup(True)
+        # 去掉上下步进按钮（防误改年份），保留日历下拉箭头
+        date_edit.setButtonSymbols(QAbstractSpinBox.NoButtons)
         date_edit.setDisplayFormat("yyyy-MM-dd")
         date_edit.setStyleSheet(input_style)
-        if editing:
+        if series and series_members:
+            # 系列编辑：起始日期取批次最早一条（保持原起点，可改）
+            try:
+                first_date = min(m.get("date", "") for m in series_members)
+                date_edit.setDate(QDate.fromString(first_date, "yyyy-MM-dd"))
+            except Exception:
+                date_edit.setDate(QDate.currentDate())
+        elif editing:
             try:
                 date_edit.setDate(QDate.fromString(ev.get("date", ""), "yyyy-MM-dd"))
             except Exception:
                 date_edit.setDate(QDate.currentDate())
         else:
-            date_edit.setDate(QDate(self._center_date.year, self._center_date.month, self._center_date.day))
+            # 新建事件：日期默认当天（不跟随视图所在日期）
+            date_edit.setDate(QDate.currentDate())
         repeat_edit = QComboBox()
         repeat_edit.addItems(["不重复", "每天重复", "每周重复", "每月重复", "每年重复"])
         repeat_edit.setStyleSheet(
@@ -4479,37 +5584,53 @@ class ScheduleWindow(AniNoteWindow):
             " QComboBox::drop-down { border: none; width: 22px; }"
         )
         if editing:
-            rep = ev.get("repeat", "none")
-            idx = {"none": 0, "daily": 1, "weekly": 2, "monthly": 3, "yearly": 4}.get(rep, 0)
+            # 用 base_rep 回显：系列成员显示其所属系列的重复规则（保留最近状态）
+            idx = {"none": 0, "daily": 1, "weekly": 2, "monthly": 3, "yearly": 4}.get(base_rep, 0)
             repeat_edit.setCurrentIndex(idx)
+            if is_series_member:
+                # 单条编辑：重复规则由系列决定，禁止在此改动（避免误触整批重建）
+                repeat_edit.setEnabled(False)
+                repeat_edit.setToolTip("该事件属于重复系列，重复规则请使用「编辑整个系列」修改")
         date_row = QHBoxLayout()
         date_row.setSpacing(8)
         date_row.addWidget(date_edit, 1)
         date_row.addWidget(repeat_edit, 1)
         content.addWidget(date_lbl)
         content.addLayout(date_row)
+        if is_series_member:
+            series_hint = QLabel("属于重复系列：如需修改重复规则或周期，请右键选择「编辑整个系列」")
+            series_hint.setStyleSheet("font-size: 11px; color: #999; background: transparent;")
+            series_hint.setWordWrap(True)
+            content.addWidget(series_hint)
 
-        # 时间
+        # 时间：时 + 分 两个下拉（直接点选，没有步进箭头可误触）
         time_lbl = QLabel("时间")
         time_lbl.setStyleSheet(lbl_style)
         time_row = QHBoxLayout()
-        time_row.setSpacing(8)
-        start_edit = QTimeEdit()
-        end_edit = QTimeEdit()
-        for te in (start_edit, end_edit):
-            te.setDisplayFormat("HH:mm")
-            te.setStyleSheet(input_style)
-        if editing:
-            start_edit.setTime(QTime.fromString(ev.get("start", "09:00"), "HH:mm"))
-            end_edit.setTime(QTime.fromString(ev.get("end", "10:00"), "HH:mm"))
-        else:
-            start_edit.setTime(QTime(9, 0))
-            end_edit.setTime(QTime(10, 0))
+        time_row.setSpacing(4)
+        time_combo_style = (
+            "QComboBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
+            " font-size: 13px; background: #FFFFFF; }"
+            " QComboBox:focus { border-color: #1A73E8; }"
+            " QComboBox::drop-down { border: none; width: 18px; }"
+        )
+        start_h, start_m = _make_time_selectors(time_combo_style)
+        end_h, end_m = _make_time_selectors(time_combo_style)
+        _set_time_selectors(start_h, start_m, ev.get("start", "09:00") if editing else "09:00")
+        _set_time_selectors(end_h, end_m, ev.get("end", "10:00") if editing else "10:00")
+        colon1 = QLabel(":")
+        colon2 = QLabel(":")
+        for c in (colon1, colon2):
+            c.setStyleSheet("font-size: 13px; color: #888; background: transparent;")
         dash = QLabel("至")
         dash.setStyleSheet("font-size: 13px; color: #888; background: transparent;")
-        time_row.addWidget(start_edit)
+        time_row.addWidget(start_h)
+        time_row.addWidget(colon1)
+        time_row.addWidget(start_m)
         time_row.addWidget(dash)
-        time_row.addWidget(end_edit)
+        time_row.addWidget(end_h)
+        time_row.addWidget(colon2)
+        time_row.addWidget(end_m)
         time_row.addStretch()
         content.addWidget(time_lbl)
         content.addLayout(time_row)
@@ -4527,6 +5648,7 @@ class ScheduleWindow(AniNoteWindow):
         bd_infinite.setChecked(True)
         bd_date = QDateEdit()
         bd_date.setCalendarPopup(True)
+        bd_date.setButtonSymbols(QAbstractSpinBox.NoButtons)
         bd_date.setDisplayFormat("yyyy-MM-dd")
         bd_date.setStyleSheet(input_style)
         bd_date.setDate(date_edit.date())
@@ -4556,12 +5678,13 @@ class ScheduleWindow(AniNoteWindow):
         bm_infinite.setChecked(True)
         bm_date = QDateEdit()
         bm_date.setCalendarPopup(True)
+        bm_date.setButtonSymbols(QAbstractSpinBox.NoButtons)
         bm_date.setDisplayFormat("yyyy-MM")
         bm_date.setStyleSheet(input_style)
         bm_date.setDate(date_edit.date())
         bm_date.setEnabled(False)
         bm_infinite.toggled.connect(lambda checked: bm_date.setEnabled(not checked))
-        if editing and ev.get("repeat") == "monthly" and ev.get("repeat_until"):
+        if editing and base_rep == "monthly" and ev.get("repeat_until"):
             try:
                 u = datetime_module.date.fromisoformat(ev["repeat_until"])
                 bm_date.setDate(QDate(u.year, u.month, 1))
@@ -4624,6 +5747,7 @@ class ScheduleWindow(AniNoteWindow):
         wu_infinite.setChecked(True)
         wu_date = QDateEdit()
         wu_date.setCalendarPopup(True)
+        wu_date.setButtonSymbols(QAbstractSpinBox.NoButtons)
         wu_date.setDisplayFormat("yyyy-MM-dd")
         wu_date.setStyleSheet(input_style)
         wu_date.setDate(date_edit.date())
@@ -4686,6 +5810,11 @@ class ScheduleWindow(AniNoteWindow):
 
         # 按重复类型切换边界行显示
         def update_bounds(idx):
+            if is_series_member:
+                # 系列成员单条编辑：边界归系列管理，全部隐藏
+                for _w in (bound_daily, bound_month, bound_week, bound_year):
+                    _w.setVisible(False)
+                return
             bound_daily.setVisible(idx == 1)      # 每天
             bound_month.setVisible(idx == 3)      # 每月
             bound_week.setVisible(idx == 2)       # 每周
@@ -4704,6 +5833,7 @@ class ScheduleWindow(AniNoteWindow):
         remind_value = QSpinBox()
         remind_value.setRange(1, 999)
         remind_value.setValue(10)
+        # 保留上下步进箭头（用户要求恢复：点箭头即可调数值）
         remind_value.setStyleSheet(
             "QSpinBox { padding: 6px 8px; border: 1px solid #D0D0D0; border-radius: 8px;"
             " background: #FFFFFF; font-size: 13px; }"
@@ -4812,7 +5942,7 @@ class ScheduleWindow(AniNoteWindow):
             " QPushButton:hover { background: #F0F0F0; border-color: #B0B0B0; }"
         )
         cancel_btn.clicked.connect(dialog.reject)
-        ok_btn = QPushButton("保存" if editing else "添加")
+        ok_btn = QPushButton("保存整个系列" if series else ("保存" if editing else "添加"))
         ok_btn.setStyleSheet(
             "QPushButton { padding: 8px 26px; border: none; border-radius: 8px;"
             " background: #1A73E8; font-size: 13px; color: #FFFFFF; font-weight: 600; }"
@@ -4829,8 +5959,8 @@ class ScheduleWindow(AniNoteWindow):
             title = title_input.text().strip()
             if not title:
                 return
-            s_time = start_edit.time().toString("HH:mm")
-            e_time = end_edit.time().toString("HH:mm")
+            s_time = _read_time_selectors(start_h, start_m, "09:00")
+            e_time = _read_time_selectors(end_h, end_m, "10:00")
             if _time_to_min(e_time) <= _time_to_min(s_time):
                 QMessageBox.warning(self, "时间无效", "结束时间必须晚于开始时间。")
                 return
@@ -4868,31 +5998,72 @@ class ScheduleWindow(AniNoteWindow):
             if remind_enable.isChecked():
                 unit = {0: "minute", 1: "hour", 2: "day"}[remind_unit.currentIndex()]
                 remind = {"value": remind_value.value(), "unit": unit}
-            if editing:
+            if series:
+                # 编辑整个系列：按原批次重建，已完成标记按日期保留
+                _bid = ev.get("batch_id")
+                done_map = {}
+                for m in series_members:
+                    _dk = m.get("date", "")
+                    if _dk:
+                        done_map[_dk] = bool(m.get("done", False))
+                self._events = [e for e in self._events if e.get("batch_id") != _bid]
+                template = {
+                    "id": uuid.uuid4().hex[:8],
+                    "title": title,
+                    "date": date_str,
+                    "start": s_time,
+                    "end": e_time,
+                    "note": note_input.toPlainText().strip(),
+                    "color": selected_color[0],
+                    "repeat": rep,
+                    "remind": remind,
+                    "repeat_until": repeat_until,
+                    "week_start": week_start,
+                    "week_end": week_end,
+                    "year_start": year_start,
+                    "year_end": year_end,
+                    "done": False,
+                    "done_dates": done_map,   # 物化时按日期映射回完成状态
+                }
+                if rep != "none":
+                    self._events.extend(self._materialize_repeat(template, _bid))
+                else:
+                    # 系列改为不重复：仅保留起始日那一条为单次事件
+                    single = dict(template)
+                    single.pop("done_dates", None)
+                    single["done"] = bool(done_map.get(date_str, False))
+                    self._events.append(single)
+            elif editing:
                 ev["title"] = title
                 ev["date"] = date_str
                 ev["start"] = s_time
                 ev["end"] = e_time
                 ev["note"] = note_input.toPlainText().strip()
                 ev["color"] = selected_color[0]
-                ev["repeat"] = rep
                 ev["remind"] = remind
-                ev["repeat_until"] = repeat_until
-                ev["week_start"] = week_start
-                ev["week_end"] = week_end
-                ev["year_start"] = year_start
-                ev["year_end"] = year_end
-                if rep != "none":
-                    # 编辑成重复：删除该批次旧实体 + 编辑中的实体本身，重新物化
-                    bid = ev.get("batch_id") or ev["id"]
-                    self._events = [e for e in self._events
-                                    if e.get("batch_id") != bid
-                                    and e.get("id") != ev["id"]]
-                    template = dict(ev)
-                    self._events.extend(self._materialize_repeat(template, bid))
+                if is_series_member:
+                    # 系列成员单条编辑：只改这一条；重复规则与周期由系列管理，
+                    # 保持 repeat=none / series_repeat / batch_id 不变
+                    ev["repeat"] = "none"
                 else:
-                    ev.pop("batch_id", None)   # 转回单次
-                    ev.pop("done_dates", None)
+                    ev["repeat"] = rep
+                    ev["repeat_until"] = repeat_until
+                    ev["week_start"] = week_start
+                    ev["week_end"] = week_end
+                    ev["year_start"] = year_start
+                    ev["year_end"] = year_end
+                    if rep != "none":
+                        # 单次事件改为重复：以本条为起点物化新系列
+                        bid = ev.get("batch_id") or ev["id"]
+                        self._events = [e for e in self._events
+                                        if e.get("batch_id") != bid
+                                        and e.get("id") != ev["id"]]
+                        template = dict(ev)
+                        self._events.extend(self._materialize_repeat(template, bid))
+                    else:
+                        ev.pop("batch_id", None)   # 转回单次
+                        ev.pop("done_dates", None)
+                        ev.pop("series_repeat", None)
             else:
                 new_ev = {
                     "id": uuid.uuid4().hex[:8],
@@ -4939,6 +6110,7 @@ class ScheduleWindow(AniNoteWindow):
                     except ValueError:
                         pass
                 self._events = sd.get("events", [])
+                self._migrate_series_repeat()   # 旧数据：补写系列重复规则
                 # 起始周锚点（周一日期；空 = 未设置）
                 aw = sd.get("anchor_week", "")
                 if aw:
@@ -5186,7 +6358,7 @@ class BangumiScheduleWindow(AniNoteWindow):
     def _show_if_not_hidden(self):
         if not getattr(self, 'is_hidden', False):
             # 只显示不抢焦点：避免同步弹窗时新便签盖住模态提示框导致无法点击
-            self.show()
+            self.animated_show()
 
     # ---------- 网格构建 ----------
 
@@ -5742,10 +6914,13 @@ class BangumiScheduleWindow(AniNoteWindow):
             "title": title,
             "html_content": html,
             "x": self.x(), "y": self.y(),
-            "width": self.width(), "height": self.height(),
+            "width": self.width(), "height": self._persist_height(),
             "is_locked": self.is_locked,
             "is_always_on_top": getattr(self, 'is_always_on_top', True),
             "is_hidden": getattr(self, 'is_hidden', False),
+            "is_collapsed": self._is_collapsed_for_save(),
+            "stack_id": getattr(self, 'stack_id', ''),
+            "stack_pos": int(getattr(self, 'stack_pos', 0) or 0),
             "bg_color": self.bg_color,
             "note_hotkey": getattr(self, '_note_hotkey', ''),
             "bangumi_schedule_data": self._schedule,
@@ -6044,7 +7219,7 @@ def create_global_new_note():
     if ACTIVE_NOTES and len(ACTIVE_NOTES) > 1:
         ref_note = ACTIVE_NOTES[-2]
         note.move(ref_note.x() + 40, ref_note.y() + 40)
-    note.show()
+    note.animated_show()
     note.activateWindow()
     note.setFocus()
     note.save_data()
@@ -6106,13 +7281,13 @@ def toggle_all_notes():
                 note.text_edit.clearFocus()
                 note.is_hidden = True
                 note.save_data()
-                note.hide()
+                note.animated_hide()
     else:
         for note in ACTIVE_NOTES:
             if note.note_id in _TOGGLE_HIDDEN_NOTES:
                 note.is_hidden = False
                 note.save_data()
-                note.show()
+                note.animated_show()
                 note.activateWindow()
         _TOGGLE_HIDDEN_NOTES.clear()
 
@@ -6123,5 +7298,5 @@ def show_all_notes():
         if not note.isVisible():
             note.is_hidden = False
             note.save_data()
-            note.show()
+            note.animated_show()
             note.activateWindow()

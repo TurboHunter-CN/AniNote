@@ -1,10 +1,12 @@
-# AniNote v4.3.3
+# AniNote v5.0.0
 
 桌面便签工具，支持富文本编辑、待办事项、事务追踪、日程表、Bangumi 新番日历、Markdown 便签。
 
 ## 功能
 
 - **桌面便签** — 无边框可拖拽缩放，四角可自由拉伸
+- **便签折叠** — 点标题栏右上角减号（或右键「折叠便签」）把便签收成一条，只留标题与底色、保持原来的透明度，可在屏幕上任意拖动；鼠标悬停时临时「抽出」一行显示内容预览（普通便签给正文首行，事务/日程/新番便签给统计摘要）
+- **便签夹** — 把多条折叠便签上下拖到一起即自动吸附成集：夹子头部可拖动整叠、双击可重命名、右侧灰色小字显示条数，右键可「全部折叠 / 重命名 / 解散便签集」；夹内拖动可换序、拖远即拆出、只剩一条自动解散；展开其中一条时其余成员实时让位。归属与顺序随便签存档持久化，重启后自动重新成集
 - **富文本编辑** — 粗体、斜体、下划线、字号、颜色、背景色，调色板自由选
 - **Markdown 语言支持** — 工具栏「Md」一键将便签切换为 Markdown 模式：左源码右实时渲染分栏、语法高亮、任务列表点击勾选、滚动同步；右键可隐藏源码（便签宽度切半，仅保留渲染效果）；支持完整 GFM 语法（表格、代码块、脚注、嵌套列表等）
 
@@ -21,7 +23,7 @@
 
     ![missiontrack](images/missiontrack.png)
 
-- **日程表** — 日/周双视图时间轴（课程表效果），支持自定义编辑事件（标题、日期、起止时间、备注、颜色）、每日/周/月/年重复、提前提醒、左键标记完成；时间轴随窗口自适应缩放
+- **日程表** — 日/周双视图时间轴（课程表效果），支持自定义编辑事件（标题、日期、起止时间、备注、颜色）、每日/周/月/年重复、提前提醒、左键标记完成；右键事件可编辑单条，属于重复系列时还可选择「编辑整个系列」；时间轴随窗口自适应缩放
 
 - **Bangumi 新番** — 一键授权绑定，自动拉取追番日历（周循环滑动窗口、今天高亮、集数徽标）；点击番剧名标记看过/取消并双向同步 Bangumi；右键可在 Bangumi 打开条目或打开集数标记窗口逐集勾选/一键全部看过；顶部「只看未看」过滤未看条目
 
@@ -74,14 +76,14 @@ python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." 
    ```bash
    python -m PyInstaller --noconsole --icon=Newicon.ico --add-data "Newicon.ico;." --add-data "MaterialSymbolsOutlined_Static.ttf;." app.py
    ```
-3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote-vX.Y.Z.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
-4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v4.2`，4.2.x 系列统一用 `v4.2`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote_vX.Y.Z.zip`）
+3. **压缩**：把 `dist/app/` 里的**全部内容**（`app.exe`、`_internal/`、`Newicon.ico`、`MaterialSymbolsOutlined_Static.ttf`）压成 `AniNote_vX.Y.Z.zip`，zip 内直接展开程序文件，**不要包含** `notes_data/` 和 `aninote_config.json`
+4. **发布**：GitHub 创建 Release，tag 必须为 `vX.Y`（如 `v5.0`，5.0.x 系列统一用 `v5.0`），Release body 写更新日志（Markdown），上传步骤 3 的 zip（附件名需为 `AniNote_vX.Y.Z.zip`）
 5. **更新版本清单**：修改仓库根目录的 `latest_version.json` 并提交：
    ```json
    {
-       "version": "4.3.0",
-       "notes": "本次更新：\n- 新增日程表功能\n- 支持自定义编辑事件和日/周视图切换",
-       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v4.3/AniNote_v4.3.0.zip",
+       "version": "5.0.0",
+       "notes": "本次更新：\n- 修改了日程表的事件编辑逻辑\n- 增加便签折叠与便签夹功能",
+       "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v5.0/AniNote_v5.0.0.zip",
        "sha256": ""
    }
    ```
@@ -115,8 +117,9 @@ notes_data/
 ```
 AniNote/
 ├── app.py                            # 应用入口、热键、Bangumi 逻辑
-├── main.py                           # 便签窗口、事务追踪器、日程表、配置
+├── main.py                           # 便签窗口、便签折叠、事务追踪器、日程表、配置
 ├── control_panel.py                  # 控制台 UI（便签墙、设置页）
+├── note_stacks.py                    # 便签夹（便签集）：吸附成集、整叠排布、夹子头部与持久化
 ├── markdown_conv.py                  # Markdown ⇄ 富文本转换（mistune 渲染）
 ├── icons.py                          # Material Icons 图标系统
 ├── MaterialSymbolsOutlined_Static.ttf # 图标字体

@@ -103,6 +103,7 @@ _ICONS = {
 
     # 操作
     "add":           "\ue145",   # +
+    "remove":        "\ue15b",   # −（便签折叠）
     "add_circle":    "\ue147",   # ⊕
     "arrow_upward":  "\ue5d8",   # ↑
     "arrow_downward":"\ue5db",   # ↓
@@ -170,6 +171,7 @@ _FALLBACK_ICONS = {
     "expand_more":   "\u25bc",   # ▼
     "expand_less":   "\u25b2",   # ▲
     "add":           "\u229e",   # ⊞
+    "remove":        "\u2212",   # −（便签折叠）
     "close":         "\u2715",   # ✕
     "delete":        "\u2715",   # ✕
     "refresh":       "\u21bb",   # ↻
