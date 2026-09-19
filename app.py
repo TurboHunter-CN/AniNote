@@ -1238,7 +1238,7 @@ def main():
         " border: 1px solid #E0E0E0;"
         " border-radius: 10px;"
         " padding: 6px;"
-        " font-family: 'Microsoft YaHei';"
+        " font-family: 'Noto Sans SC';"
         " }"
         " QMenu::item {"
         " padding: 7px 24px;"
@@ -1352,12 +1352,19 @@ def main():
         set_autostart(new_cfg["autostart"])
         bind_hotkeys(new_cfg)
 
-        # 更新所有便签的字体
+        # 更新所有便签的字体（正文走 QSS；标题等由 refresh_title_font 重取字体族）
         for note in note_app.ACTIVE_NOTES:
             note.text_edit.setStyleSheet(
                 f"QTextEdit {{ border: none; background: transparent; font-size: 18px; "
                 f"font-family: '{new_cfg['font_family']}'; color: #333333; }}"
             )
+            # 标题栏字体族跟随（_title_font 内部走 fonts_mod，能命中真实粗体字面）
+            try:
+                note.header._apply_title_font(
+                    getattr(note.header, "_title_px", 18), bold=True
+                )
+            except Exception:
+                pass
 
         action_new.setText(f"新建便签 ({new_cfg['new_hotkey'].upper()})")
         action_toggle.setText(

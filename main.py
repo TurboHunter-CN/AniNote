@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 import datetime as datetime_module
 
-VERSION = "5.0.0"
+VERSION = "5.0.1"
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QTimeEdit, QComboBox, QAbstractSpinBox,
 )
 from PySide6.QtCore import (
-    Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint,
+    Qt, QObject, Signal, QTimer, QDate, QTime, QEvent, QRect, QPoint, QSize,
     QPropertyAnimation, QEasingCurve, QVariantAnimation,
 )
 from PySide6.QtGui import (
@@ -41,6 +41,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 from icons import icon, set_icon_font
 import note_stacks as stacks   # 便签集（便签夹）：折叠便签吸附成一条
+import fonts as fonts_mod      # 字体工具：统一字体族与真实字面（字重）解析
 
 # ---------- 路径初始化 ----------
 
@@ -87,7 +88,7 @@ DEFAULT_CONFIG = {
     "panel_hotkey": "alt+c",
     "show_all_hotkey": "alt+shift+n",
     "disable_all_hotkey": "ctrl+shift+a",
-    "font_family": "Microsoft YaHei",
+    "font_family": fonts_mod.DEFAULT_FONT_FAMILY,
     "autostart": True,
     "skin": "极简模式",
     "is_first_run": True,
@@ -103,15 +104,32 @@ DEFAULT_CONFIG = {
 }
 
 
+# 历史默认字体：旧版本写进配置文件的字体名。
+# 5.0.0 起默认字体改为 Noto Sans SC（思源黑体同源，自带 7 档真实字重），
+# 但老用户配置里存着这些旧值，会覆盖新默认值导致看不到变化 —— 需做一次静默迁移。
+_LEGACY_FONT_FAMILIES = {"Microsoft YaHei", "微软雅黑", "Microsoft YaHei UI", "微软雅黑 Light", "Microsoft YaHei Light"}
+
+
+def _migrate_config(cfg):
+    """配置迁移：把历史默认字体平滑升级到新默认字体。
+
+    只迁移「恰好等于旧默认值」的情况 —— 用户手动选过的其他字体一律尊重，不动。
+    """
+    fam = cfg.get("font_family")
+    if fam in _LEGACY_FONT_FAMILIES:
+        cfg["font_family"] = DEFAULT_CONFIG["font_family"]
+    return cfg
+
+
 def load_config():
     """加载配置文件，缺失字段自动回退到默认值。"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+                return _migrate_config({**DEFAULT_CONFIG, **json.load(f)})
         except (json.JSONDecodeError, OSError):
             pass
-    return DEFAULT_CONFIG
+    return dict(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
@@ -480,10 +498,11 @@ class MarkdownSplitEdit(QWidget):
 
         # 左：源码
         self.src = MdSourceEdit()
+        # 源码区保留等宽字体（Consolas）在前，中文回退到界面字体
         self.src.setStyleSheet(
             "QPlainTextEdit { border: none; background: transparent;"
-            " font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 13px;"
-            " color: #333333; }"
+            f" font-family: Consolas, '{fonts_mod.resolve_family()}', monospace;"
+            " font-size: 13px; color: #333333; }"
         )
         self.hl = MarkdownHighlighter(self.src.document())
 
@@ -495,7 +514,8 @@ class MarkdownSplitEdit(QWidget):
         self.preview.anchorClicked.connect(QDesktopServices.openUrl)
         self.preview.setStyleSheet(
             "QTextBrowser { border: none; background: transparent;"
-            " font-family: 'Microsoft YaHei'; font-size: 13px; color: #333333; }"
+            f" font-family: '{fonts_mod.resolve_family()}';"
+            " font-size: 13px; color: #333333; }"
         )
 
         # 细滚动条（对齐便签风格）；未滚动时透明隐藏，滚动时显示
@@ -709,15 +729,17 @@ class EditorHost(QWidget):
 class HeaderBar(QWidget):
     """便签标题栏：标题输入框 + 拖拽点心 + 工具栏容器。"""
 
-    # 标题样式。字号 / 字重交给 QFont（不写进 QSS），便于长标题自动缩小
+    # 标题样式。字号 / 字重 / 字体族全部交给 QFont（不写进 QSS）：
+    # QSS 里的 font-family 优先级高于 setFont，会把用户在控制面板选的字体盖掉；
+    # 且字号要支持长标题自动缩小、字重需要命中真实字面。
     TITLE_QSS = (
         "QLineEdit { border: none; background: transparent; color: #222;"
-        " font-family: 'Microsoft YaHei'; padding: 2px; }"
+        " padding: 2px; }"
         " QLineEdit:focus { background: rgba(255, 255, 255, 0.5); border-radius: 4px; }"
     )
     TITLE_QSS_COMPACT = (
         "QLineEdit { border: none; background: transparent; color: #333333;"
-        " font-family: 'Microsoft YaHei'; padding: 1px 2px; }"
+        " padding: 1px 2px; }"
     )
     TITLE_PX = 18          # 常规标题字号
     TITLE_PX_MIN = 12      # 长标题自动缩小的下限（再小就影响阅读了）
@@ -766,10 +788,20 @@ class HeaderBar(QWidget):
     # ---------- 标题字号自适应 ----------
 
     def _title_font(self, px, bold=True):
-        f = QFont("Microsoft YaHei")
-        f.setPixelSize(int(px))
-        f.setBold(bool(bold))
-        return f
+        """便签标题字体。
+
+        统一走 fonts_mod.make_font：优先命中真实 Bold 字面，
+        避免 Qt 合成粗体把笔画糊在一起（这是标题「发虚」的根源）。
+        字体族取用户配置（用户可在控制面板换字体）。
+        """
+        family = None
+        try:
+            family = self.parent_window._ui_font_family()
+        except Exception:
+            family = None      # 窗口尚未初始化完成时，交给 resolve_family 兜底
+        return fonts_mod.make_font(
+            family, px=int(px), weight="bold" if bold else "regular"
+        )
 
     def _apply_title_font(self, px, bold=True):
         self._title_px = int(px)
@@ -995,11 +1027,14 @@ class FormatPanel(QFrame):
         layout.setContentsMargins(5, 0, 5, 0)
         layout.setSpacing(8)
         
-        component_style = """
-            QWidget { border: 1px solid #D1D1D1; border-radius: 6px; background-color: #FFFFFF; color: #333333; font-family: 'Microsoft YaHei'; font-size: 13px; padding-left: 5px; }
-            QWidget:hover { border: 1px solid #0078D7; }
-            QWidget:focus { border: 1px solid #0078D7; background-color: #FCFCFC; }
-        """
+        component_style = (
+            "QWidget { border: 1px solid #D1D1D1; border-radius: 6px;"
+            " background-color: #FFFFFF; color: #333333;"
+            f" font-family: '{fonts_mod.resolve_family()}'; font-size: 13px;"
+            " padding-left: 5px; }"
+            " QWidget:hover { border: 1px solid #0078D7; }"
+            " QWidget:focus { border: 1px solid #0078D7; background-color: #FCFCFC; }"
+        )
 
         # 1. 字体选择框美化
         self.font_combo = QFontComboBox()
@@ -1612,10 +1647,9 @@ class AniNoteWindow(QWidget):
         bar_layout = QHBoxLayout(dlg_bar)
         bar_layout.setContentsMargins(20, 0, 10, 0)
         dlg_title = QLabel("便签设置")
-        dlg_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #333;"
-            " font-family: 'Microsoft YaHei';"
-        )
+        # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
+        dlg_title.setStyleSheet("color: #333;")
+        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -2426,9 +2460,16 @@ class AniNoteWindow(QWidget):
             pass
 
     def _ensure_collapse_anim(self):
-        """惰性创建并复用同一个几何动画对象。"""
+        """惰性创建并复用同一个高度动画对象。
+
+        动画的是 `size` 而不是 `geometry`：geometry 会连带设置窗口位置，而动画
+        每帧写入的位置是「动画启动那一刻」的旧值 —— 动画进行中被便签夹重排
+        move 到新位置后，下一帧又被拉回旧坐标，整叠位置会累积漂移
+        （表现为悬停预览几次之后整叠跑偏、要手动拖回来）。只动 size 时位置
+        完全交给排布逻辑掌控。
+        """
         if getattr(self, '_collapse_anim', None) is None:
-            anim = QPropertyAnimation(self, b"geometry", self)
+            anim = QPropertyAnimation(self, b"size", self)
             anim.setEasingCurve(QEasingCurve.OutCubic)
             anim.finished.connect(self._on_collapse_anim_done)
             anim.valueChanged.connect(self._on_collapse_anim_step)
@@ -2444,6 +2485,14 @@ class AniNoteWindow(QWidget):
 
     def _on_collapse_anim_done(self):
         self._finish_collapse(self.is_collapsed)
+        # 动画结束后再补一次整叠重排。
+        # 动画途中各成员的高度是渐变的中间值，期间的重排是按"中间高度"算出来的，
+        # 会留下位置偏差；此时高度已经到位，用最终高度重排一次即可把整叠收敛回
+        # 正确坐标 —— 少这一步的话，反复悬停预览会让整叠一点点跑偏、要手动拉回。
+        try:
+            stacks.STACKS.on_geometry_changed(self)
+        except RuntimeError:
+            pass
 
     def _install_bg_shadow(self, enabled=True):
         """给便签底板装上 / 卸下投影特效。
@@ -2464,11 +2513,11 @@ class AniNoteWindow(QWidget):
         self._bg_shadow = shadow
 
     def _animate_collapse_height(self, target_h, animate):
-        """把窗口高度动画到目标值（保持左上角不动、宽度不变）。"""
-        start = self.geometry()
-        end = QRect(start.x(), start.y(), start.width(), int(target_h))
+        """把窗口高度动画到目标值（宽度与位置都不动）。"""
+        start = self.size()
+        end = QSize(start.width(), int(target_h))
         if not animate:
-            self.setGeometry(end)
+            self.resize(end)
             self._finish_collapse(self.is_collapsed)
             return
         # 动画期间卸下底板投影：避免分层窗口的绘制区域超出窗口（见 _install_bg_shadow）
@@ -2784,6 +2833,17 @@ class AniNoteWindow(QWidget):
         self.is_locked = not self.is_locked
         self._apply_lock_ui()
         self.save_data()
+
+    def _ui_font_family(self):
+        """当前界面字体族（读用户配置，缺失时回退到默认）。
+
+        每次读取而非缓存：用户在控制面板换字体后无需重启即可生效。
+        读取失败一律降级为默认字体，不影响便签主流程。
+        """
+        try:
+            return fonts_mod.resolve_family(load_config().get("font_family"))
+        except Exception:
+            return fonts_mod.resolve_family()
 
     def _toggle_always_on_top(self):
         """切换置顶状态。需要 hide + 改 flag + show 来刷新窗口属性。"""
@@ -3699,10 +3759,9 @@ class HabitTrackerWindow(AniNoteWindow):
         bar_layout = QHBoxLayout(dlg_bar)
         bar_layout.setContentsMargins(20, 0, 10, 0)
         dlg_title = QLabel("新建事务")
-        dlg_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #333;"
-            " font-family: 'Microsoft YaHei';"
-        )
+        # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
+        dlg_title.setStyleSheet("color: #333;")
+        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -4198,13 +4257,16 @@ class ScheduleDayHeader(QWidget):
             rect = QRect(x0, 0, cw, self.HEADER_H)
             if is_today:
                 painter.setPen(QColor(0, 120, 215))
-                font = painter.font()
-                font.setBold(True)
+                # 用真实 Bold 字面（合成粗体在小字号下发虚、笔画粘连）
+                font = fonts_mod.make_font(
+                    painter.font().family(), painter.font().pixelSize(), "bold"
+                )
                 painter.setFont(font)
             else:
                 painter.setPen(QColor(95, 107, 122))
-                font = painter.font()
-                font.setBold(False)
+                font = fonts_mod.make_font(
+                    painter.font().family(), painter.font().pixelSize(), "regular"
+                )
                 painter.setFont(font)
             # 上排：周几
             painter.drawText(rect.adjusted(0, 1, 0, -self.HEADER_H // 2),
@@ -4551,11 +4613,13 @@ class ScheduleBlock(QFrame):
         self._end_lbl.setStyleSheet(time_style)
 
     def _title_font(self, px):
-        """构造标题字体：字号按块尺寸自适应（像素级，避免 QSS 覆盖）。"""
-        f = QFont(self._title_lbl.font())
-        f.setPixelSize(px)
-        f.setBold(True)
-        return f
+        """构造标题字体：字号按块尺寸自适应（像素级，避免 QSS 覆盖）。
+
+        走 fonts_mod.make_font 命中真实 Bold 字面，避免合成粗体糊笔画；
+        字体族沿用控件自身的（日程表可被用户改字体）。
+        """
+        fam = self._title_lbl.font().family()
+        return fonts_mod.make_font(fam, px=int(px), weight="bold")
 
     def _sync_layout(self):
         """立即让布局按当前可见性重排（同步拿到子件真实几何）。
@@ -5494,10 +5558,9 @@ class ScheduleWindow(AniNoteWindow):
         bar_layout = QHBoxLayout(dlg_bar)
         bar_layout.setContentsMargins(20, 0, 10, 0)
         dlg_title = QLabel("编辑整个系列" if series else ("编辑事件" if editing else "新建事件"))
-        dlg_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #333;"
-            " font-family: 'Microsoft YaHei';"
-        )
+        # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
+        dlg_title.setStyleSheet("color: #333;")
+        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -7010,8 +7073,9 @@ class EpisodeDialog(QDialog):
 
         title = QLabel(item.get("name", ""))
         title.setObjectName("dlg_title")
-        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #333;"
-                            " font-family: 'Microsoft YaHei';")
+        # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成）
+        title.setStyleSheet("color: #333;")
+        title.setFont(fonts_mod.make_font(px=15, weight="bold"))
         bar_layout.addWidget(title)
         bar_layout.addStretch()
 

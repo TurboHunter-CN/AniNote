@@ -24,6 +24,22 @@ from PySide6.QtWidgets import (QWidget, QFrame, QLabel, QLineEdit, QHBoxLayout,
 
 from icons import icon, set_icon_font
 
+try:
+    import fonts as _fonts_mod
+except Exception:               # 字体模块异常时降级，绝不影响便签夹主流程
+    _fonts_mod = None
+
+
+def _ui_font(px, weight="regular"):
+    """构造界面字体（走真实字面）。字体模块不可用时退回 Qt 默认字体。"""
+    if _fonts_mod is None:
+        from PySide6.QtGui import QFont
+        f = QFont()
+        f.setPixelSize(int(px))
+        return f
+    return _fonts_mod.make_font(px=px, weight=weight)
+
+
 SNAP_GAP = 26.0          # 吸附判定：纵向边缘间距 ≤ 该值即吸附
 SNAP_H_OVERLAP = 0.30    # 吸附判定：横向重叠至少占较窄者的比例
 DETACH_SLACK = 46        # 拖离整叠超过该距离 → 拆出
@@ -36,21 +52,28 @@ REBUILD_DELAY = 260      # 批量加载后的重建延迟（ms）
 DEFAULT_STACK_NAME = "便签夹"
 DRAG_THRESHOLD = 4       # 拖动阈值（px）：小于它只当点击，避免双击重命名时误拖整叠
 
+def _ui_family():
+    """当前界面字体族（读用户配置）。失败时返回空串，交给 QSS 的兜底值。"""
+    try:
+        return _fonts_mod.resolve_family() if _fonts_mod else ""
+    except Exception:
+        return ""
+
+
 # 夹子头部样式。便签底色只留一点影子做淡彩，主体仍是浅色卡片，避免"一整条色块"的土气感
+# 注意：字重（600）由 _ui_font() 走 QFont 真实字面设置 —— QSS 的 font-weight
+# 会触发 Qt 合成粗体（笔画发虚），且 QSS 的 font-family 在 Qt 里常不生效。
 HEADER_NAME_QSS = (
     "QLineEdit { border: none; background: transparent; color: #3C4043;"
-    " font-family: 'Microsoft YaHei'; font-size: 12px; font-weight: 600;"
-    " padding: 0 2px; }"
+    " font-size: 12px; padding: 0 2px; }"
 )
 HEADER_NAME_EDIT_QSS = (
     "QLineEdit { border: none; border-bottom: 1px solid #1A73E8;"
     " background: rgba(255, 255, 255, 0.75); color: #202124;"
-    " font-family: 'Microsoft YaHei'; font-size: 12px; font-weight: 600;"
-    " padding: 0 2px; }"
+    " font-size: 12px; padding: 0 2px; }"
 )
 HEADER_COUNT_QSS = (
     "background: transparent; color: #9AA0A6; font-size: 11px;"
-    " font-family: 'Microsoft YaHei';"
 )
 MENU_QSS = (
     "QMenu { background-color: #FAFAFA; border: 1px solid #E0E0E0;"
@@ -168,6 +191,8 @@ class StackHeader(QWidget):
         self.name_edit.setFrame(False)
         self.name_edit.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.name_edit.setStyleSheet(HEADER_NAME_QSS)
+        # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成、且字体族不可靠）
+        self.name_edit.setFont(_ui_font(12, "semibold"))
         self.name_edit.installEventFilter(self)
         self.name_edit.returnPressed.connect(self._commit_rename)
         self.name_edit.editingFinished.connect(self._commit_rename)
@@ -175,6 +200,7 @@ class StackHeader(QWidget):
 
         self.count_lbl = QLabel("")
         self.count_lbl.setStyleSheet(HEADER_COUNT_QSS)
+        self.count_lbl.setFont(_ui_font(11, "regular"))
         row.addWidget(self.count_lbl)
         self._apply_bg()
 
@@ -427,6 +453,11 @@ class NoteStack:
         self.header = None         # StackHeader 或 None
         self.header_color = None   # 夹子底色（取最上面那条便签）
         self.name = DEFAULT_STACK_NAME   # 用户可改的名字（落盘在 config 的 stack_names）
+        # 整叠顶部的纵坐标（= 第一条便签的 y）。显式记住而不是每次由成员高度反推：
+        # 反推时若某个成员正在做高度动画，读到的是中间高度，算出的顶部会偏，
+        # 而且这个偏差会被下一次反推继承、逐次累积 —— 表现为悬停预览几次之后
+        # 整叠跑偏、要手动拖回来。记住基准值后，每次重排都从同一处出发。
+        self.top = None
 
     def alive_members(self):
         self.members = [m for m in self.members if _alive(m)]
@@ -555,21 +586,46 @@ class NoteStackManager(QObject):
     # ---------- 排布 ----------
 
     def layout(self, stack, keep_note=None, free_note=None):
-        """重排整叠：keep_note 原位不动，其余成员按顺序紧贴排布。"""
+        """重排整叠。
+
+        顶部基准（top）的取法分两种情况：
+        - **传了 keep_note**（拖动叠内排序 / 拖动松手）：以这条不动的便签为锚，
+          由它的位置减去上方成员高度反推顶部，并把结果记进 `stack.top`。
+          此时各成员高度稳定，反推是准确的。
+        - **没传 keep_note**（悬停抽出、折叠展开的每帧动画）：直接用记住的
+          `stack.top`，不再反推 —— 动画途中成员高度是渐变的中间值，一旦参与
+          反推就会把顶部算偏并累积漂移。成员位置由「顶部 + 上方各成员实时高度」
+          得出，所以下方依然逐帧平滑让位，但基准不会跑。
+
+        高度一律取**实时值**：这样悬停抽出时下方成员是跟随时长动画连续让位的，
+        而不是一次性跳到位；由于顶部固定，实时高度只影响相对间距、不会污染基准。
+        """
         try:
             members = stack.visible_members()
             if not members:
                 self._hide_header(stack)
                 return
+
             if keep_note in members:
                 i = members.index(keep_note)
                 top = keep_note.y()
                 for m in members[:i]:
                     top -= (m.height() + STACK_GAP)
                 x = keep_note.x()
+                stack.top = top          # 以锚点反推并记住，后续动画帧直接复用
             else:
-                top = min(m.y() for m in members)
                 x = members[0].x()
+                top = stack.top
+                if top is None:
+                    top = min(m.y() for m in members)
+                # 校验：第一条便签的实际位置是基准最可靠的来源。成员增删
+                # （拆出 / 吸附新成员）或整叠被别处挪动时记忆值会过期，这里
+                # 以实际位置为准重新对齐。悬停抽出不改变第一条的 y，
+                # 所以正常的悬停动画不会误触发这条修正。
+                if abs(members[0].y() - top) > 2:
+                    top = members[0].y()
+                stack.top = top
+
             y = top
             for m in members:
                 if m is free_note:
@@ -616,6 +672,8 @@ class NoteStackManager(QObject):
             hdr = stack.header
             if hdr is not None and _alive_header(hdr) and hdr.isVisible():
                 hdr.move(hdr.x() + int(dx), hdr.y() + int(dy))
+            if stack.top is not None:
+                stack.top += int(dy)        # 整叠平移，基准跟着走
         except Exception as e:
             _log(f"move_stack 失败: {e}")
 
@@ -841,12 +899,16 @@ class NoteStackManager(QObject):
     # ---------- 事件钩子 ----------
 
     def on_geometry_changed(self, note):
-        """成员折叠 / 展开 / 悬停抽出后 → 让整叠跟着让位。"""
+        """成员折叠 / 展开 / 悬停抽出后 → 让整叠跟着让位。
+
+        刻意不传 keep_note：动画逐帧触发，若以该成员为锚反推顶部，
+        动画中途的高度会把基准算偏并累积。用记住的 stack.top 最稳。
+        """
         try:
             st = self.stack_of(note)
             if st is None:
                 return
-            self.layout(st, keep_note=note)
+            self.layout(st)
         except Exception as e:
             _log(f"几何变化后排布失败: {e}")
 
@@ -871,7 +933,9 @@ class NoteStackManager(QObject):
             if not hasattr(note, 'set_peek'):
                 return
             note.set_peek(on)
-            self.layout(st, keep_note=note)
+            # 不传 keep_note：悬停抽出的高度动画每帧都会走到这里，
+            # 用记住的 stack.top 排布才不会让整叠基准漂移（详见 layout 注释）。
+            self.layout(st)
         except Exception as e:
             _log(f"悬停抽出失败: {e}")
 

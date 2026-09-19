@@ -13,6 +13,7 @@ import threading
 import webbrowser
 
 from icons import icon, set_icon_font
+import fonts as fonts_mod   # 字体工具：统一字体族与真实字面（字重）解析
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QToolTip, QFontComboBox, QToolButton,
 
     QGraphicsDropShadowEffect, QSizeGrip, QMessageBox, QMenu, QFileDialog,
+    QSizePolicy,
 )
 from PySide6.QtGui import QFont, QColor, QTextDocument, QCursor, QPainter
 from PySide6.QtCore import (
@@ -150,15 +152,19 @@ class CollapsibleSection(QWidget):
 #  流式网格布局
 # ==========================================
 
+# 便签卡片尺寸与列间距。NoteCard 和 FlowWidget 必须共用同一组数值，
+# 否则列数算错 —— 卡片宽度写死在两个地方很容易漂移，这里统一成常量。
+NOTE_CARD_SIZE = 160
+NOTE_CARD_GAP = 15
+
+
 class FlowWidget(QWidget):
     """自适应网格容器：根据自身宽度动态计算列数，自动排列子控件。"""
-
-    ITEM_WIDTH = 175
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.grid = QGridLayout(self)
-        self.grid.setSpacing(15)
+        self.grid.setSpacing(NOTE_CARD_GAP)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.items = []
@@ -178,10 +184,18 @@ class FlowWidget(QWidget):
         super().resizeEvent(event)
 
     def rearrange(self):
+        """按可用宽度重排列数。
+
+        每列占位 = 卡片宽 + 列间距，但最后一张卡片右侧没有间距，
+        所以可用宽度要先补一个 gap 再做整除。旧写法用 (w - 20) // 175，
+        既凭空扣了 20px 又把最后一段间距算进去，导致列数被低估 ——
+        表现为「右侧明明还空着一大片，却被挤到下一行」。
+        """
         if not self.items:
             return
         w = self.width()
-        cols = max(1, (w - 20) // self.ITEM_WIDTH)
+        sp = NOTE_CARD_GAP
+        cols = max(1, (w + sp) // (NOTE_CARD_SIZE + sp))
         for i, widget in enumerate(self.items):
             self.grid.addWidget(widget, i // cols, i % cols)
 
@@ -212,7 +226,7 @@ class NoteCard(QFrame):
         self.is_top = note_info["is_top"]
         self._note_hotkey = note_info.get("note_hotkey", "")
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(160, 160)
+        self.setFixedSize(NOTE_CARD_SIZE, NOTE_CARD_SIZE)
         r, g, b = note_info.get("bg_color", [255, 249, 196])[:3]
         self.setStyleSheet(
             f"QFrame {{ background-color: rgb({r}, {g}, {b}); border-radius: 10px;"
@@ -318,6 +332,102 @@ class NoteCard(QFrame):
             self.set_hotkey_clicked.emit(self.note_id)
 
 
+# ---------- 便签夹卡片的配色（与便签端夹子头部同一套算法）----------
+
+def _tint_rgb(bg_color, keep=0.18):
+    """便签底色按 keep 比例掺进浅灰底 → 克制的淡彩，而不是整块纯色。"""
+    base = (246, 247, 249)
+    try:
+        r, g, b = [int(v) for v in bg_color[:3]]
+    except (TypeError, ValueError, IndexError):
+        r, g, b = 236, 238, 242
+    return tuple(
+        max(0, min(255, int(base[i] * (1 - keep) + (r, g, b)[i] * keep)))
+        for i in range(3)
+    )
+
+
+def _accent_hex(bg_color):
+    """图标点缀色：底色压暗，保证在浅色卡片上看得清。"""
+    try:
+        rgb = [int(v) for v in bg_color[:3]]
+    except (TypeError, ValueError, IndexError):
+        rgb = [236, 238, 242]
+    return "#%02X%02X%02X" % tuple(
+        max(72, min(150, int(v * 0.62))) for v in rgb
+    )
+
+
+class StackCard(QFrame):
+    """便签墙上的「便签夹」卡片：把同一个夹子里的多条便签聚合成一张。
+
+    便签端把成集的便签收成一条夹子，控制面板这边跟着对应 —— 同一 stack_id
+    的便签不再逐条铺开，而是合并成这张卡片，点击进入夹子内部看具体条目。
+
+    配色刻意与便签端的夹子头部保持一致（底色调淡 + 细边框 + 压暗的图标色），
+    让人一眼看出这是个"夹子"而不是一张普通便签。
+
+    信号:
+        clicked(str): 用户点击卡片，携带 stack_id。
+    """
+
+    clicked = Signal(str)
+
+    def __init__(self, stack_id, name, members, parent=None):
+        super().__init__(parent)
+        self.stack_id = stack_id
+        self.count = len(members)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(NOTE_CARD_SIZE, NOTE_CARD_SIZE)
+
+        bg = (members[0].get("bg_color") if members else None) or [236, 238, 242]
+        mr, mg, mb = _tint_rgb(bg)
+        self.setStyleSheet(
+            f"QFrame {{ background-color: rgb({mr}, {mg}, {mb}); border-radius: 10px;"
+            f" border: 1px solid #E4E7EC; }}"
+            f" QFrame:hover {{ border: 2px solid #0078D7; }}"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addStretch()
+
+        self.icon_lbl = QLabel(icon("folder"))
+        set_icon_font(self.icon_lbl, 34)
+        self.icon_lbl.setAlignment(Qt.AlignCenter)
+        self.icon_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: {_accent_hex(bg)};"
+        )
+        lay.addWidget(self.icon_lbl)
+
+        self.name_lbl = QLabel(name)
+        self.name_lbl.setAlignment(Qt.AlignCenter)
+        self.name_lbl.setWordWrap(True)
+        self.name_lbl.setFont(fonts_mod.make_font(px=14, weight="semibold"))
+        self.name_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #2F3437;"
+        )
+        lay.addWidget(self.name_lbl)
+
+        self.count_lbl = QLabel(f"{self.count} 条便签")
+        self.count_lbl.setAlignment(Qt.AlignCenter)
+        self.count_lbl.setFont(fonts_mod.make_font(px=11, weight="regular"))
+        self.count_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #8A9099;"
+        )
+        lay.addWidget(self.count_lbl)
+        lay.addStretch()
+
+        # 子控件不拦鼠标，保证点击穿透到整张卡片
+        for w in (self.icon_lbl, self.name_lbl, self.count_lbl):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.stack_id)
+
+
 # ==========================================
 #  自定义标题栏
 # ==========================================
@@ -334,10 +444,9 @@ class CustomTitleBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 0, 10, 0)
         title_label = QLabel("AniNote")
-        title_label.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #333;"
-            " font-family: 'Microsoft YaHei';"
-        )
+        # 字重走 QFont 真实字面（QSS 的 font-weight: bold 会触发 Qt 合成，笔画发虚）
+        title_label.setStyleSheet("color: #333;")
+        title_label.setFont(fonts_mod.make_font(px=15, weight="bold"))
         layout.addWidget(title_label)
         layout.addStretch()
 
@@ -463,6 +572,9 @@ class ControlPanel(QWidget):
         # 最小宽度保证顶部栏（检索/刷新/三个新建按钮）完整显示不被压缩
         self.setMinimumSize(1000, 500)
 
+        # 面板整体字体：统一走 fonts_mod，避免各控件落到 Qt 默认字体（字形不统一）
+        self.setFont(fonts_mod.make_font(px=13, weight="regular"))
+
         # Bangumi OAuth 状态（授权中可取消）
         self._oauth_cancel_event = None
         self._oauth_busy = False
@@ -554,16 +666,26 @@ class ControlPanel(QWidget):
                      base_style=None, hover_style=None):
         """创建一个带 Material Icon 的 QLabel（table 布局保证对齐）。
         自动注册悬停效果，由 eventFilter 处理。
+
+        label 传空字符串时只生成图标单元格（不留多余的空单元格）——
+        纯图标按钮在拥挤的顶栏里更省横向空间，也不会被布局压扁后
+        出现"图标和文字叠在一起"的错位。
         """
-        html = (
-            f'<table style="border:none;margin:0;padding:0;border-collapse:collapse;">'
-            f'<tr>'
-            f'<td style="vertical-align:middle;padding-top:1px;padding-right:2px;">'
-            f'<span style="font-family:\'Material Symbols Outlined\';'
-            f'font-size:{icon_size}px;">{icon(name)}</span></td>'
-            f'<td style="vertical-align:middle;padding-top:1px;">'
+        icon_cell = (
+            '<td style="vertical-align:middle;padding-top:1px;'
+            + ('padding-right:2px;' if label else '')
+            + '">'
+            + '<span style="font-family:\'Material Symbols Outlined\';'
+            + f'font-size:{icon_size}px;">{icon(name)}</span></td>'
+        )
+        text_cell = (
+            '<td style="vertical-align:middle;padding-top:1px;">'
             f'<span style="font-size:{text_size}px;">{label}</span></td>'
-            f'</tr></table>'
+        ) if label else ''
+        html = (
+            '<table style="border:none;margin:0;padding:0;border-collapse:collapse;">'
+            f'<tr>{icon_cell}{text_cell}</tr>'
+            '</table>'
         )
         lbl = QLabel(html)
         lbl.setCursor(Qt.PointingHandCursor)
@@ -600,12 +722,33 @@ class ControlPanel(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 20, 20, 20)
 
+        # 当前所处的便签夹（None = 便签墙总览；否则为该 stack_id 的内部视图）
+        self._current_stack = None
+
         top_bar = QHBoxLayout()
 
+        # 返回便签墙（仅在便签夹内部视图显示，平时隐藏）
+        self.back_btn = QPushButton(icon("arrow_back"))
+        self.back_btn.setFixedSize(30, 30)
+        self.back_btn.setToolTip("返回便签墙")
+        set_icon_font(self.back_btn, 20)
+        self.back_btn.setCursor(Qt.PointingHandCursor)
+        self.back_btn.setStyleSheet("""
+            QPushButton { border: none; border-radius: 6px; background: transparent; color: #555; }
+            QPushButton:hover { background-color: rgba(0,0,0,0.06); color: #1A73E8; }
+        """)
+        self.back_btn.clicked.connect(self._exit_stack)
+        self.back_btn.hide()
+        top_bar.addWidget(self.back_btn)
+
         # 搜索框
+        # 宽度上限 200，空间不足时可收缩：顶栏控件较多（返回箭头 / 清空 /
+        # 刷新 / 三个新建按钮），若把宽度写死，右侧按钮会被挤出可视区。
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("输入关键字检索...")
-        self.search_input.setFixedWidth(200)
+        self.search_input.setMinimumWidth(120)
+        self.search_input.setMaximumWidth(200)
+        self.search_input.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self.search_input.setStyleSheet("""
             QLineEdit { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px;
@@ -627,10 +770,28 @@ class ControlPanel(QWidget):
         clear_btn.clicked.connect(self.search_input.clear)
         top_bar.addWidget(clear_btn)
 
-        # 刷新按钮
-        refresh_btn = self._icon_label("refresh", "刷新", icon_size=18, text_size=13)
-        refresh_btn.setFixedHeight(28)
+        # 刷新按钮：纯图标。
+        # 顶栏横向空间紧张，带"刷新"二字会被布局压扁到与搜索框重叠；
+        # 另外这里不走 _icon_label —— 它内部是 HTML 表格，QLabel 默认左对齐，
+        # 配上固定宽度会把图标整体挤得偏右（实测偏 2.6px），
+        # 所以直接用图标字体渲染 + 居中对齐，位置才正。
+        refresh_btn = QLabel(icon("refresh"))
+        set_icon_font(refresh_btn, 18)
+        refresh_btn.setAlignment(Qt.AlignCenter)
+        refresh_btn.setFixedSize(32, 28)
+        refresh_btn.setCursor(Qt.PointingHandCursor)
         refresh_btn.setToolTip("同步最新便签修改")
+        _rb_base = ("QLabel { color: #333; background: transparent;"
+                    " border-radius: 6px; }")
+        _rb_hover = ("QLabel { color: #1A73E8; background-color: rgba(0,0,0,0.06);"
+                     " border-radius: 6px; }")
+        refresh_btn.setProperty("hover_base_style", _rb_base)
+        refresh_btn.setProperty("hover_hover_style", _rb_hover)
+        refresh_btn.setStyleSheet(_rb_base)
+        refresh_btn.installEventFilter(self)
+        if not hasattr(self, '_hover_labels'):
+            self._hover_labels = set()
+        self._hover_labels.add(refresh_btn)
         refresh_btn.mousePressEvent = lambda e: self.refresh_notes_wall()
         top_bar.addWidget(refresh_btn)
 
@@ -691,36 +852,142 @@ class ControlPanel(QWidget):
         return super().eventFilter(obj, event)
 
     def refresh_notes_wall(self):
-        """重新加载磁盘上的便签数据并刷新卡片墙。"""
+        """重新加载磁盘上的便签数据并刷新卡片墙。
+
+        两种视图：
+        - **便签墙总览**：同一个便签夹的便签合并成一张夹子卡片（点击进入内部），
+          不在夹里的便签逐条显示；
+        - **便签夹内部**：只列出该夹的成员便签，顶部用返回箭头退出。
+        """
         self.flow_container.clear_items()
         notes_data_list = self._load_notes_from_disk()
+        kw = self.search_input.text().strip().lower() if hasattr(self, 'search_input') else ""
+        cur = getattr(self, '_current_stack', None)
+
+        if cur:
+            self._render_stack_members(notes_data_list, cur, kw)
+            return
+
         if not notes_data_list:
             empty_label = QLabel("还没有任何便签，点击右上角新建吧！")
             empty_label.setStyleSheet("color: #999; font-size: 14px;")
             self.flow_container.add_item(empty_label)
             return
 
-        kw = self.search_input.text().strip().lower() if hasattr(self, 'search_input') else ""
         visible_count = 0
-
-        for note_info in notes_data_list:
-            if kw and (kw not in note_info["title"].lower() and kw not in note_info["text"].lower()):
-                continue
-
-            card = NoteCard(note_info)
-            card.clicked.connect(self.request_open_note.emit)
-            card.delete_clicked.connect(self._handle_card_delete)
-            card.set_top_clicked.connect(self.request_set_top.emit)
-            card.export_clicked.connect(self.request_export_note.emit)
-            card.export_md_clicked.connect(self.request_export_md_note.emit)
-            card.set_hotkey_clicked.connect(self.request_set_note_hotkey.emit)
-            self.flow_container.add_item(card)
-            visible_count += 1
+        for kind, payload in self._group_for_wall(notes_data_list):
+            if kind == "stack":
+                sid, members = payload
+                name = self._stack_display_name(sid)
+                # 夹子卡片在「夹子名」或任一成员命中关键字时都算匹配
+                if kw and not (kw in name.lower()
+                               or any(self._matches_kw(m, kw) for m in members)):
+                    continue
+                card = StackCard(sid, name, members)
+                card.clicked.connect(self._enter_stack)
+                self.flow_container.add_item(card)
+                visible_count += 1
+            else:
+                info = payload
+                if kw and not self._matches_kw(info, kw):
+                    continue
+                card = NoteCard(info)
+                self._wire_note_card(card)
+                self.flow_container.add_item(card)
+                visible_count += 1
 
         if visible_count == 0 and kw:
             no_result_lbl = QLabel("未找到匹配的便签")
             no_result_lbl.setStyleSheet("color: #999; font-size: 14px; padding: 20px;")
             self.flow_container.add_item(no_result_lbl)
+
+    def _render_stack_members(self, notes_data_list, stack_id, kw):
+        """渲染便签夹内部视图：按夹内顺序列出该夹的成员便签。"""
+        members = [n for n in notes_data_list
+                   if (n.get("stack_id") or "") == stack_id]
+        members.sort(key=lambda n: n.get("stack_pos", 0))
+
+        visible_count = 0
+        for info in members:
+            if kw and not self._matches_kw(info, kw):
+                continue
+            card = NoteCard(info)
+            self._wire_note_card(card)
+            self.flow_container.add_item(card)
+            visible_count += 1
+
+        if visible_count == 0:
+            lbl = QLabel("未找到匹配的便签" if kw else "这个便签夹里暂时没有便签")
+            lbl.setStyleSheet("color: #999; font-size: 14px; padding: 20px;")
+            self.flow_container.add_item(lbl)
+
+    def _wire_note_card(self, card):
+        """把便签卡片的交互信号接到控制面板对应的请求信号上。"""
+        card.clicked.connect(self.request_open_note.emit)
+        card.delete_clicked.connect(self._handle_card_delete)
+        card.set_top_clicked.connect(self.request_set_top.emit)
+        card.export_clicked.connect(self.request_export_note.emit)
+        card.export_md_clicked.connect(self.request_export_md_note.emit)
+        card.set_hotkey_clicked.connect(self.request_set_note_hotkey.emit)
+
+    @staticmethod
+    def _matches_kw(note_info, kw):
+        return kw in note_info["title"].lower() or kw in note_info["text"].lower()
+
+    @staticmethod
+    def _group_for_wall(notes_data_list):
+        """把便签按便签夹聚合，返回 [(kind, payload)]，顺序沿用磁盘顺序。
+
+        kind="stack" 时 payload = (stack_id, [成员…])；kind="note" 时 payload = 单条。
+        只有成员数 ≥ 2 的 stack_id 才算夹子 —— 与便签端的 MIN_MEMBERS 保持一致，
+        否则会出现"只剩一条便签却仍显示成夹子"的怪状态。
+        """
+        groups, loose = {}, []
+        for idx, info in enumerate(notes_data_list):
+            gid = info.get("stack_id") or ""
+            if gid:
+                groups.setdefault(gid, []).append((idx, info))
+            else:
+                loose.append((idx, info))
+
+        entries = [(idx, "note", info) for idx, info in loose]
+        for gid, pairs in groups.items():
+            if len(pairs) >= 2:
+                pairs.sort(key=lambda p: p[1].get("stack_pos", 0))
+                entries.append((min(p[0] for p in pairs), "stack",
+                                (gid, [p[1] for p in pairs])))
+            else:
+                # 只剩一条的"孤零零成员"按普通便签显示
+                entries.extend((idx, "note", info) for idx, info in pairs)
+        entries.sort(key=lambda e: e[0])
+        return [(kind, payload) for _, kind, payload in entries]
+
+    @staticmethod
+    def _stack_display_name(stack_id):
+        """便签夹的显示名：用户在便签端改过名就沿用，否则用默认名。"""
+        try:
+            name = (load_config().get("stack_names") or {}).get(stack_id)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return "便签夹"
+
+    def _enter_stack(self, stack_id):
+        """进入便签夹内部视图。"""
+        self._current_stack = stack_id
+        self.back_btn.show()
+        if self.search_input.text():
+            self.search_input.clear()      # 清掉旧关键字，免得一进来就是"未找到"
+        self.refresh_notes_wall()
+
+    def _exit_stack(self):
+        """返回便签墙总览。"""
+        self._current_stack = None
+        self.back_btn.hide()
+        if self.search_input.text():
+            self.search_input.clear()
+        self.refresh_notes_wall()
 
     def _handle_card_delete(self, note_id):
         self.request_delete_note.emit(note_id)
@@ -796,6 +1063,9 @@ class ControlPanel(QWidget):
                         "is_top": is_top,
                         "bg_color": bg_color,
                         "note_hotkey": data.get("note_hotkey", ""),
+                        # 便签夹归属：同一 stack_id 的多条便签在便签墙上会合并成一张夹子卡片
+                        "stack_id": data.get("stack_id", "") or "",
+                        "stack_pos": int(data.get("stack_pos", 0) or 0),
                     })
                 except Exception:
                     pass
@@ -930,10 +1200,12 @@ class ControlPanel(QWidget):
         self.skin_combo.wheelEvent = lambda event: event.ignore()
         self.skin_combo.setStyleSheet(dropdown_style + "QComboBox { min-width: 250px; }")
 
-        # 字体选择
+        # 字体选择：先用 resolve_family 归一化，保证字体缺失时也能选中可用项
         self.font_combo = QFontComboBox()
         self.font_combo.setStyleSheet(dropdown_style)
-        self.font_combo.setCurrentFont(QFont(cfg["font_family"]))
+        self.font_combo.setCurrentFont(
+            QFont(fonts_mod.resolve_family(cfg.get("font_family")))
+        )
         self.font_combo.wheelEvent = lambda event: event.ignore()
 
         # 快捷键输入
@@ -1270,7 +1542,13 @@ class ControlPanel(QWidget):
         default_export_dir = os.path.abspath(os.path.join(BASE_DIR, "导出的便签文本"))
         final_export_dir = "default" if new_export_dir == default_export_dir else new_export_dir
 
-        cfg = {
+        # 以现有配置为基底增量更新。
+        # 控制面板只负责它自己管的这几个字段，其余字段（stack_names、
+        # last_bangumi_sync 等）必须原样带过去 —— 早先直接构造一个全新字典再
+        # 整文件覆写，导致「打开控制面板并保存一次」就把便签夹名字抹成空，
+        # 表现为贴好的名字重启后丢失。
+        cfg = dict(old_cfg)
+        cfg.update({
             "skin": self.skin_combo.currentText(),
             "font_family": self.font_combo.currentFont().family(),
             "toggle_hotkey": self.hotkey_input.text(),
@@ -1285,11 +1563,7 @@ class ControlPanel(QWidget):
             "export_dir": final_export_dir,
             "auto_update": self.auto_update_checkbox.isChecked(),
             "default_markdown": self.default_md_checkbox.isChecked(),
-            "ignored_version": old_cfg.get("ignored_version", ""),
-            "is_first_run": old_cfg.get("is_first_run", False),
-            "bangumi_uid": old_cfg.get("bangumi_uid", ""),
-            "bangumi_oauth": old_cfg.get("bangumi_oauth", {}),
-        }
+        })
         save_config(cfg)
         self.settings_changed.emit(cfg)
 

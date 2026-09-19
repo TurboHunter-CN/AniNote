@@ -75,16 +75,28 @@ def icon_text(name, label="", size=16):
 
 
 def set_icon_font(widget, size=18):
-    """将 widget 的字体设为 Material Icons 优先 + 系统字体兜底。
+    """将 widget 的字体设为 Material Icons 优先 + 界面字体兜底。
 
     调用后 widget 中的图标 PUA 码位由 Material Icons 渲染，
-    中文等字符由系统默认字体渲染。
+    中文等字符由界面字体（默认 Noto Sans SC）渲染。
+
+    注意：不能只依赖 `font.families()` —— 控件若尚未继承到应用字体，
+    这个列表会落回 Qt 默认字体，中文就会和图标字形不一致。
+    因此这里显式把界面字体插在图标字体之后。
     """
     _init_font()
     if not _FONT_AVAILABLE:
         return
+    try:
+        import fonts as _fonts
+        ui_family = _fonts.resolve_family()
+    except Exception:
+        ui_family = ""
     font = widget.font()
-    families = [_FAMILIES[0]] + font.families()
+    families = [_FAMILIES[0]]
+    if ui_family:
+        families.append(ui_family)
+    families += [f for f in font.families() if f not in families]
     font.setFamilies(families)
     font.setPixelSize(size)
     widget.setFont(font)
@@ -138,6 +150,8 @@ _ICONS = {
     "dashboard":     "\ue871",   # 仪表盘
     "note_add":      "\ue89c",   # 新建便签
     "playlist_add":  "\ue03b",   # 列表添加
+    "folder":        "\ue2c7",   # 文件夹（便签夹）
+    "folder_open":   "\ue2c8",   # 打开的文件夹
 
     # 警告
     "error":         "\ue000",   # 错误
@@ -184,6 +198,8 @@ _FALLBACK_ICONS = {
     "task_alt":      "\u2713",   # ✓
     "circle":        "\u25cb",   # ○
     "note_add":      "\u229e",   # ⊞
+    "folder":        "\u25a1",   # □（文件夹占位）
+    "folder_open":   "\u25a1",   # □
     "calendar_today":"\u25a0",   # ■
     "schedule":      "\u25d8",   # ◘
     "home":          "\u2302",   # ⌂

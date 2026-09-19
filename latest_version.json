@@ -1,6 +1,6 @@
 {
-    "version": "5.0.0",
-    "notes": "本次更新：\n- 修改了日程表的事件编辑逻辑\n- 增加便签折叠与便签夹功能",
-    "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v5.0/AniNote_v5.0.0.zip",
+    "version": "5.0.1",
+    "notes": "本次更新：\n- 修复了若干问题",
+    "zip_url": "https://github.com/TurboHunter-CN/AniNote/releases/download/v5.0/AniNote_v5.0.1.zip",
     "sha256": ""
 }
