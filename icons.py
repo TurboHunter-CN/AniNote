@@ -53,25 +53,8 @@ def icon(name, size=18):
     return _ICONS.get(name, "")
 
 
-def fallback_icon(name):
-    """始终返回 Unicode 后备字符，不依赖 Material Symbols 字体。
-    用于 QMenu/QAction 等不能使用 PUA 码点的场景。
-    """
-    return _FALLBACK_ICONS.get(name, "")
 
 
-def icon_text(name, label="", size=16):
-    """图标 + 文字，适合 QPushButton / QAction 的 text 属性。
-
-    Args:
-        name: 图标名。
-        label: 文字标签。
-        size: 字号。
-    Returns:
-        str: "图标  文字" 格式字符串。
-    """
-    ic = icon(name, size)
-    return f"{ic}  {label}" if label else ic
 
 
 def set_icon_font(widget, size=18):

@@ -153,6 +153,28 @@ def _fetch_all_episodes(subject_ids, headers, proxies):
     return out
 
 
+def _http_error_hint(status_code, snippet, what="在看列表"):
+    """把 Bangumi 返回的 HTTP 错误码翻译成人话。
+
+    早先对所有非 200 一律提示"被拒"，遇到 502/503 这种**服务端临时故障**时，
+    用户会误以为自己的账号被封了（实际 502 是 Bangumi 网关连不上后端，
+    跟客户端无关）。这里按状态码分别说明，并给出对应的处理建议。
+    """
+    if status_code in (401, 403):
+        return (f"授权失败（{status_code}）<br>"
+                "Bangumi 拒绝了这次请求，请到控制面板重新登录账号。")
+    if status_code == 404:
+        return (f"找不到该用户（404）<br>"
+                "请检查控制面板里填写的 Bangumi 用户 ID 是否正确。")
+    if status_code == 429:
+        return (f"请求太频繁（429）<br>"
+                "触发了 Bangumi 的访问频率限制，过几分钟再试。")
+    if status_code in (500, 502, 503, 504):
+        return (f"Bangumi 服务端临时故障（{status_code}）<br>"
+                "这是对方服务器的问题，不是你的账号或网络有问题，稍后重试即可。")
+    return f"获取{what}失败（{status_code}）<br>服务器返回: {snippet}"
+
+
 def fetch_bangumi_data(uid, proxy_str=""):
     """从 Bangumi API 拉取用户的在追新番日历。
 
@@ -184,11 +206,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
 
         if res_coll.status_code != 200:
             snippet = res_coll.text[:150].replace('<', '&lt;').replace('>', '&gt;')
-            return (
-                f"获取在看列表被拒！<br>"
-                f"状态码: {res_coll.status_code}<br>"
-                f"服务器返回: {snippet}"
-            )
+            return _http_error_hint(res_coll.status_code, snippet, "在看列表")
 
         watching = {item['subject_id']: item for item in res_coll.json().get('data', [])}
         if not watching:
@@ -203,7 +221,7 @@ def fetch_bangumi_data(uid, proxy_str=""):
             headers=headers, proxies=proxies, timeout=15
         )
         if res_cal.status_code != 200:
-            return f"获取新番日历被拒！<br>状态码: {res_cal.status_code}"
+            return _http_error_hint(res_cal.status_code, "", "新番日历")
 
         calendar_data = res_cal.json()
         schedule = {i: [] for i in range(7)}
@@ -397,6 +415,24 @@ def set_autostart(enable):
 
 # ---------- 主入口 ----------
 
+def apply_app_font(family=None):
+    """设置应用级 UI 字体：没显式指定字体的控件都会继承它。
+
+    为什么必须走 QApplication.setFont 而不是给某个窗口 setFont：
+    Qt 只会把字体传给"之后创建、且自己没设过字体"的子控件。控制面板里大量
+    控件自带 QSS（哪怕只写了 font-size），继承链会被截断 —— 实测 49 个控件里
+    有 43 个仍落到系统默认的 Microsoft YaHei UI，只有手动 setFont 过的那几个
+    才生效。设成应用级字体后，控制面板 / 各种对话框 / 便签工具栏才能统一。
+    """
+    try:
+        import fonts as _fonts
+        inst = QApplication.instance()
+        if inst is not None:
+            inst.setFont(_fonts.make_font(family, px=13, weight="regular"))
+    except Exception as e:
+        print(f"设置全局界面字体失败: {e}")
+
+
 def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -423,6 +459,8 @@ def main():
             pass
 
     cfg = note_app.load_config()
+    # 应用级 UI 字体必须在任何界面控件创建之前设好，否则已建好的窗口不会继承
+    apply_app_font(cfg.get("font_family"))
     set_autostart(cfg["autostart"])
 
     # 路径容灾：确保存储目录可写；失败时回退到程序同级目录。
@@ -1351,6 +1389,7 @@ def main():
         """设置保存后应用所有变更。"""
         set_autostart(new_cfg["autostart"])
         bind_hotkeys(new_cfg)
+        apply_app_font(new_cfg.get("font_family"))   # 换字体立即作用到面板与对话框
 
         # 更新所有便签的字体（正文走 QSS；标题等由 refresh_title_font 重取字体族）
         for note in note_app.ACTIVE_NOTES:
@@ -1358,11 +1397,9 @@ def main():
                 f"QTextEdit {{ border: none; background: transparent; font-size: 18px; "
                 f"font-family: '{new_cfg['font_family']}'; color: #333333; }}"
             )
-            # 标题栏字体族跟随（_title_font 内部走 fonts_mod，能命中真实粗体字面）
+            # 标题字体跟随（先清字体缓存再重设，否则会拿回旧字体族的 QFont）
             try:
-                note.header._apply_title_font(
-                    getattr(note.header, "_title_px", 18), bold=True
-                )
+                note.refresh_ui_font()
             except Exception:
                 pass
 

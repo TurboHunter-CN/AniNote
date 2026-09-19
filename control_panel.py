@@ -334,6 +334,20 @@ class NoteCard(QFrame):
 
 # ---------- 便签夹卡片的配色（与便签端夹子头部同一套算法）----------
 
+def _panel_font(px, weight="regular"):
+    """按用户配置的字体族构造面板内使用的字体。
+
+    显式 setFont 的地方（标题、卡片文字）必须走这里 —— 只写
+    `make_font(px=…)` 会用默认字体，导致控制面板里出现两种字体混排，
+    也就是"换了字体但面板上没全跟着变"。
+    """
+    try:
+        family = load_config().get("font_family")
+    except Exception:
+        family = None
+    return fonts_mod.make_font(family, px=px, weight=weight)
+
+
 def _tint_rgb(bg_color, keep=0.18):
     """便签底色按 keep 比例掺进浅灰底 → 克制的淡彩，而不是整块纯色。"""
     base = (246, 247, 249)
@@ -404,7 +418,7 @@ class StackCard(QFrame):
         self.name_lbl = QLabel(name)
         self.name_lbl.setAlignment(Qt.AlignCenter)
         self.name_lbl.setWordWrap(True)
-        self.name_lbl.setFont(fonts_mod.make_font(px=14, weight="semibold"))
+        self.name_lbl.setFont(_panel_font(14, "semibold"))
         self.name_lbl.setStyleSheet(
             "border: none; background: transparent; color: #2F3437;"
         )
@@ -412,7 +426,7 @@ class StackCard(QFrame):
 
         self.count_lbl = QLabel(f"{self.count} 条便签")
         self.count_lbl.setAlignment(Qt.AlignCenter)
-        self.count_lbl.setFont(fonts_mod.make_font(px=11, weight="regular"))
+        self.count_lbl.setFont(_panel_font(11, "regular"))
         self.count_lbl.setStyleSheet(
             "border: none; background: transparent; color: #8A9099;"
         )
@@ -446,7 +460,7 @@ class CustomTitleBar(QWidget):
         title_label = QLabel("AniNote")
         # 字重走 QFont 真实字面（QSS 的 font-weight: bold 会触发 Qt 合成，笔画发虚）
         title_label.setStyleSheet("color: #333;")
-        title_label.setFont(fonts_mod.make_font(px=15, weight="bold"))
+        title_label.setFont(_panel_font(15, "bold"))
         layout.addWidget(title_label)
         layout.addStretch()
 
@@ -572,8 +586,11 @@ class ControlPanel(QWidget):
         # 最小宽度保证顶部栏（检索/刷新/三个新建按钮）完整显示不被压缩
         self.setMinimumSize(1000, 500)
 
-        # 面板整体字体：统一走 fonts_mod，避免各控件落到 Qt 默认字体（字形不统一）
-        self.setFont(fonts_mod.make_font(px=13, weight="regular"))
+        # 面板整体字体：跟随用户在「便签默认字体」里的选择
+        # （应用级字体由 app.main 通过 QApplication.setFont 设好，这里是兜底，
+        #  便于单独构造面板时也能拿到正确字体）
+        self.setFont(fonts_mod.make_font(
+            load_config().get("font_family"), px=13, weight="regular"))
 
         # Bangumi OAuth 状态（授权中可取消）
         self._oauth_cancel_event = None

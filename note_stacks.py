@@ -31,18 +31,28 @@ except Exception:               # 字体模块异常时降级，绝不影响便�
 
 
 def _ui_font(px, weight="regular"):
-    """构造界面字体（走真实字面）。字体模块不可用时退回 Qt 默认字体。"""
+    """构造便签夹头部用的字体（跟随用户在控制面板选的字体族）。
+
+    只写 make_font(px=…) 会落到系统默认字体，整叠夹子就会和便签用两套字形。
+    """
     if _fonts_mod is None:
         from PySide6.QtGui import QFont
         f = QFont()
         f.setPixelSize(int(px))
         return f
-    return _fonts_mod.make_font(px=px, weight=weight)
+    family = None
+    try:
+        import main as _note_app          # 本模块顶层不 import main，避免循环依赖
+        family = _note_app.load_config().get("font_family")
+    except Exception:
+        family = None
+    return _fonts_mod.make_font(family, px=px, weight=weight)
 
 
 SNAP_GAP = 26.0          # 吸附判定：纵向边缘间距 ≤ 该值即吸附
 SNAP_H_OVERLAP = 0.30    # 吸附判定：横向重叠至少占较窄者的比例
 DETACH_SLACK = 46        # 拖离整叠超过该距离 → 拆出
+_STRIP_REF_H = 40        # 排序参考高度：把展开态便签也按"一条"参与纵向比较
 HEADER_H = 30            # 便签夹头部高度
 HEADER_GAP = 2           # 头部与第一条之间的缝隙
 PEEK_H = 18              # 悬停抽出时多露出的高度（含一行预览文字）
@@ -52,12 +62,6 @@ REBUILD_DELAY = 260      # 批量加载后的重建延迟（ms）
 DEFAULT_STACK_NAME = "便签夹"
 DRAG_THRESHOLD = 4       # 拖动阈值（px）：小于它只当点击，避免双击重命名时误拖整叠
 
-def _ui_family():
-    """当前界面字体族（读用户配置）。失败时返回空串，交给 QSS 的兜底值。"""
-    try:
-        return _fonts_mod.resolve_family() if _fonts_mod else ""
-    except Exception:
-        return ""
 
 
 # 夹子头部样式。便签底色只留一点影子做淡彩，主体仍是浅色卡片，避免"一整条色块"的土气感
@@ -737,24 +741,41 @@ class NoteStackManager(QObject):
             _log(f"拖动结束处理失败: {e}")
 
     def _order_by_position(self, stack, note):
-        """按当前纵坐标把 note 插到合适位置（越过邻条中线即换序）。"""
+        """按当前纵坐标把 note 插到合适位置（越过邻条中线即换序）。
+
+        参考点取「顶部往下约半条折叠条」，而不是几何中心 —— 夹内便签可能是
+        展开态（高几百像素），用中心算会把它一路排到底部。
+        """
         others = [m for m in stack.members if m is not note]
-        cy = note.y() + note.height() // 2
+        ref = note.y() + min(note.height(), _STRIP_REF_H) // 2
         idx = 0
         for m in others:
-            if cy > m.y() + m.height() // 2:
+            if ref > m.y() + min(m.height(), _STRIP_REF_H) // 2:
                 idx += 1
         return others[:idx] + [note] + others[idx:]
 
     def _should_detach(self, stack, note):
-        """拖离整叠足够远 → 拆出。"""
+        """拖离整叠足够远 → 拆出。
+
+        用「两个纵向区间是否还挨着」判定，既不能用几何中心、单看顶边也不够：
+        夹内便签可能是展开态（几百像素高），展开后其余成员会被整体推到它下方
+        （或上方），此时它的中心、甚至顶边天生就离 others 很远 —— 可位置其实
+        一动没动。而标题栏的 mouseReleaseEvent 会走 `on_drag_released`，
+        于是「在展开的便签上点一下标题栏（比如想改标题）」就会把整叠拆开，
+        时有时无、极难复现。
+
+        改成区间判定后：展开态便签的 [y, y+h) 与整叠区间始终相接 → 不拆；
+        真的拖到远处 → 区间彻底分离 → 正常拆出。
+        """
         others = [m for m in stack.visible_members() if m is not note]
         if not others:
             return False
         top = min(m.y() for m in others)
         bottom = max(m.y() + m.height() for m in others)
-        cy = note.y() + note.height() // 2
-        return cy < top - DETACH_SLACK or cy > bottom + DETACH_SLACK
+        note_top = note.y()
+        note_bottom = note.y() + note.height()
+        return (note_bottom < top - DETACH_SLACK
+                or note_top > bottom + DETACH_SLACK)
 
     def _find_snap_target(self, note):
         """在其它折叠便签里找可吸附的那条（最贴近的）。"""

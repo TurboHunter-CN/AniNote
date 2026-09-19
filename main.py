@@ -138,6 +138,19 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=4)
 
 
+def cfg_ui_font(px, weight="regular"):
+    """按用户配置的字体族构造界面字体。
+
+    对话框标题这类需要显式 setFont（以命中真实字重字面）的地方统一走这里；
+    直接写 make_font(px=…) 会用系统默认字体，于是「换了字体但某些窗口没跟着变」。
+    """
+    try:
+        family = load_config().get("font_family")
+    except Exception:
+        family = None
+    return fonts_mod.make_font(family, px=px, weight=weight)
+
+
 # 注入配置持久化回调：bangumi_oauth 刷新 token 成功后自动落盘
 import bangumi_oauth as _bangumi_oauth
 _bangumi_oauth.set_config_saver(save_config)
@@ -514,7 +527,7 @@ class MarkdownSplitEdit(QWidget):
         self.preview.anchorClicked.connect(QDesktopServices.openUrl)
         self.preview.setStyleSheet(
             "QTextBrowser { border: none; background: transparent;"
-            f" font-family: '{fonts_mod.resolve_family()}';"
+            f" {fonts_mod.font_family_css()}"
             " font-size: 13px; color: #333333; }"
         )
 
@@ -788,20 +801,45 @@ class HeaderBar(QWidget):
     # ---------- 标题字号自适应 ----------
 
     def _title_font(self, px, bold=True):
-        """便签标题字体。
+        """便签标题字体（按字号缓存）。
 
         统一走 fonts_mod.make_font：优先命中真实 Bold 字面，
         避免 Qt 合成粗体把笔画糊在一起（这是标题「发虚」的根源）。
         字体族取用户配置（用户可在控制面板换字体）。
+
+        缓存原因：`refresh_title_font` 每帧都要拿字号探一遍标题宽度，
+        涉及多次 QFont 构造；QFont 是隐式共享的，复用同一实例是安全的
+        （调用方只会把它交给 setFont / QFontMetrics，都不会就地修改它）。
         """
-        family = None
-        try:
-            family = self.parent_window._ui_font_family()
-        except Exception:
-            family = None      # 窗口尚未初始化完成时，交给 resolve_family 兜底
-        return fonts_mod.make_font(
-            family, px=int(px), weight="bold" if bold else "regular"
-        )
+        cache = getattr(self, '_title_font_cache', None)
+        if cache is None:
+            cache = {}
+            self._title_font_cache = cache
+        key = (int(px), bool(bold))
+        f = cache.get(key)
+        if f is None:
+            family = None
+            try:
+                family = self.parent_window._ui_font_family()
+            except Exception:
+                family = None      # 窗口尚未初始化完成时，交给 resolve_family 兜底
+            f = fonts_mod.make_font(
+                family, px=int(px), weight="bold" if bold else "regular"
+            )
+            cache[key] = f
+        return f
+
+    def _title_metrics(self, px):
+        """指定字号的 QFontMetrics（按字号缓存，避免每帧重复构造）。"""
+        cache = getattr(self, '_title_metrics_cache', None)
+        if cache is None:
+            cache = {}
+            self._title_metrics_cache = cache
+        fm = cache.get(int(px))
+        if fm is None:
+            fm = QFontMetrics(self._title_font(px))
+            cache[int(px)] = fm
+        return fm
 
     def _apply_title_font(self, px, bold=True):
         self._title_px = int(px)
@@ -882,10 +920,13 @@ class HeaderBar(QWidget):
             fit_w = max(cap - 12, 30)   # 减去输入框左右内边距
             px = self.TITLE_PX
             while px > self.TITLE_PX_MIN:
-                if QFontMetrics(self._title_font(px)).horizontalAdvance(text) <= fit_w:
+                if self._title_metrics(px).horizontalAdvance(text) <= fit_w:
                     break
                 px -= 1
-            self._apply_title_font(px, bold=True)
+            # 字号没变就别再 setFont —— 每帧重复设同一个字体同样会让
+            # QLineEdit 重算布局，是折叠/展开动画里最容易被浪费的一笔开销
+            if px != getattr(self, '_title_px', None):
+                self._apply_title_font(px, bold=True)
         except RuntimeError:
             pass
 
@@ -1030,7 +1071,7 @@ class FormatPanel(QFrame):
         component_style = (
             "QWidget { border: 1px solid #D1D1D1; border-radius: 6px;"
             " background-color: #FFFFFF; color: #333333;"
-            f" font-family: '{fonts_mod.resolve_family()}'; font-size: 13px;"
+            f" {fonts_mod.font_family_css()} font-size: 13px;"
             " padding-left: 5px; }"
             " QWidget:hover { border: 1px solid #0078D7; }"
             " QWidget:focus { border: 1px solid #0078D7; background-color: #FCFCFC; }"
@@ -1285,7 +1326,7 @@ class AniNoteWindow(QWidget):
         self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.text_edit.setStyleSheet(
             f"QTextEdit {{ border: none; background: transparent; font-size: 18px; "
-            f"font-family: '{cfg['font_family']}'; color: #333333; }}"
+            f"{fonts_mod.font_family_css(cfg['font_family'])} color: #333333; }}"
         )
         self.text_edit.textChanged.connect(self._mark_dirty)
         self.editor_host = EditorHost(self, self.text_edit)
@@ -1649,7 +1690,7 @@ class AniNoteWindow(QWidget):
         dlg_title = QLabel("便签设置")
         # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
         dlg_title.setStyleSheet("color: #333;")
-        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
+        dlg_title.setFont(cfg_ui_font(15, "bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -2304,6 +2345,8 @@ class AniNoteWindow(QWidget):
             peek_lbl = getattr(self, '_peek_lbl', None)
             lay = self.bg_frame.layout()
             if lay is not None:
+                # 批量隐藏时先关重绘：否则每个控件各触发一次布局/重绘，
+                # 内容多的便签（如新番网格）会明显拖慢折叠动作。
                 for i in range(lay.count()):
                     item = lay.itemAt(i)
                     w = item.widget() if item is not None else None
@@ -2683,6 +2726,57 @@ class AniNoteWindow(QWidget):
             stacks.STACKS.on_geometry_changed(self)
         except RuntimeError:
             pass
+        # 收尾稳定后强制整窗重绘，并在下一轮事件循环再补一次。
+        #
+        # 便签是半透明无边框窗口（Windows 分层窗口），内容靠 UpdateLayeredWindow
+        # 整块上传：resize 与批量显隐之后 Qt 往往只上传了局部，屏幕上留着空白或
+        # 上一帧的像素，要等某个系统事件（例如窗口失活）重新合成才"突然正常"。
+        # 这正是「展开后一片空白 / 鼠标掠过有重影 / 点一下便签之外立刻恢复」的表现。
+        # 单次 update 不够，所以同步 repaint 一次、下轮再补一次。
+        self._repaint_window_now()
+
+    def _repaint_window_now(self):
+        """延迟约一帧后做「同步整窗重绘」—— 这是让分层窗口正确上屏的关键。
+
+        三个结论都来自实测对照：
+
+        1. **必须用 `repaint()`（同步），不能用 `update()`。**
+           只 `update()` 时问题复现（展开后空白、鼠标掠过有重影、点一下便签之外
+           才恢复）；换回 `repaint()` 就正常 —— 分层窗口（半透明无边框）是
+           "内容已经画好、但没上传到屏幕"，异步 update 不足以可靠触发上传。
+
+        2. **必须等投影装回并生效。** 展开动画期间投影是卸下的
+           （见 `_animate_collapse_height`），收尾时 `_install_bg_shadow(True)`
+           才装回，而 `setGraphicsEffect` 要过一帧才参与合成。当场重绘会画出
+           「没有投影」的那一帧 —— 四周阴影缺失，看着就像便签缩了一小圈。
+
+        3. 所以先等一帧，再同步重绘。
+        """
+        try:
+            QTimer.singleShot(16, self._repaint_window_sync)
+        except Exception:
+            pass
+
+    def _repaint_window_sync(self):
+        """此刻投影已生效：同步整窗重绘，并再排一次补偿。"""
+        try:
+            self.repaint()
+            bg = getattr(self, 'bg_frame', None)
+            if bg is not None:
+                bg.repaint()
+        except RuntimeError:
+            return
+        try:
+            QTimer.singleShot(0, self._repaint_window_sync2)
+        except Exception:
+            pass
+
+    def _repaint_window_sync2(self):
+        """再补一次，避免首次上传落在尺寸尚未完全稳定的那一帧。"""
+        try:
+            self.repaint()
+        except RuntimeError:
+            pass
 
     def _is_collapsed_for_save(self):
         """写盘用的折叠状态：待落位的折叠也算折叠。
@@ -2837,13 +2931,35 @@ class AniNoteWindow(QWidget):
     def _ui_font_family(self):
         """当前界面字体族（读用户配置，缺失时回退到默认）。
 
-        每次读取而非缓存：用户在控制面板换字体后无需重启即可生效。
-        读取失败一律降级为默认字体，不影响便签主流程。
+        结果缓存在实例上：刷新标题字号时可能一帧内调用多次，每次都读一遍
+        配置文件（还要解析 JSON）会让折叠/展开动画变得顿挫。
+        用户在控制面板换字体后走 `refresh_ui_font()` 清缓存即可生效。
         """
+        cached = getattr(self, '_ui_family_cache', None)
+        if cached:
+            return cached
         try:
-            return fonts_mod.resolve_family(load_config().get("font_family"))
+            family = fonts_mod.resolve_family(load_config().get("font_family"))
         except Exception:
-            return fonts_mod.resolve_family()
+            family = fonts_mod.resolve_family()
+        self._ui_family_cache = family
+        return family
+
+    def refresh_ui_font(self):
+        """设置变更后刷新界面字体：清掉字体缓存并重设标题字体。
+
+        字体缓存与标题号缓存都必须一起清 —— 只清配置缓存的话，
+        `_title_font` 会继续吐回旧字体的 QFont。
+        """
+        self._ui_family_cache = None
+        try:
+            self.header._ui_family_cache = None
+            self.header._title_font_cache = None
+            self.header._title_metrics_cache = None
+            self.header._apply_title_font(
+                getattr(self.header, '_title_px', self.header.TITLE_PX), True)
+        except Exception:
+            pass
 
     def _toggle_always_on_top(self):
         """切换置顶状态。需要 hide + 改 flag + show 来刷新窗口属性。"""
@@ -3761,7 +3877,7 @@ class HabitTrackerWindow(AniNoteWindow):
         dlg_title = QLabel("新建事务")
         # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
         dlg_title.setStyleSheet("color: #333;")
-        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
+        dlg_title.setFont(cfg_ui_font(15, "bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -4152,9 +4268,6 @@ def _time_to_min(hhmm):
         return 9 * 60
 
 
-def _min_to_hhmm(mins):
-    """当日分钟数 → "HH:MM"。"""
-    return f"{mins // 60:02d}:{mins % 60:02d}"
 
 
 def _make_time_selectors(style=""):
@@ -4617,9 +4730,17 @@ class ScheduleBlock(QFrame):
 
         走 fonts_mod.make_font 命中真实 Bold 字面，避免合成粗体糊笔画；
         字体族沿用控件自身的（日程表可被用户改字体）。
+
+        字号钳到可读下限：块被压得很扁时（折叠动画途中、窗口极矮）
+        `_fit_content` 可能算出 0 甚至负数，直接交给 Qt 会报
+        "Pixel size <= 0" 并让字体彻底失效。
         """
         fam = self._title_lbl.font().family()
-        return fonts_mod.make_font(fam, px=int(px), weight="bold")
+        try:
+            px = int(px)
+        except (TypeError, ValueError):
+            px = 13
+        return fonts_mod.make_font(fam, px=max(px, 8), weight="bold")
 
     def _sync_layout(self):
         """立即让布局按当前可见性重排（同步拿到子件真实几何）。
@@ -5560,7 +5681,7 @@ class ScheduleWindow(AniNoteWindow):
         dlg_title = QLabel("编辑整个系列" if series else ("编辑事件" if editing else "新建事件"))
         # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成且字体族不生效）
         dlg_title.setStyleSheet("color: #333;")
-        dlg_title.setFont(fonts_mod.make_font(px=15, weight="bold"))
+        dlg_title.setFont(cfg_ui_font(15, "bold"))
         bar_layout.addWidget(dlg_title)
         bar_layout.addStretch()
         dlg_close = QPushButton(icon("close"))
@@ -7075,7 +7196,7 @@ class EpisodeDialog(QDialog):
         title.setObjectName("dlg_title")
         # 字重走 QFont 真实字面（QSS 的 font-weight 会触发 Qt 合成）
         title.setStyleSheet("color: #333;")
-        title.setFont(fonts_mod.make_font(px=15, weight="bold"))
+        title.setFont(cfg_ui_font(15, "bold"))
         bar_layout.addWidget(title)
         bar_layout.addStretch()
 
